@@ -736,15 +736,33 @@ async def secret_reset_command(ctx: commands.Context):
 
 
 @bot.command(name="tf", aliases=["TF"])
-@commands.guild_only()
 async def tf_stats_command(ctx: commands.Context):
-    guild_data = tf_stats.get(str(ctx.guild.id), {})
+    guild_id = ctx.guild.id if ctx.guild else None
+    if guild_id is None:
+        await ctx.reply(
+            "Run this command from a server so I know which TF roster to check.",
+            mention_author=False,
+        )
+        return None
+
+    guild_data = tf_stats.get(str(guild_id), {})
     user_data = guild_data.get(str(ctx.author.id))
 
     if not user_data:
-        await ctx.reply(
-            "You haven't experienced any transformations yet.", mention_author=False
-        )
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+        try:
+            await ctx.author.send(
+                "You haven't experienced any transformations yet."
+            )
+        except discord.Forbidden:
+            await ctx.reply(
+                "I couldn't DM you. Please enable direct messages from server members.",
+                mention_author=False,
+                delete_after=10,
+            )
         return None
 
     embed = discord.Embed(
@@ -771,7 +789,41 @@ async def tf_stats_command(ctx: commands.Context):
         lines = [f"- {name}: **{count}**" for name, count in sorted_chars]
         embed.add_field(name="By Character", value="\n".join(lines), inline=False)
 
-    await ctx.reply(embed=embed, mention_author=False)
+    key = _state_key(guild_id, ctx.author.id)
+    current_state = active_transformations.get(key)
+    if current_state:
+        remaining = max(
+            (current_state.expires_at - _now()).total_seconds(),
+            0,
+        )
+        minutes, seconds = divmod(int(remaining), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            remaining_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes:
+            remaining_str = f"{minutes}m {seconds}s"
+        else:
+            remaining_str = f"{seconds}s"
+
+        embed.add_field(
+            name="Current Transformation",
+            value=f"Character: **{current_state.character_name}**\nTime left: `{remaining_str}`",
+            inline=False,
+        )
+
+    try:
+        await ctx.author.send(embed=embed)
+    except discord.Forbidden:
+        await ctx.reply(
+            "I couldn't DM you. Please enable direct messages from server members.",
+            mention_author=False,
+            delete_after=10,
+        )
+    finally:
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
 
 
 @bot.event
