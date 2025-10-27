@@ -1,4 +1,4 @@
-# TF Discord Bot
+﻿# TF Discord Bot
 
 Basic Discord bot scaffold that listens for messages and has a configurable chance (default 10%) of triggering a TF response. Future iterations can expand the transformation narrative without reworking the scaffolding.
 
@@ -24,6 +24,15 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | `TFBOT_HISTORY_CHANNEL_ID` | Channel that receives TF audit logs | `1432196317722972262` |
 | `TFBOT_STATE_FILE` | Path for persisting active TF records | `tf_state.json` |
 | `TFBOT_MAGIC_EMOJI_NAME` | Custom emoji name to prefix TF narration (falls back to `:name:` if missing) | `magic_emoji` |
+| `TFBOT_MESSAGE_STYLE` | `classic` embed layout or `vn` for visual-novel image panels | `classic` |
+| `TFBOT_VN_BASE` | Base PNG used for VN-style rendering (only when style is `vn`) | `vn_assets/vn_base.png` |
+| `TFBOT_VN_FONT` | Optional TTF font path for VN text rendering | `fonts/Ubuntu-B.ttf` |
+| `TFBOT_VN_NAME_SIZE` | Font size (px) for VN character name | `34` |
+| `TFBOT_VN_TEXT_SIZE` | Font size (px) for VN dialogue text | `26` |
+| `TFBOT_VN_GAME_ROOT` | Path to Student Transfer game root for sprite composition | _(empty)_ |
+| `TFBOT_VN_OUTFIT` | Default outfit filename when composing sprites | `casual.png` |
+| `TFBOT_VN_FACE` | Default face sprite filename when composing sprites | `0.png` |
+| `TFBOT_VN_SELECTIONS` | JSON file storing per-character outfit overrides | `tf_outfits.json` |
 | `TFBOT_STATS_FILE` | JSON file storing per-user TF counts | `tf_stats.json` |
 
 ## Running
@@ -42,7 +51,7 @@ The bot requires the `MESSAGE CONTENT INTENT` to be enabled in the Discord devel
   - Selects a random duration (10m, 1h, 10h, 24h) and schedules an automatic revert.
   - Sends an entry to the history channel defined by `TFBOT_HISTORY_CHANNEL_ID` without pinging the user or naming the guild.
 - When the timer expires, the nickname and avatar revert and the history channel receives a 'TF Reverted' entry that references the member's username (not display name) and the character that expired.
-- While a user is transformed, every message they send is mirrored by the bot as an embedded post that uses the character's avatar thumbnail (requires the bot to have **Manage Messages** to remove the original post cleanly).
+- While a user is transformed, every message they send is mirrored by the bot; use `TFBOT_MESSAGE_STYLE=classic` for embeds with thumbnails or `vn` for generated visual-novel panels (requires **Manage Messages**). In `vn` mode the bot composites character sprites from the Student Transfer assets if `TFBOT_VN_GAME_ROOT` is provided. In VN mode, transformed users can switch sprites by running `!outfit <name>` after the bot DM shares available outfits.
 - Members with the Discord Administrator permission (or a role literally named `Admin`) and ignored channels never trigger TFs.
 - Server admins can run the hidden `!synreset` command to immediately revert all active TFs in the current server and log the action to the history channel.
 - Any member can type `!tf` to see how many times they've transformed and how often each character has appeared.

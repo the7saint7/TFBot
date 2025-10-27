@@ -9,11 +9,17 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
+from functools import lru_cache
 
 import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 from tf_characters import TF_CHARACTERS as CHARACTER_DATA
 
@@ -43,6 +49,16 @@ DEV_TF_CHANCE = 0.75
 TF_HISTORY_CHANNEL_ID = _int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
+MESSAGE_STYLE = os.getenv("TFBOT_MESSAGE_STYLE", "classic").lower()
+VN_BASE_IMAGE = Path(os.getenv("TFBOT_VN_BASE", "vn_assets/vn_base.png"))
+VN_FONT_PATH = os.getenv("TFBOT_VN_FONT", "").strip()
+VN_NAME_FONT_SIZE = int(os.getenv("TFBOT_VN_NAME_SIZE", "34"))
+VN_TEXT_FONT_SIZE = int(os.getenv("TFBOT_VN_TEXT_SIZE", "26"))
+VN_GAME_ROOT = Path(os.getenv("TFBOT_VN_GAME_ROOT", "")).expanduser().resolve() if os.getenv("TFBOT_VN_GAME_ROOT") else None
+VN_ASSET_ROOT = VN_GAME_ROOT / "game" / "images" / "characters" if VN_GAME_ROOT else None
+VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
+VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
+VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
 TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 minutes", timedelta(minutes=10)),
     ("1 hour", timedelta(hours=1)),
@@ -157,6 +173,17 @@ bot = commands.Bot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intent
 TransformKey = Tuple[int, int]
 active_transformations: Dict[TransformKey, TransformationState] = {}
 revert_tasks: Dict[TransformKey, asyncio.Task] = {}
+
+def find_active_transformation(user_id: int, guild_id: Optional[int] = None) -> Optional[TransformationState]:
+    if guild_id is not None:
+        state = active_transformations.get(_state_key(guild_id, user_id))
+        if state:
+            return state
+    for state in active_transformations.values():
+        if state.user_id == user_id and (guild_id is None or state.guild_id == guild_id):
+            return state
+    return None
+
 STATE_RESTORED = False
 
 
@@ -211,6 +238,25 @@ def persist_stats() -> None:
     TF_STATS_FILE.write_text(json.dumps(tf_stats, indent=2), encoding="utf-8")
 
 
+
+def load_outfit_selections() -> Dict[str, str]:
+    if not VN_SELECTION_FILE.exists():
+        return {}
+    try:
+        data = json.loads(VN_SELECTION_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k).lower(): str(v) for k, v in data.items()}
+    except json.JSONDecodeError as exc:
+        logger.warning("Failed to parse %s: %s", VN_SELECTION_FILE, exc)
+    return {}
+
+def persist_outfit_selections() -> None:
+    try:
+        VN_SELECTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        VN_SELECTION_FILE.write_text(json.dumps(vn_outfit_selection, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to persist outfit selections: %s", exc)
+
 def load_states_from_disk() -> Sequence[TransformationState]:
     if not TF_STATE_FILE.exists():
         return []
@@ -241,6 +287,8 @@ def load_stats_from_disk() -> Dict[str, Dict[str, Dict[str, object]]]:
 
 
 tf_stats = load_stats_from_disk()
+VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
+vn_outfit_selection = load_outfit_selections()
 
 
 def increment_tf_stats(guild_id: int, user_id: int, character_name: str) -> None:
@@ -338,6 +386,410 @@ async def fetch_member(guild_id: int, user_id: int) -> Tuple[Optional[discord.Gu
 BASE_DIR = Path(__file__).resolve().parent
 
 
+def _load_vn_font(size: int):
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return None
+
+    font_candidates = []
+    if VN_FONT_PATH:
+        font_candidates.append(Path(VN_FONT_PATH))
+    font_candidates.append(BASE_DIR / "fonts" / "Ubuntu-B.ttf")
+
+    attempted = set()
+    for candidate in font_candidates:
+        if not candidate or candidate in attempted:
+            continue
+        attempted.add(candidate)
+        if candidate.exists():
+            try:
+                logger.debug("VN sprite: loading font %s (size=%s)", candidate, size)
+                return ImageFont.truetype(str(candidate), size=size)
+            except OSError as exc:
+                logger.warning("Failed to load VN font %s: %s", candidate, exc)
+        else:
+            logger.debug("VN sprite: font candidate missing -> %s", candidate)
+    logger.warning("VN sprite: falling back to default font (size=%s)", size)
+    return ImageFont.load_default()
+
+def _wrap_text(draw, text: str, font, max_width: int) -> Sequence[str]:
+    if not text:
+        return []
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip() if current else word
+        if draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+_vn_config_cache: Dict[str, Dict] = {}
+
+
+def _load_character_config(character_dir: Path) -> Dict:
+    if yaml is None:
+        return {}
+    cache_key = str(character_dir)
+    if cache_key in _vn_config_cache:
+        return _vn_config_cache[cache_key]
+    config_path = character_dir / "character.yml"
+    config: Dict = {}
+    if config_path.exists():
+        try:
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to read character config %s: %s", config_path, exc)
+            config = {}
+    _vn_config_cache[cache_key] = config
+    return config
+
+
+def _select_variant_dir(character_dir: Path, config: Dict) -> Optional[Path]:
+    variants = {child.name.lower(): child for child in character_dir.iterdir() if child.is_dir()}
+    if not variants:
+        logger.warning("VN sprite: no variants found under %s", character_dir.name)
+        return None
+    preferred_names = []
+    poses = config.get("poses")
+    if isinstance(poses, dict):
+        preferred_names.extend(name.lower() for name in poses.keys())
+    preferred_names.append("a")
+    for name in preferred_names:
+        if name in variants:
+            return variants[name]
+    return variants[sorted(variants.keys())[0]]
+
+
+def _select_outfit_path(variant_dir: Path, config: Dict, preferred: Optional[str] = None) -> Optional[Path]:
+    outfits_dir = variant_dir / "outfits"
+    if not outfits_dir.exists():
+        logger.warning("VN sprite: outfit directory missing at %s", outfits_dir)
+        return None
+    outfits = sorted(outfits_dir.glob("*.png"))
+    if not outfits:
+        logger.warning("VN sprite: no outfit PNGs in %s", outfits_dir)
+        return None
+
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+    default_outfit = config.get("default_outfit")
+    if isinstance(default_outfit, str):
+        candidates.append(default_outfit)
+    if VN_DEFAULT_OUTFIT:
+        candidates.append(VN_DEFAULT_OUTFIT)
+
+    normalized_candidates = []
+    for name in candidates:
+        name = name.strip()
+        if not name:
+            continue
+        lower = name.lower()
+        if not lower.endswith(".png"):
+            normalized_candidates.append(lower)
+            normalized_candidates.append(f"{lower}.png")
+        else:
+            normalized_candidates.append(lower)
+            normalized_candidates.append(lower.rstrip(".png"))
+
+    for target in normalized_candidates:
+        for outfit in outfits:
+            if outfit.name.lower() == target or outfit.stem.lower() == target:
+                logger.debug("VN sprite: using outfit %s for variant %s", outfit.name, variant_dir.name)
+                return outfit
+
+    logger.debug("VN sprite: defaulting to first outfit %s for variant %s", outfits[0].name, variant_dir.name)
+    return outfits[0]
+
+def _select_face_path(variant_dir: Path) -> Optional[Path]:
+    faces_dir = variant_dir / "faces"
+    if not faces_dir.exists():
+        logger.warning("VN sprite: faces directory missing at %s", faces_dir)
+        return None
+    groups = [d for d in faces_dir.iterdir() if d.is_dir()]
+    if not groups:
+        logger.warning("VN sprite: no face groups found in %s", faces_dir)
+        return None
+
+    group_preference = ["face", "neutral", "default"]
+    selected_group = None
+    for candidate in group_preference:
+        for group in groups:
+            if group.name.lower() == candidate:
+                selected_group = group
+                break
+        if selected_group:
+            break
+    if selected_group is None:
+        selected_group = sorted(groups, key=lambda p: p.name.lower())[0]
+
+    images = sorted(selected_group.glob("*.png"))
+    if not images:
+        return None
+
+    face_candidates = []
+    if VN_DEFAULT_FACE:
+        if VN_DEFAULT_FACE.lower().endswith(".png"):
+            face_candidates.append(VN_DEFAULT_FACE.lower())
+            face_candidates.append(VN_DEFAULT_FACE.lower().rstrip(".png"))
+        else:
+            face_candidates.append(VN_DEFAULT_FACE.lower())
+            face_candidates.append(f"{VN_DEFAULT_FACE}.png".lower())
+    for target in face_candidates:
+        for image_path in images:
+            if image_path.name.lower() == target or image_path.stem.lower() == target:
+                logger.debug("VN sprite: using face %s from group %s", image_path.name, selected_group.name)
+                return image_path
+    logger.debug(
+        "VN sprite: defaulting to face %s from group %s", images[0].name, selected_group.name
+    )
+    return images[0]
+
+
+def _candidate_character_keys(raw_name: str) -> Sequence[str]:
+    name = raw_name.lower().strip()
+    if not name:
+        return []
+    candidates = [name]
+    if " " in name:
+        first_word = name.split(" ", 1)[0]
+        candidates.append(first_word)
+        candidates.append(name.replace(" ", ""))
+        candidates.append(name.replace(" ", "_"))
+    if "-" in name:
+        candidates.append(name.split("-", 1)[0])
+        candidates.append(name.replace("-", ""))
+    # Ensure unique order
+    seen = set()
+    ordered = []
+    for cand in candidates:
+        if cand not in seen:
+            seen.add(cand)
+            ordered.append(cand)
+    return ordered
+
+
+def resolve_character_directory(character_name: str) -> tuple[Optional[Path], Sequence[str]]:
+    if VN_ASSET_ROOT is None:
+        return None, []
+    attempted: list[str] = []
+    for key in _candidate_character_keys(character_name):
+        candidate = VN_ASSET_ROOT / key
+        attempted.append(candidate.name)
+        if candidate.exists():
+            return candidate, attempted
+    return None, attempted
+
+def list_available_outfits(character_name: str) -> Sequence[str]:
+    directory, attempted = resolve_character_directory(character_name)
+    if directory is None:
+        logger.debug("VN sprite: cannot list outfits for %s (tried %s)", character_name, attempted)
+        return []
+    config = _load_character_config(directory)
+    variant_dir = _select_variant_dir(directory, config)
+    if not variant_dir:
+        return []
+    outfits_dir = variant_dir / "outfits"
+    if not outfits_dir.exists():
+        return []
+    outfits = sorted({p.stem for p in outfits_dir.glob("*.png")})
+    return outfits
+
+def get_selected_outfit_name(character_name: str) -> Optional[str]:
+    directory, _ = resolve_character_directory(character_name)
+    if directory is None:
+        return None
+    return vn_outfit_selection.get(directory.name.lower())
+
+def set_selected_outfit_name(character_name: str, outfit_name: str) -> bool:
+    directory, attempted = resolve_character_directory(character_name)
+    if directory is None:
+        logger.debug("VN sprite: cannot set outfit for %s (tried %s)", character_name, attempted)
+        return False
+    outfits = list_available_outfits(character_name)
+    if outfit_name.lower() not in [o.lower() for o in outfits]:
+        return False
+    vn_outfit_selection[directory.name.lower()] = outfit_name
+    persist_outfit_selections()
+    compose_game_avatar.cache_clear()
+    logger.info("VN sprite: outfit override for %s set to %s", directory.name, outfit_name)
+    return True
+
+def get_selected_outfit_for_dir(directory: Path) -> Optional[str]:
+    return vn_outfit_selection.get(directory.name.lower())
+
+
+
+@lru_cache(maxsize=128)
+def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
+    if VN_ASSET_ROOT is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    character_dir, attempted = resolve_character_directory(character_name)
+    if character_dir is None:
+        logger.debug("VN sprite: missing character directory for %s (tried %s)", character_name, attempted)
+        return None
+
+    config = _load_character_config(character_dir)
+    variant_dir = _select_variant_dir(character_dir, config)
+    if not variant_dir:
+        logger.debug("VN sprite: no variant directory found for %s", character_dir.name)
+        return None
+
+    preferred_outfit = get_selected_outfit_for_dir(character_dir)
+    if preferred_outfit:
+        logger.debug("VN sprite: preferred outfit override for %s is %s", character_dir.name, preferred_outfit)
+    outfit_path = _select_outfit_path(variant_dir, config, preferred_outfit)
+    if not outfit_path or not outfit_path.exists():
+        logger.warning(
+            "VN sprite: outfit not found for %s (variant %s, tried %s)",
+            character_dir.name,
+            variant_dir.name,
+            outfit_path,
+        )
+        return None
+
+    try:
+        outfit_image = Image.open(outfit_path).convert("RGBA")
+    except OSError as exc:
+        logger.warning("Failed to load outfit %s: %s", outfit_path, exc)
+        return None
+
+    face_path = _select_face_path(variant_dir)
+    if face_path and face_path.exists():
+        try:
+            face_image = Image.open(face_path).convert("RGBA")
+            outfit_image.paste(face_image, (0, 0), face_image)
+        except OSError as exc:
+            logger.warning("Failed to load face %s: %s", face_path, exc)
+    else:
+        logger.warning(
+            "VN sprite: face image missing for %s (variant %s, searched %s)",
+            character_dir.name,
+            variant_dir.name,
+            face_path,
+        )
+
+    return outfit_image
+
+def render_vn_panel(
+    state: TransformationState,
+    message_content: str,
+    character_display_name: str,
+    original_name: str,
+    attachment_id: Optional[str] = None,
+) -> Optional[discord.File]:
+    if MESSAGE_STYLE != "vn":
+        return None
+    if not VN_BASE_IMAGE.exists():
+        logger.warning("VN base image not found at %s; falling back to classic style.", VN_BASE_IMAGE)
+        return None
+
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        logger.warning("Pillow is not installed; cannot render VN message style.")
+        return None
+
+    base = Image.open(VN_BASE_IMAGE).convert("RGBA")
+    draw = ImageDraw.Draw(base)
+
+    from PIL import Image
+    name_font = _load_vn_font(VN_NAME_FONT_SIZE)
+    text_font = _load_vn_font(VN_TEXT_FONT_SIZE)
+
+    # Layout constants derived from vn_base.png geometry.
+    name_box = (170, 10, 303, 26)
+    text_box = (178, 80, 800, 250)
+    name_padding = 10
+    text_padding = 12
+    avatar_box = (4, 4, 160, 250)
+    avatar_width = avatar_box[2] - avatar_box[0]
+    avatar_height = avatar_box[3] - avatar_box[1]
+
+    avatar_image = None
+    local_avatar_path: Optional[Path] = None
+    if state.character_avatar_path:
+        local_avatar_path = Path(state.character_avatar_path)
+        if not local_avatar_path.is_absolute():
+            local_avatar_path = (BASE_DIR / local_avatar_path).resolve()
+        if not local_avatar_path.exists():
+            local_avatar_path = None
+
+    if VN_AVATAR_MODE == "user" and local_avatar_path:
+        try:
+            avatar_image = Image.open(local_avatar_path).convert("RGBA")
+        except OSError as exc:
+            logger.warning("Failed to load avatar %s for VN panel: %s", local_avatar_path, exc)
+            avatar_image = None
+
+    if avatar_image is None and VN_AVATAR_MODE == "game" and state.character_name:
+        composed = compose_game_avatar(state.character_name)
+        if composed is not None:
+            logger.debug("VN sprite: composed avatar ready for %s (%s)", state.character_name, composed.size)
+            avatar_image = composed.copy()
+
+    if avatar_image is None and local_avatar_path:
+        try:
+            avatar_image = Image.open(local_avatar_path).convert("RGBA")
+        except OSError as exc:
+            logger.warning("Failed to load avatar %s for VN panel: %s", local_avatar_path, exc)
+            avatar_image = None
+
+    if avatar_image is not None:
+        avatar_image = avatar_image.copy()
+        avatar_image.thumbnail((avatar_width, avatar_height), Image.LANCZOS)
+        pos_x = avatar_box[0] + (avatar_width - avatar_image.width) // 2
+        pos_y = avatar_box[1] + (avatar_height - avatar_image.height) // 2
+        base.paste(avatar_image, (pos_x, pos_y), avatar_image)
+        logger.debug("VN sprite: pasted avatar for %s at (%s, %s) size %s", state.character_name, pos_x, pos_y, avatar_image.size)
+    if avatar_image is None:
+        logger.warning(
+            "VN sprite: no avatar rendered for %s (mode=%s)",
+            state.character_name,
+            VN_AVATAR_MODE,
+        )
+
+    name_text = character_display_name
+    name_x = name_box[0] + name_padding
+    name_y = name_box[1] + name_padding
+    draw.text((name_x, name_y), name_text, fill=(255, 220, 180, 255), font=name_font)
+
+    if not message_content.strip():
+        message_content = f"{original_name} remains quietly transformed..."
+
+    max_width = text_box[2] - text_box[0] - text_padding * 2
+    lines = _wrap_text(draw, message_content.strip(), text_font, max_width)
+    if not lines:
+        lines = ["..."]
+
+    line_height = (text_font.getbbox("Ag")[3] - text_font.getbbox("Ag")[1] + 4) if hasattr(text_font, "getbbox") else text_font.size + 4
+    text_y = text_box[1] + text_padding
+    for line in lines:
+        draw.text((text_box[0] + text_padding, text_y), line, fill=(240, 240, 240, 255), font=text_font)
+        text_y += line_height
+
+    output = io.BytesIO()
+    base.save(output, format="PNG")
+    output.seek(0)
+    unique_fragment = attachment_id or str(int(_now().timestamp() * 1000))
+    filename = f"tf-panel-{state.user_id}-{unique_fragment}.png"
+    return discord.File(fp=output, filename=filename)
+
+
 async def fetch_avatar_bytes(path_or_url: str) -> Optional[bytes]:
     if not path_or_url:
         return None
@@ -381,23 +833,40 @@ async def relay_transformed_message(
     cleaned_content = message.content.strip()
     description = cleaned_content if cleaned_content else "*no message content*"
 
-    embed = discord.Embed(
-        description=description,
-        color=0x9B59B6,
-        timestamp=_now(),
-    )
-    embed.set_author(name=state.character_name)
-
     files: list[discord.File] = []
-    avatar_bytes = await fetch_avatar_bytes(state.character_avatar_path)
-    avatar_filename = None
-    if avatar_bytes:
-        suffix = Path(state.character_avatar_path).suffix or ".png"
-        avatar_filename = f"tf-avatar-{state.user_id}{suffix}"
-        files.append(
-            discord.File(io.BytesIO(avatar_bytes), filename=avatar_filename)
+    payload: dict = {}
+
+    if MESSAGE_STYLE == "vn":
+        vn_file = render_vn_panel(
+            state=state,
+            message_content=cleaned_content,
+            character_display_name=state.character_name,
+            original_name=message.author.display_name,
+            attachment_id=str(message.id),
         )
-        embed.set_thumbnail(url=f"attachment://{avatar_filename}")
+        if vn_file:
+            files.append(vn_file)
+        else:
+            logger.debug("VN panel rendering unavailable; using classic embed.")
+
+    if not files:
+        embed = discord.Embed(
+            description=description,
+            color=0x9B59B6,
+            timestamp=_now(),
+        )
+        embed.set_author(name=state.character_name)
+
+        avatar_bytes = await fetch_avatar_bytes(state.character_avatar_path)
+        if avatar_bytes:
+            suffix = Path(state.character_avatar_path).suffix or ".png"
+            avatar_filename = f"tf-avatar-{state.user_id}{suffix}"
+            files.append(
+                discord.File(io.BytesIO(avatar_bytes), filename=avatar_filename)
+            )
+            embed.set_thumbnail(url=f"attachment://{avatar_filename}")
+
+        payload["embed"] = embed
 
     for attachment in message.attachments:
         try:
@@ -424,10 +893,11 @@ async def relay_transformed_message(
         deleted = False
         logger.warning("Failed to delete message %s: %s", message.id, exc)
 
-    if not deleted:
-        embed.set_footer(text="Grant Manage Messages so TF relay can replace posts.")
+    if not deleted and "embed" in payload:
+        payload["embed"].set_footer(text="Grant Manage Messages so TF relay can replace posts.")
 
-    send_kwargs = {"embed": embed}
+    send_kwargs: Dict[str, object] = {}
+    send_kwargs.update(payload)
     if reference:
         if isinstance(reference, discord.Message):
             reference = reference.to_reference(fail_if_not_exists=False)
@@ -690,6 +1160,7 @@ async def on_ready():
     await ensure_state_restored()
     logger.info("Logged in as %s (id=%s)", bot.user, bot.user.id if bot.user else "unknown")
     logger.info("TF chance set to %.0f%%", TF_CHANCE * 100)
+    logger.info("Message style: %s", MESSAGE_STYLE.upper())
     logger.info("Dev mode: %s", "ON" if DEV_MODE else "OFF")
     if DEV_MODE:
         logger.info("Allowed channel: %s", DEV_CHANNEL_ID)
@@ -813,6 +1284,24 @@ async def tf_stats_command(ctx: commands.Context):
 
     try:
         await ctx.author.send(embed=embed)
+        if current_state:
+            outfits = list_available_outfits(current_state.character_name)
+            if outfits:
+                selected = get_selected_outfit_name(current_state.character_name)
+                formatted = []
+                for option in outfits:
+                    label = option
+                    if selected and option.lower() == selected.lower():
+                        label = f"{option} (current)"
+                    formatted.append(label)
+                outfit_note = (
+                    f"Outfits available for {current_state.character_name}: {', '.join(formatted)}.\n"
+                    "Use `!outfit <name>` while you are transformed to switch outfits."
+                )
+                try:
+                    await ctx.author.send(outfit_note)
+                except discord.Forbidden:
+                    pass
     except discord.Forbidden:
         await ctx.reply(
             "I couldn't DM you. Please enable direct messages from server members.",
@@ -825,6 +1314,61 @@ async def tf_stats_command(ctx: commands.Context):
         except discord.HTTPException:
             pass
 
+
+
+@bot.command(name="outfit")
+async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
+    outfit_name = outfit_name.strip()
+    if not outfit_name:
+        message = "Usage: !outfit <outfit name>"
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    guild_id = ctx.guild.id if ctx.guild else None
+    state = find_active_transformation(ctx.author.id, guild_id)
+    if not state:
+        message = "You need to be transformed to change outfits."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    outfits = list_available_outfits(state.character_name)
+    if not outfits:
+        message = f"No outfits are available for {state.character_name}."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    normalized = outfit_name.lower()
+    match = next((o for o in outfits if o.lower() == normalized), None)
+    if match is None:
+        message = f"Unknown outfit `{outfit_name}`. Available: {', '.join(outfits)}"
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    if not set_selected_outfit_name(state.character_name, match):
+        message = "Unable to update outfit at this time."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    confirmation = f"Outfit for {state.character_name} set to `{match}`. Future messages will use this outfit."
+    if ctx.guild:
+        await ctx.reply(confirmation, mention_author=False)
+    else:
+        await ctx.send(confirmation)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -849,8 +1393,11 @@ async def on_message(message: discord.Message):
         return None
 
     is_admin_user = _is_admin(message.author)
-    if not DEV_MODE and is_admin_user:
-        logger.debug("Ignoring message %s from admin user %s (normal mode)", message.id, message.author.id)
+    if message.guild and message.guild.owner_id == message.author.id:
+        logger.debug("Ignoring message %s from server owner %s", message.id, message.author.id)
+        return None
+    if DEV_MODE and is_admin_user:
+        logger.debug("Admin user %s message allowed (dev mode)", message.author.id)
         return None
     if DEV_MODE and is_admin_user:
         logger.debug("Admin user %s message allowed (dev mode)", message.author.id)
