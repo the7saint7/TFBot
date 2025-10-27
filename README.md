@@ -27,6 +27,7 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | `TFBOT_MESSAGE_STYLE` | `classic` embed layout or `vn` for visual-novel image panels | `classic` |
 | `TFBOT_VN_BASE` | Base PNG used for VN-style rendering (only when style is `vn`) | `vn_assets/vn_base.png` |
 | `TFBOT_VN_FONT` | Optional TTF font path for VN text rendering | `fonts/Ubuntu-B.ttf` |
+| `TFBOT_VN_EMOJI_FONT` | Optional emoji fallback font | `fonts/NotoEmoji-VariableFont_wght.ttf` |
 | `TFBOT_VN_NAME_SIZE` | Font size (px) for VN character name | `34` |
 | `TFBOT_VN_TEXT_SIZE` | Font size (px) for VN dialogue text | `26` |
 | `TFBOT_VN_GAME_ROOT` | Path to Student Transfer game root for sprite composition | _(empty)_ |

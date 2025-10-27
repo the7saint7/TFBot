@@ -5,11 +5,12 @@ import json
 import logging
 import os
 import random
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
-from functools import lru_cache
 
 import aiohttp
 import discord
@@ -44,6 +45,17 @@ def _int_from_env(name: str, default: int) -> int:
         return default
 
 
+def _float_from_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid float for %s=%s. Falling back to %s.", name, raw, default)
+        return default
+
+
 DEV_CHANNEL_ID = 1432191400983662766
 DEV_TF_CHANCE = 0.75
 TF_HISTORY_CHANNEL_ID = _int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
@@ -52,6 +64,7 @@ TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
 MESSAGE_STYLE = os.getenv("TFBOT_MESSAGE_STYLE", "classic").lower()
 VN_BASE_IMAGE = Path(os.getenv("TFBOT_VN_BASE", "vn_assets/vn_base.png"))
 VN_FONT_PATH = os.getenv("TFBOT_VN_FONT", "").strip()
+VN_EMOJI_FONT_PATH = os.getenv('TFBOT_VN_EMOJI_FONT', 'fonts/NotoEmoji-VariableFont_wght.ttf').strip()
 VN_NAME_FONT_SIZE = int(os.getenv("TFBOT_VN_NAME_SIZE", "34"))
 VN_TEXT_FONT_SIZE = int(os.getenv("TFBOT_VN_TEXT_SIZE", "26"))
 VN_GAME_ROOT = Path(os.getenv("TFBOT_VN_GAME_ROOT", "")).expanduser().resolve() if os.getenv("TFBOT_VN_GAME_ROOT") else None
@@ -59,6 +72,7 @@ VN_ASSET_ROOT = VN_GAME_ROOT / "game" / "images" / "characters" if VN_GAME_ROOT 
 VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
 VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
 VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
+VN_AVATAR_SCALE = max(0.1, _float_from_env("TFBOT_VN_AVATAR_SCALE", 1.0))
 TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 minutes", timedelta(minutes=10)),
     ("1 hour", timedelta(hours=1)),
@@ -74,6 +88,7 @@ REQUIRED_GUILD_PERMISSIONS = {
 MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 tf_stats: Dict[str, Dict[str, Dict[str, object]]] = {}
+_vn_config_cache: Dict[str, Dict] = {}
 
 
 @dataclass(frozen=True)
@@ -386,16 +401,17 @@ async def fetch_member(guild_id: int, user_id: int) -> Tuple[Optional[discord.Gu
 BASE_DIR = Path(__file__).resolve().parent
 
 
-def _load_vn_font(size: int):
+@lru_cache(maxsize=64)
+def _load_vn_font(size: int) -> "ImageFont.ImageFont":
     try:
         from PIL import ImageFont
     except ImportError:
-        return None
+        return ImageFont.load_default()
 
     font_candidates = []
     if VN_FONT_PATH:
         font_candidates.append(Path(VN_FONT_PATH))
-    font_candidates.append(BASE_DIR / "fonts" / "Ubuntu-B.ttf")
+    font_candidates.append(BASE_DIR / 'fonts' / 'Ubuntu-B.ttf')
 
     attempted = set()
     for candidate in font_candidates:
@@ -404,35 +420,347 @@ def _load_vn_font(size: int):
         attempted.add(candidate)
         if candidate.exists():
             try:
-                logger.debug("VN sprite: loading font %s (size=%s)", candidate, size)
+                logger.debug('VN sprite: loading font %s (size=%s)', candidate, size)
                 return ImageFont.truetype(str(candidate), size=size)
             except OSError as exc:
-                logger.warning("Failed to load VN font %s: %s", candidate, exc)
+                logger.warning('Failed to load VN font %s: %s', candidate, exc)
         else:
-            logger.debug("VN sprite: font candidate missing -> %s", candidate)
-    logger.warning("VN sprite: falling back to default font (size=%s)", size)
+            logger.debug('VN sprite: font candidate missing -> %s', candidate)
+    logger.warning('VN sprite: falling back to default font (size=%s)', size)
     return ImageFont.load_default()
 
-def _wrap_text(draw, text: str, font, max_width: int) -> Sequence[str]:
+
+@lru_cache(maxsize=64)
+def _load_emoji_font(size: int):
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return None
+    if not VN_EMOJI_FONT_PATH:
+        return None
+    emoji_path = Path(VN_EMOJI_FONT_PATH)
+    if not emoji_path.exists():
+        logger.debug('VN sprite: emoji font missing -> %s', emoji_path)
+        return None
+    try:
+        return ImageFont.truetype(str(emoji_path), size=size)
+    except OSError as exc:
+        logger.warning('Failed to load emoji font %s: %s', emoji_path, exc)
+        return None
+
+
+def _is_emoji_char(ch: str) -> bool:
+    code = ord(ch)
+    return code >= 0x1F000 or 0x2600 <= code <= 0x27BF or 0x1F300 <= code <= 0x1FAFF
+
+
+def _select_font_for_segment(segment: Dict, base_font: "ImageFont.ImageFont") -> "ImageFont.ImageFont":
+    """Return an appropriate font for this segment, handling bold and emoji fallbacks."""
+    size = getattr(base_font, "size", VN_TEXT_FONT_SIZE)
+    font = base_font
+    if segment.get("bold"):
+        font = _load_vn_font(size + 2)
+    if segment.get("emoji"):
+        emoji_font = _load_emoji_font(getattr(font, "size", size))
+        if emoji_font:
+            font = emoji_font
+    return font
+
+
+def parse_discord_formatting(text: str) -> Sequence[dict]:
+    """Parse a subset of Discord markdown into renderable text segments."""
+    segments: list[dict] = []
+    bold = italic = strike = False
+    buffer: list[str] = []
+
+    def emit_buffer() -> None:
+        if buffer:
+            segments.append(
+                {
+                    "text": "".join(buffer),
+                    "bold": bold,
+                    "italic": italic,
+                    "strike": strike,
+                    "emoji": False,
+                }
+            )
+            buffer.clear()
+
+    length = len(text)
+    i = 0
+    while i < length:
+        ch = text[i]
+        if text.startswith("**", i):
+            emit_buffer()
+            bold = not bold
+            i += 2
+            continue
+        if text.startswith("~~", i):
+            emit_buffer()
+            strike = not strike
+            i += 2
+            continue
+        if text.startswith("__", i):
+            emit_buffer()
+            italic = not italic
+            i += 2
+            continue
+        if ch in ("*", "_"):
+            emit_buffer()
+            italic = not italic
+            i += 1
+            continue
+        if ch == "\r":
+            i += 1
+            continue
+        if ch == "\n":
+            emit_buffer()
+            segments.append(
+                {
+                    "text": "\n",
+                    "bold": bold,
+                    "italic": italic,
+                    "strike": strike,
+                    "emoji": False,
+                    "newline": True,
+                }
+            )
+            i += 1
+            continue
+        if _is_emoji_char(ch):
+            emit_buffer()
+            cluster_chars = [ch]
+            i += 1
+            while i < length:
+                nxt = text[i]
+                if nxt == "\r":
+                    i += 1
+                    continue
+                if nxt == "\n":
+                    break
+                code = ord(nxt)
+                if nxt == "\u200d":
+                    cluster_chars.append(nxt)
+                    i += 1
+                    if i < length:
+                        cluster_chars.append(text[i])
+                        i += 1
+                    continue
+                if code in (0xFE0F, 0xFE0E) or 0x1F3FB <= code <= 0x1F3FF:
+                    cluster_chars.append(nxt)
+                    i += 1
+                    continue
+                if _is_emoji_char(nxt):
+                    cluster_chars.append(nxt)
+                    i += 1
+                    continue
+                break
+            segments.append(
+                {
+                    "text": "".join(cluster_chars),
+                    "bold": bold,
+                    "italic": italic,
+                    "strike": strike,
+                    "emoji": True,
+                }
+            )
+            continue
+        buffer.append(ch)
+        i += 1
+
+    emit_buffer()
+    if not segments:
+        return [{"text": text, "bold": False, "italic": False, "strike": False, "emoji": False}]
+    return segments
+
+
+def layout_formatted_text(draw, segments: Sequence[dict], base_font, max_width: int) -> Sequence[Sequence[dict]]:
+    """Lay out formatted segments into lines that fit the VN text box."""
+    result: list[list[dict]] = []
+    line: list[dict] = []
+    current_x = 0
+    baseline_height = getattr(base_font, "size", VN_TEXT_FONT_SIZE)
+
+    def push_line(force_blank: bool = False) -> None:
+        nonlocal line, current_x
+        if line:
+            result.append(line)
+        elif force_blank:
+            result.append([])
+        line = []
+        current_x = 0
+
+    for segment in segments:
+        if segment.get("newline"):
+            push_line(force_blank=True)
+            continue
+
+        text = segment.get("text", "")
+        if not text:
+            continue
+
+        segment_font = _select_font_for_segment(segment, base_font)
+        tokens = deque(_tokenize_for_layout(text, segment.get("emoji")))
+
+        while tokens:
+            token = tokens.popleft()
+            if token == "":
+                continue
+
+            if token.isspace() and not line:
+                continue
+
+            width = draw.textlength(token, font=segment_font)
+            if width > max_width and len(token) > 1 and not segment.get("emoji"):
+                splits = _split_token_to_width(token, segment_font, max_width, draw)
+                if len(splits) > 1:
+                    for part in reversed(splits):
+                        tokens.appendleft(part)
+                    continue
+
+            if current_x > 0 and current_x + width > max_width:
+                push_line()
+                if token.isspace():
+                    continue
+                width = draw.textlength(token, font=segment_font)
+
+            if current_x == 0 and token.isspace():
+                continue
+
+            height = getattr(segment_font, "size", baseline_height)
+            bbox = None
+            try:
+                if hasattr(segment_font, "getbbox"):
+                    bbox = segment_font.getbbox(token)
+                else:
+                    bbox = draw.textbbox((0, 0), token, font=segment_font)
+            except Exception:  # pylint: disable=broad-except
+                bbox = None
+            if bbox:
+                height = max(height, bbox[3] - bbox[1])
+
+            line.append(
+                {
+                    "text": token,
+                    "font": segment_font,
+                    "strike": segment.get("strike"),
+                    "bold": segment.get("bold"),
+                    "italic": segment.get("italic"),
+                    "emoji": segment.get("emoji"),
+                    "color": (240, 240, 240, 255),
+                    "width": width,
+                    "height": height,
+                }
+            )
+            current_x += width
+
+    push_line()
+    return result
+
+
+def _measure_layout_height(lines: Sequence[Sequence[dict]], base_line_height: int) -> int:
+    total = 0
+    line_spacing = 6
+    for line in lines:
+        if not line:
+            total += base_line_height + line_spacing
+            continue
+        line_height = base_line_height
+        for segment in line:
+            seg_height = segment.get("height")
+            if seg_height:
+                line_height = max(line_height, seg_height)
+        total += line_height + line_spacing
+    if total > 0:
+        total -= line_spacing
+    return total
+
+
+def _fit_text_segments(
+    draw,
+    segments: Sequence[dict],
+    starting_font,
+    max_width: int,
+    max_height: int,
+) -> Tuple[Sequence[Sequence[dict]], "ImageFont.ImageFont"]:
+    """Shrink text until it fits within the text box height."""
+    start_size = int(getattr(starting_font, "size", VN_TEXT_FONT_SIZE))
+    min_size = max(8, int(start_size * 0.5))
+    min_size = min(start_size, min_size)
+
+    chosen_lines: Sequence[Sequence[dict]] = []
+    chosen_font = starting_font
+
+    for size in range(start_size, min_size - 1, -1):
+        base_font = _load_vn_font(size)
+        lines = layout_formatted_text(draw, segments, base_font, max_width)
+        total_height = _measure_layout_height(lines, getattr(base_font, "size", size))
+        chosen_lines = lines
+        chosen_font = base_font
+        if total_height <= max_height:
+            break
+    return chosen_lines, chosen_font
+
+
+def _tokenize_for_layout(text: str, is_emoji: bool) -> Sequence[str]:
     if not text:
         return []
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip() if current else word
-        if draw.textlength(candidate, font=font) <= max_width:
-            current = candidate
+    if is_emoji:
+        return [text]
+    tokens: list[str] = []
+    idx = 0
+    length = len(text)
+    while idx < length:
+        start = idx
+        if text[idx].isspace():
+            while idx < length and text[idx].isspace():
+                idx += 1
         else:
-            if current:
-                lines.append(current)
-            current = word
+            while idx < length and not text[idx].isspace():
+                idx += 1
+        tokens.append(text[start:idx])
+    return tokens
+
+
+def _split_token_to_width(token: str, font, max_width: int, draw) -> Sequence[str]:
+    if not token:
+        return []
+    if max_width <= 0:
+        return [token]
+    pieces: list[str] = []
+    current = ""
+    for ch in token:
+        trial = current + ch
+        width = draw.textlength(trial, font=font)
+        if current and width > max_width:
+            pieces.append(current)
+            current = ch
+        elif not current and width > max_width:
+            pieces.append(ch)
+            current = ""
+        else:
+            current = trial
     if current:
-        lines.append(current)
-    return lines
+        pieces.append(current)
+    return pieces
 
 
-_vn_config_cache: Dict[str, Dict] = {}
+def _crop_transparent_top(image: "Image.Image") -> "Image.Image":
+    """Remove transparent rows from the top of an RGBA sprite while keeping width."""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if not bbox:
+        return image
+    _, top, _, bottom = bbox
+    height = bottom - top
+    if top <= 0 or height <= 0:
+        return image
+    bottom = min(image.height, max(top + height, top + 1))
+    cropped = image.crop((0, top, image.width, bottom))
+    logger.debug("VN sprite: trimmed transparent top (%s -> %s)", image.size, cropped.size)
+    return cropped
 
 
 def _load_character_config(character_dir: Path) -> Dict:
@@ -683,7 +1011,7 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
             face_path,
         )
 
-    return outfit_image
+    return _crop_transparent_top(outfit_image)
 
 def render_vn_panel(
     state: TransformationState,
@@ -709,11 +1037,11 @@ def render_vn_panel(
 
     from PIL import Image
     name_font = _load_vn_font(VN_NAME_FONT_SIZE)
-    text_font = _load_vn_font(VN_TEXT_FONT_SIZE)
+    base_text_font = _load_vn_font(VN_TEXT_FONT_SIZE)
 
     # Layout constants derived from vn_base.png geometry.
     name_box = (170, 10, 303, 26)
-    text_box = (178, 80, 800, 250)
+    text_box = (178, 80, 775, 250)
     name_padding = 10
     text_padding = 12
     avatar_box = (4, 4, 160, 250)
@@ -750,12 +1078,55 @@ def render_vn_panel(
             avatar_image = None
 
     if avatar_image is not None:
-        avatar_image = avatar_image.copy()
-        avatar_image.thumbnail((avatar_width, avatar_height), Image.LANCZOS)
-        pos_x = avatar_box[0] + (avatar_width - avatar_image.width) // 2
-        pos_y = avatar_box[1] + (avatar_height - avatar_image.height) // 2
-        base.paste(avatar_image, (pos_x, pos_y), avatar_image)
-        logger.debug("VN sprite: pasted avatar for %s at (%s, %s) size %s", state.character_name, pos_x, pos_y, avatar_image.size)
+        avatar_image = avatar_image.copy().convert("RGBA")
+        orig_w, orig_h = avatar_image.size
+        scale = max(0.1, VN_AVATAR_SCALE or 1.0)
+        scaled_w = max(1, int(orig_w * scale))
+        scaled_h = max(1, int(orig_h * scale))
+        if (scaled_w, scaled_h) != avatar_image.size:
+            avatar_image = avatar_image.resize((scaled_w, scaled_h), Image.LANCZOS)
+
+        target_w = avatar_width
+        target_h = avatar_height
+
+        if avatar_image.width < target_w or avatar_image.height < target_h:
+            adjust = max(target_w / avatar_image.width, target_h / avatar_image.height)
+            new_size = (
+                max(1, int(avatar_image.width * adjust)),
+                max(1, int(avatar_image.height * adjust)),
+            )
+            avatar_image = avatar_image.resize(new_size, Image.LANCZOS)
+
+        crop_left = max(0, (avatar_image.width - target_w) // 2)
+        crop_upper = 0
+        crop_right = crop_left + target_w
+        crop_lower = crop_upper + target_h
+        crop_box = (
+            crop_left,
+            crop_upper,
+            min(crop_right, avatar_image.width),
+            min(crop_lower, avatar_image.height),
+        )
+        cropped = avatar_image.crop(crop_box)
+
+        if cropped.size != (target_w, target_h):
+            canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            offset_x = max(0, (target_w - cropped.width) // 2)
+            offset_y = max(0, (target_h - cropped.height) // 2)
+            canvas.paste(cropped, (offset_x, offset_y), cropped)
+            cropped = canvas
+
+        pos_x = avatar_box[0]
+        pos_y = avatar_box[1]
+        base.paste(cropped, (pos_x, pos_y), cropped)
+        logger.debug(
+            "VN sprite: pasted avatar for %s at (%s, %s) size %s (scale=%s)",
+            state.character_name,
+            pos_x,
+            pos_y,
+            cropped.size,
+            scale,
+        )
     if avatar_image is None:
         logger.warning(
             "VN sprite: no avatar rendered for %s (mode=%s)",
@@ -772,16 +1143,35 @@ def render_vn_panel(
         message_content = f"{original_name} remains quietly transformed..."
 
     max_width = text_box[2] - text_box[0] - text_padding * 2
-    lines = _wrap_text(draw, message_content.strip(), text_font, max_width)
-    if not lines:
-        lines = ["..."]
-
-    line_height = (text_font.getbbox("Ag")[3] - text_font.getbbox("Ag")[1] + 4) if hasattr(text_font, "getbbox") else text_font.size + 4
+    max_height = text_box[3] - text_box[1] - text_padding * 2
+    formatted_segments = parse_discord_formatting(message_content.strip())
+    lines, text_font = _fit_text_segments(draw, formatted_segments, base_text_font, max_width, max_height)
     text_y = text_box[1] + text_padding
+    base_line_height = getattr(text_font, "size", VN_TEXT_FONT_SIZE)
     for line in lines:
-        draw.text((text_box[0] + text_padding, text_y), line, fill=(240, 240, 240, 255), font=text_font)
-        text_y += line_height
-
+        if not line:
+            text_y += base_line_height + 6
+            continue
+        text_x = text_box[0] + text_padding
+        max_height = 0
+        for segment in line:
+            fill = segment.get("color", (240, 240, 240, 255))
+            font_segment = segment["font"]
+            text_segment = segment.get("text", "")
+            width = segment.get("width", 0)
+            height = segment.get("height") or getattr(font_segment, "size", base_line_height)
+            if text_segment:
+                draw.text((text_x, text_y), text_segment, fill=fill, font=font_segment)
+                if segment.get("strike"):
+                    strike_y = text_y + height / 2
+                    draw.line(
+                        (text_x, strike_y, text_x + width, strike_y),
+                        fill=fill,
+                        width=max(1, int(height / 10)),
+                    )
+            max_height = max(max_height, height)
+            text_x += width
+        text_y += max_height + 6
     output = io.BytesIO()
     base.save(output, format="PNG")
     output.seek(0)
@@ -1396,12 +1786,6 @@ async def on_message(message: discord.Message):
     if message.guild and message.guild.owner_id == message.author.id:
         logger.debug("Ignoring message %s from server owner %s", message.id, message.author.id)
         return None
-    if DEV_MODE and is_admin_user:
-        logger.debug("Admin user %s message allowed (dev mode)", message.author.id)
-        return None
-    if DEV_MODE and is_admin_user:
-        logger.debug("Admin user %s message allowed (dev mode)", message.author.id)
-
     channel_id = getattr(message.channel, "id", None)
     if DEV_MODE and ALLOWED_CHANNEL_IDS and channel_id not in ALLOWED_CHANNEL_IDS:
         logger.info(
