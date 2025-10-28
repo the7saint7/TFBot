@@ -105,7 +105,6 @@ TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 minutes", timedelta(minutes=10)),
     ("1 hour", timedelta(hours=1)),
     ("10 hours", timedelta(hours=10)),
-    ("24 hours", timedelta(hours=24)),
 ]
 DEV_TRANSFORM_DURATION = ("2 minutes", timedelta(minutes=2))
 REQUIRED_GUILD_PERMISSIONS = {
@@ -2677,21 +2676,26 @@ async def tf_stats_command(ctx: commands.Context):
 
 @bot.command(name="bg")
 async def background_command(ctx: commands.Context, *, selection: str = ""):
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
     if VN_BACKGROUND_ROOT is None:
-        message = "Backgrounds are not configured on this bot."
-        if ctx.guild:
-            await ctx.reply(message, mention_author=False)
-        else:
-            await ctx.send(message)
+        try:
+            await ctx.author.send("Backgrounds are not configured on this bot.")
+        except discord.Forbidden:
+            if ctx.guild:
+                await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
         return
 
     choices = list_background_choices()
     if not choices:
-        message = "No background images were found in the configured directory."
-        if ctx.guild:
-            await ctx.reply(message, mention_author=False)
-        else:
-            await ctx.send(message)
+        try:
+            await ctx.author.send("No background images were found in the configured directory.")
+        except discord.Forbidden:
+            if ctx.guild:
+                await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
         return
 
     selection = selection.strip()
@@ -2734,45 +2738,37 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
                 await ctx.author.send(f"```\n{chunk}\n```")
             await ctx.author.send(instructions)
         except discord.Forbidden:
-            message = "I couldn't DM you. Please enable direct messages, then rerun `!bg`."
             if ctx.guild:
-                await ctx.reply(message, mention_author=False)
-            else:
-                await ctx.send(message)
+                await ctx.send("I couldn't DM you. Please enable direct messages, then rerun `!bg`.", delete_after=10)
             return
 
-        ack = "I've sent you a DM with the list of available backgrounds."
-        if ctx.guild:
-            await ctx.reply(ack, mention_author=False)
-        else:
-            await ctx.send(ack)
         return
 
     try:
         index = int(selection)
     except ValueError:
-        message = f"`{selection}` isn't a valid background number. Use `!bg` with no arguments to see the list."
-        if ctx.guild:
-            await ctx.reply(message, mention_author=False)
-        else:
-            await ctx.send(message)
+        try:
+            await ctx.author.send(f"`{selection}` isn't a valid background number. Use `!bg` with no arguments to see the list.")
+        except discord.Forbidden:
+            if ctx.guild:
+                await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
         return
 
     if index < 1 or index > len(choices):
-        message = f"Background number must be between 1 and {len(choices)}."
-        if ctx.guild:
-            await ctx.reply(message, mention_author=False)
-        else:
-            await ctx.send(message)
+        try:
+            await ctx.author.send(f"Background number must be between 1 and {len(choices)}.")
+        except discord.Forbidden:
+            if ctx.guild:
+                await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
         return
 
     selected_path = choices[index - 1]
     if not set_selected_background(ctx.author.id, selected_path):
-        message = "Unable to update your background at this time."
-        if ctx.guild:
-            await ctx.reply(message, mention_author=False)
-        else:
-            await ctx.send(message)
+        try:
+            await ctx.author.send("Unable to update your background at this time.")
+        except discord.Forbidden:
+            if ctx.guild:
+                await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
         return
 
     try:
@@ -2781,11 +2777,11 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     except ValueError:
         display = str(selected_path)
 
-    confirmation = f"Background set to `{display}`."
-    if ctx.guild:
-        await ctx.reply(confirmation, mention_author=False)
-    else:
-        await ctx.send(confirmation)
+    try:
+        await ctx.author.send(f"Background set to `{display}`.")
+    except discord.Forbidden:
+        if ctx.guild:
+            await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
 
 
 
