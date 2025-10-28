@@ -1127,7 +1127,7 @@ def _prepare_reply_snippet(text: str, limit: int = 180) -> str:
     cleaned = " ".join(text.split())
     if len(cleaned) <= limit:
         return cleaned
-    return cleaned[: limit - 1].rstrip() + "…"
+    return cleaned[: limit - 1].rstrip() + "â€¦"
 
 
 def _wrap_plain_text(draw, text: str, font, max_width: int) -> Sequence[str]:
@@ -1185,16 +1185,47 @@ def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
     return pngs[0]
 
 
+def _collect_accessory_layers(entry: Path) -> list[tuple[int, Path]]:
+    """Gather accessory layers defined under the outfit entry, respecting `acc-` naming and order."""
+    accessories: list[tuple[int, Path]] = []
+    for accessory_dir in sorted(
+        (child for child in entry.iterdir() if child.is_dir() and child.name.lower().startswith("acc-")),
+        key=lambda p: p.name.lower(),
+    ):
+        layer = _default_accessory_layer(accessory_dir)
+        if not layer:
+            continue
+        # Determine layer order from suffix
+        layer_name = accessory_dir.name
+        order = 0
+        if "-" in layer_name:
+            suffix = layer_name.rsplit("-", 1)[-1]
+            if suffix.lstrip("-").isdigit():
+                try:
+                    order = int(suffix)
+                except ValueError:
+                    order = 0
+        accessories.append((order, layer))
+    accessories.sort(key=lambda item: item[0])
+    return accessories
+
+
 def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
     assets: Dict[str, OutfitAsset] = {}
     outfits_dir = variant_dir / "outfits"
     if not outfits_dir.exists():
         return assets
-    for entry in sorted(outfits_dir.iterdir(), key=lambda p: p.name.lower()):
+    entries = sorted(outfits_dir.iterdir(), key=lambda p: p.name.lower())
+
+    # First pass – register standalone PNG outfits
+    for entry in entries:
         if entry.is_file() and entry.suffix.lower() == ".png":
             name = entry.stem
             assets[name.lower()] = OutfitAsset(name=name, base_path=entry, accessory_layers=())
-        elif entry.is_dir():
+
+    # First pass – build outfit directories
+    for entry in entries:
+        if entry.is_dir() and not entry.name.lower().startswith("acc"):
             primary = entry / f"{entry.name}.png"
             if not primary.exists():
                 primary = next((p for p in entry.glob("*.png")), None)
@@ -1202,19 +1233,28 @@ def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
                 primary = next((p for p in entry.rglob("*.png")), None)
             if not primary:
                 continue
-            accessories: list[Path] = []
-            for accessory_dir in sorted(
-                (child for child in entry.iterdir() if child.is_dir()),
-                key=lambda p: p.name.lower(),
-            ):
-                layer = _default_accessory_layer(accessory_dir)
-                if layer:
-                    accessories.append(layer)
+            accessories = []
+            # Collect outfit-specific accessories (acc- folders scoped to this entry)
+            accessories.extend(_collect_accessory_layers(entry))
             assets[entry.name.lower()] = OutfitAsset(
                 name=entry.name,
                 base_path=primary,
-                accessory_layers=tuple(accessories),
+                accessory_layers=tuple(layer for _, layer in accessories),
             )
+
+    # Second pass – apply global accessories (acc_* folders under outfits/)
+    for entry in entries:
+        if entry.is_dir() and entry.name.lower().startswith("acc"):
+            global_layers = _collect_accessory_layers(entry)
+            if global_layers:
+                for key, asset in list(assets.items()):
+                    combined = list(asset.accessory_layers)
+                    combined.extend(layer for _, layer in global_layers)
+                    assets[key] = OutfitAsset(
+                        name=asset.name,
+                        base_path=asset.base_path,
+                        accessory_layers=tuple(combined),
+                    )
     return assets
 
 
@@ -1290,6 +1330,7 @@ def _crop_transparent_left(image: "Image.Image") -> "Image.Image":
     left = 0
     right = image.width
     # move left bound until any non-transparent pixel is found
+    # Walk each column from the far left until we hit a pixel with alpha > 0
     while left < image.width:
         column = [pixels[left, y] for y in range(image.height)]
         if any(column):
@@ -1300,6 +1341,34 @@ def _crop_transparent_left(image: "Image.Image") -> "Image.Image":
     cropped = image.crop((left, 0, right, image.height))
     logger.debug("VN sprite: trimmed transparent left (%s -> %s)", image.size, cropped.size)
     return cropped
+
+
+def _crop_transparent_vertical(image: "Image.Image") -> "Image.Image":
+    """Trim transparent rows from both the top and bottom of the sprite."""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if not bbox:
+        return image
+    _, top, _, bottom = bbox
+    if top <= 0 and bottom >= image.height:
+        return image
+    top = max(0, top)
+    bottom = min(image.height, bottom)
+    cropped = image.crop((0, top, image.width, bottom))
+    logger.debug("VN sprite: trimmed transparent vertical space (%s -> %s)", image.size, cropped.size)
+    return cropped
+
+
+def _get_pose_metadata(config: Dict, pose_name: str) -> Dict:
+    poses = config.get("poses")
+    if not isinstance(poses, dict):
+        return {}
+    metadata = poses.get(pose_name) or poses.get(pose_name.lower())
+    if isinstance(metadata, dict):
+        return metadata
+    return {}
 
 
 def _load_character_config(character_dir: Path) -> Dict:
@@ -1735,22 +1804,8 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         if cache_file.exists():
             try:
                 cached = Image.open(cache_file).convert("RGBA")
-                trimmed_cached = _crop_transparent_top(cached)
-                trimmed_cached = _crop_transparent_left(trimmed_cached)
-                if trimmed_cached.size != cached.size:
-                    try:
-                        trimmed_cached.save(cache_file)
-                        logger.debug(
-                            "VN sprite: refreshed cached avatar %s (%s -> %s)",
-                            cache_file,
-                            cached.size,
-                            trimmed_cached.size,
-                        )
-                    except OSError as exc:
-                        logger.warning("VN sprite: unable to refresh cached avatar %s: %s", cache_file, exc)
-                else:
-                    logger.debug("VN sprite: loaded cached avatar %s", cache_file)
-                return trimmed_cached
+                logger.debug("VN sprite: loaded cached avatar %s", cache_file)
+                return cached
             except OSError as exc:
                 logger.warning("VN sprite: failed to load cached avatar %s: %s (rebuilding)", cache_file, exc)
 
@@ -1760,6 +1815,7 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         logger.warning("Failed to load outfit %s: %s", outfit_path, exc)
         return None
 
+    # Step 1 – compose the base sprite by layering accessories and the face onto the outfit
     for layer_path in outfit_asset.accessory_layers:
         if not layer_path.exists():
             continue
@@ -1783,8 +1839,33 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
             face_path,
         )
 
-    final_image = _crop_transparent_top(outfit_image)
-    final_image = _crop_transparent_left(final_image)
+    # Step 2 â€“ determine facing direction and mirror if the pose is defined as facing left
+    pose_metadata = _get_pose_metadata(config, variant_dir.name)
+    facing = str(pose_metadata.get("facing") or config.get("facing") or "left").lower()
+    logger.debug("VN sprite: pose %s facing=%s", variant_dir.name, facing)
+    if facing != "right":
+        from PIL import ImageOps
+
+        outfit_image = ImageOps.mirror(outfit_image)
+        logger.debug("VN sprite: sprite mirrored for pose %s", variant_dir.name)
+
+    # Step 3 â€“ crop away transparent rows from the top/bottom to tighten the sprite vertically
+    outfit_image = _crop_transparent_vertical(outfit_image)
+
+    # Step 4 â€“ honour any scale override from the character config (pose-level or global)
+    scale_value = pose_metadata.get("scale", config.get("scale", 1.0))
+    try:
+        scale_factor = float(scale_value)
+    except (TypeError, ValueError):
+        scale_factor = 1.0
+    if scale_factor > 0 and abs(scale_factor - 1.0) > 1e-3:
+        new_size = (
+            max(1, int(outfit_image.width * scale_factor)),
+            max(1, int(outfit_image.height * scale_factor)),
+        )
+        outfit_image = outfit_image.resize(new_size, Image.LANCZOS)
+
+    final_image = outfit_image
     if cache_file:
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1832,7 +1913,7 @@ def render_vn_panel(
     text_box = (178, 80, 775, 250)
     name_padding = 10
     text_padding = 12
-    avatar_box = (4, 4, 250, 250)
+    avatar_box = (0, 4, 220, 250)
     avatar_width = avatar_box[2] - avatar_box[0]
     avatar_height = avatar_box[3] - avatar_box[1]
 
@@ -1866,6 +1947,7 @@ def render_vn_panel(
             avatar_image = None
 
     if avatar_image is not None:
+        # Take a working copy so we can freely crop/scale this render
         avatar_image = avatar_image.copy().convert("RGBA")
         orig_w, orig_h = avatar_image.size
         scale = max(0.1, VN_AVATAR_SCALE or 1.0)
@@ -1885,10 +1967,17 @@ def render_vn_panel(
             )
             avatar_image = avatar_image.resize(new_size, Image.LANCZOS)
 
+        # Step 5 – centre the prepared sprite within the avatar box
         crop_left = max(0, (avatar_image.width - target_w) // 2)
         crop_upper = 0
         crop_right = crop_left + target_w
         crop_lower = crop_upper + target_h
+        if crop_right > avatar_image.width:
+            shift = crop_right - avatar_image.width
+            crop_left = max(0, crop_left - shift)
+            crop_right = avatar_image.width
+        if crop_lower > avatar_image.height:
+            crop_lower = avatar_image.height
         crop_box = (
             crop_left,
             crop_upper,
@@ -1898,6 +1987,7 @@ def render_vn_panel(
         cropped = avatar_image.crop(crop_box)
 
         if cropped.size != (target_w, target_h):
+            # If the source sprite was narrower, pad it back to our expected panel box
             canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
             offset_x = max(0, (target_w - cropped.width) // 2)
             offset_y = max(0, (target_h - cropped.height) // 2)
