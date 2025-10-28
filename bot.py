@@ -67,6 +67,33 @@ MESSAGE_STYLE = os.getenv("TFBOT_MESSAGE_STYLE", "classic").lower()
 VN_BASE_IMAGE = Path(os.getenv("TFBOT_VN_BASE", "vn_assets/vn_base.png"))
 VN_FONT_PATH = os.getenv("TFBOT_VN_FONT", "").strip()
 VN_EMOJI_FONT_PATH = os.getenv('TFBOT_VN_EMOJI_FONT', 'fonts/NotoEmoji-VariableFont_wght.ttf').strip()
+def _path_from_env(name: str) -> Optional[Path]:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    return Path(value).expanduser()
+
+
+
+
+
+
+
+VN_FONT_REGULAR_PATH = (
+    _path_from_env("TFBOT_VN_FONT_REGULAR")
+    or (Path(VN_FONT_PATH).expanduser() if VN_FONT_PATH else None)
+)
+VN_FONT_BOLD_PATH = _path_from_env("TFBOT_VN_FONT_BOLD")
+VN_FONT_ITALIC_PATH = _path_from_env("TFBOT_VN_FONT_ITALIC")
+VN_FONT_BOLD_ITALIC_PATH = _path_from_env("TFBOT_VN_FONT_BOLD_ITALIC")
+
+_FONT_STYLE_PATHS: Dict[str, Optional[Path]] = {
+    "regular": VN_FONT_REGULAR_PATH,
+    "bold": VN_FONT_BOLD_PATH,
+    "italic": VN_FONT_ITALIC_PATH,
+    "bold_italic": VN_FONT_BOLD_ITALIC_PATH,
+}
+
 VN_NAME_FONT_SIZE = int(os.getenv("TFBOT_VN_NAME_SIZE", "34"))
 VN_TEXT_FONT_SIZE = int(os.getenv("TFBOT_VN_TEXT_SIZE", "26"))
 VN_GAME_ROOT = Path(os.getenv("TFBOT_VN_GAME_ROOT", "")).expanduser().resolve() if os.getenv("TFBOT_VN_GAME_ROOT") else None
@@ -763,32 +790,37 @@ async def _resolve_reply_context(message: discord.Message) -> Optional[ReplyCont
     return None
 
 
-@lru_cache(maxsize=64)
-def _load_vn_font(size: int) -> "ImageFont.ImageFont":
+@lru_cache(maxsize=128)
+def _load_vn_font(size: int, style: str = "regular") -> "ImageFont.ImageFont":
     try:
         from PIL import ImageFont
     except ImportError:
         return ImageFont.load_default()
 
-    font_candidates = []
-    if VN_FONT_PATH:
-        font_candidates.append(Path(VN_FONT_PATH))
-    font_candidates.append(BASE_DIR / 'fonts' / 'Ubuntu-B.ttf')
+    style = (style or "regular").lower()
+    style_sequence = {
+        "regular": ["regular"],
+        "bold": ["bold", "regular"],
+        "italic": ["italic", "regular"],
+        "bold_italic": ["bold_italic", "bold", "italic", "regular"],
+    }.get(style, ["regular"])
 
     attempted = set()
-    for candidate in font_candidates:
+    for style_key in style_sequence:
+        candidate = _FONT_STYLE_PATHS.get(style_key)
         if not candidate or candidate in attempted:
             continue
+        candidate = candidate.expanduser()
         attempted.add(candidate)
         if candidate.exists():
             try:
-                logger.debug('VN sprite: loading font %s (size=%s)', candidate, size)
+                logger.debug('VN sprite: loading font %s (size=%s style=%s)', candidate, size, style_key)
                 return ImageFont.truetype(str(candidate), size=size)
             except OSError as exc:
                 logger.warning('Failed to load VN font %s: %s', candidate, exc)
         else:
             logger.debug('VN sprite: font candidate missing -> %s', candidate)
-    logger.warning('VN sprite: falling back to default font (size=%s)', size)
+    logger.warning('VN sprite: falling back to default font (size=%s style=%s)', size, style)
     return ImageFont.load_default()
 
 
@@ -817,11 +849,17 @@ def _is_emoji_char(ch: str) -> bool:
 
 
 def _select_font_for_segment(segment: Dict, base_font: "ImageFont.ImageFont") -> "ImageFont.ImageFont":
-    """Return an appropriate font for this segment, handling bold and emoji fallbacks."""
+    """Return an appropriate font for this segment, handling bold/italic/emoji fallbacks."""
     size = getattr(base_font, "size", VN_TEXT_FONT_SIZE)
-    font = base_font
-    if segment.get("bold"):
-        font = _load_vn_font(size + 2)
+    style = "regular"
+    if segment.get("bold") and segment.get("italic"):
+        style = "bold_italic"
+    elif segment.get("bold"):
+        style = "bold"
+    elif segment.get("italic"):
+        style = "italic"
+
+    font = _load_vn_font(size + (2 if segment.get("bold") else 0), style=style)
     if segment.get("emoji"):
         emoji_font = _load_emoji_font(getattr(font, "size", size))
         if emoji_font:
@@ -1210,8 +1248,6 @@ def _collect_accessory_layers(entry: Path, include_all: bool = False) -> list[tu
                     order = int(suffix)
                 except ValueError:
                     order = 0
-        if not include_all and not accessory_dir.name.lower().startswith("acc"):
-            continue
         accessories.append((order, layer))
     accessories.sort(key=lambda item: item[0])
     return accessories
