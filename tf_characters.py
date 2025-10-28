@@ -250,4 +250,85 @@ TF_CHARACTERS = [
         "message": "touches a phone charm flickering with Syn’s energy, and a jolt of pink light dances up their arm. Their grin widens, their body language loosens, and that unstoppable influencer energy takes over like it owns the moment.",
     },
 
+    {
+        "name": "Brad Chambers",
+        "avatar_path": "avatars/brad.png",
+        "message": "grabs a gym towel that’s quietly pulsing with Syn’s magic, and a warm jolt runs through them. Their stance settles into easy jock confidence, and they suddenly feel stupidly protective of the people around them.",
+    },
+    {
+        "name": "Claus Hawkins",
+        "avatar_path": "avatars/claus.png",
+        "message": "touches a Student Council armband that’s been marked with a tiny rune, and the air tightens around them. Their posture goes strict and efficient, and their thoughts swing straight to rules, order, and taking charge.",
+    },
+    {
+        "name": "Dominic Carter",
+        "avatar_path": "avatars/dominic.png",
+        "message": "adjusts a server apron from Serenade and doesn’t notice the faint shimmer stitched into it. Their expression smooths into polite charm, and they slip into that calm, practiced tone of someone living off tips and patience.",
+    },
+    {
+        "name": "Eric Tyner",
+        "avatar_path": "avatars/eric.png",
+        "message": "lights up a cigarette that flickers purple instead of amber, and a lazy wave rolls through them. Their body language goes slouched and cocky, and their thoughts drift into that troublemaker mindset that never takes school seriously.",
+    },
+    {
+        "name": "Gabriel Riel",
+        "avatar_path": "avatars/gabriel.png",
+        "message": "opens a weird little charm covered in symbols and hears it hum back. A cool stillness settles over them, and they start looking at everyone like a walking experiment that needs to be documented and judged.",
+    },
+    {
+        "name": "Greg Fisk",
+        "avatar_path": "avatars/greg.png",
+        "message": "picks up a bio textbook that crackles with Syn’s mark, and a sharp clarity hits fast. Their tone shifts to firm lecture mode, and they feel this urge to demand focus and reward ‘good effort’ like a real teacher.",
+    },
+    {
+        "name": "Hank Vega",
+        "avatar_path": "avatars/hank.png",
+        "message": "leans on a set of enchanted car keys Syn left on the counter, and a grounded weight settles in. They feel steady, stubborn, a little lonely, and way too ready to act like they’re responsible for everybody’s safety.",
+    },
+    {
+        "name": "Jack Mallory",
+        "avatar_path": "avatars/jack.png",
+        "message": "brushes a history binder that sparks at his touch, and the air seems to get meaner. Their voice turns sharp and smug, and they get that urge to lecture about pain and consequences just to watch people squirm.",
+    },
+    {
+        "name": "John Davis",
+        "avatar_path": "avatars/john.png",
+        "message": "picks up a notebook that Syn absolutely wasn’t supposed to have access to, and a soft glow crawls up their arm. Their thoughts start sliding into quick improvisation and damage control, like chaos is normal and they’re built for it.",
+    },
+    {
+        "name": "Kiyoshi Honda",
+        "avatar_path": "avatars/kiyoshi.png",
+        "message": "grabs a USB stick labeled ‘classified’ in marker, and the thing actually hums. A rush of paranoid excitement fires through them, and suddenly every hallway shadow feels like proof of the conspiracy they’ve been talking about for years.",
+    },
+    {
+        "name": "Marty",
+        "avatar_path": "avatars/marty.png",
+        "message": "wipes down a bar glass that Syn quietly tagged, and a smooth warmth spreads through them. Their smile turns easy, their voice drops to playful, and they start reading people like regulars waiting to spill secrets.",
+    },
+    {
+        "name": "Matt Davidson",
+        "avatar_path": "avatars/matt.png",
+        "message": "picks up a retro game case with a faint glow at the seam, and a nostalgic buzz hits. Their mood turns laid-back and slightly flirty, and they start thinking about settling in, getting comfortable, and not being alone tonight.",
+    },
+    {
+        "name": "Maurice Honda",
+        "avatar_path": "avatars/maurice.png",
+        "message": "taps a police-style notepad Syn spelled over, and a low, observant calm moves in. They start tracking details in the room automatically, carrying themselves like the tired adult who’s seen it all and still shows up anyway.",
+    },
+    {
+        "name": "Nemuri Otani",
+        "avatar_path": "avatars/nemuri.png",
+        "message": "rests a hand on a shrine charm that’s been tampered with, and a quiet weight wraps around them. They feel protective and worn, with that deep, constant worry that comes from taking care of someone who needs you.",
+    },
+    {
+        "name": "Paul Simmons",
+        "avatar_path": "avatars/paul.png",
+        "message": "opens a glowing planner covered in tiny notes, and a warm little rush lands behind their eyes. They slide right into friendly nerd mode, half apologetic and half proud, and already ready to overshare lore nobody asked for.",
+    },
+    {
+        "name": "Riley Evans",
+        "avatar_path": "avatars/riley.png",
+        "message": "picks up a tiny folded note with Syn’s sigil on it, and a nervous spark jumps in their chest. Their stance goes a little smaller, their face goes red fast, and they can’t stop thinking about how cute everybody suddenly looks.",
+    },
 ]
+

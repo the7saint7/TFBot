@@ -75,6 +75,7 @@ VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
 VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
 VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
 VN_AVATAR_SCALE = max(0.1, _float_from_env("TFBOT_VN_AVATAR_SCALE", 1.0))
+VN_NAME_DEFAULT_COLOR: Tuple[int, int, int, int] = (255, 220, 180, 255)
 _VN_CACHE_DIR_SETTING = os.getenv("TFBOT_VN_CACHE_DIR", "vn_cache").strip()
 TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 minutes", timedelta(minutes=10)),
@@ -1007,6 +1008,54 @@ def _load_character_config(character_dir: Path) -> Dict:
     return config
 
 
+def _parse_hex_color(raw_color: str) -> Optional[Tuple[int, int, int, int]]:
+    if not raw_color:
+        return None
+    value = raw_color.strip()
+    if not value:
+        return None
+    if value.lower().startswith("0x"):
+        value = value[2:]
+    if value.startswith("#"):
+        value = value[1:]
+    if len(value) not in {6, 8}:
+        return None
+    try:
+        components = [int(value[i : i + 2], 16) for i in range(0, len(value), 2)]
+    except ValueError:
+        return None
+    if len(components) == 3:
+        components.append(255)
+    if len(components) != 4:
+        return None
+    r, g, b, a = components[:4]
+    return r, g, b, a
+
+
+def _resolve_character_name_color(character_name: str) -> Tuple[int, int, int, int]:
+    if not character_name:
+        return VN_NAME_DEFAULT_COLOR
+    directory, _ = resolve_character_directory(character_name)
+    if directory is None:
+        return VN_NAME_DEFAULT_COLOR
+    config = _load_character_config(directory)
+    raw_color = config.get("name_color") or config.get("text_color")
+    if isinstance(raw_color, str):
+        parsed = _parse_hex_color(raw_color)
+        if parsed:
+            return parsed
+    if isinstance(raw_color, Sequence) and not isinstance(raw_color, (str, bytes, bytearray)):
+        components = list(raw_color)
+        if 3 <= len(components) <= 4 and all(isinstance(c, (int, float)) for c in components):
+            channel_values = [max(0, min(255, int(c))) for c in components[:4]]
+            if len(channel_values) == 3:
+                channel_values.append(255)
+            if len(channel_values) == 4:
+                r, g, b, a = channel_values
+                return r, g, b, a
+    return VN_NAME_DEFAULT_COLOR
+
+
 def _select_variant_dir(character_dir: Path, config: Dict) -> Optional[Path]:
     variants = {child.name.lower(): child for child in character_dir.iterdir() if child.is_dir()}
     if not variants:
@@ -1390,7 +1439,8 @@ def render_vn_panel(
     name_text = character_display_name
     name_x = name_box[0] + name_padding
     name_y = name_box[1] + name_padding
-    draw.text((name_x, name_y), name_text, fill=(255, 220, 180, 255), font=name_font)
+    name_color = _resolve_character_name_color(state.character_name)
+    draw.text((name_x, name_y), name_text, fill=name_color, font=name_font)
 
     working_content = message_content.strip()
     if not working_content:
@@ -1979,8 +2029,13 @@ async def on_ready():
     logger.info("Dev mode: %s", "ON" if DEV_MODE else "OFF")
     if DEV_MODE:
         logger.info("Allowed channel: %s", DEV_CHANNEL_ID)
-    if IGNORED_CHANNEL_IDS and not DEV_MODE:
-        logger.info("Ignoring channels: %s", ", ".join(str(cid) for cid in IGNORED_CHANNEL_IDS))
+    else:
+        logger.info("Dev channel %s is excluded while dev mode is OFF.", DEV_CHANNEL_ID)
+        if IGNORED_CHANNEL_IDS:
+            logger.info(
+                "Ignoring additional channels: %s",
+                ", ".join(str(cid) for cid in IGNORED_CHANNEL_IDS),
+            )
     await log_guild_permissions()
     await log_channel_access()
 
@@ -2019,6 +2074,109 @@ async def secret_reset_command(ctx: commands.Context):
         f"Triggered by: **{author.name}**\nRestored TFs: {restored}",
     )
     await ctx.channel.send(f"TF reset completed. Restored {restored} transformations.", delete_after=10)
+
+
+@bot.command(name="reroll")
+@commands.guild_only()
+async def reroll_command(ctx: commands.Context, member: Optional[discord.Member] = None):
+    author = ctx.author
+    if not isinstance(author, discord.Member):
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return None
+    if not _is_admin(author):
+        await ctx.reply("You lack permission to run this command.", mention_author=False)
+        return None
+
+    target = member or author
+    if not isinstance(target, discord.Member):
+        await ctx.reply("Could not identify the member to reroll.", mention_author=False)
+        return None
+
+    guild = ctx.guild
+    key = _state_key(guild.id, target.id)
+    state = active_transformations.get(key)
+    if state is None:
+        message = (
+            f"{target.display_name} is not currently transformed; nothing to reroll."
+            if target != author
+            else "You are not currently transformed; nothing to reroll."
+        )
+        await ctx.reply(message, mention_author=False)
+        return None
+
+    used_characters = {
+        current_state.character_name
+        for current_key, current_state in active_transformations.items()
+        if current_key != key
+    }
+    available_characters = [
+        character
+        for character in CHARACTER_POOL
+        if character.name not in used_characters and character.name != state.character_name
+    ]
+    if not available_characters:
+        await ctx.reply(
+            "No alternative characters are available to reroll right now.",
+            mention_author=False,
+        )
+        return None
+
+    new_character = random.choice(available_characters)
+    try:
+        await target.edit(nick=new_character.name, reason="TF reroll")
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        logger.warning("Failed to update nickname for reroll on %s: %s", target.id, exc)
+        await ctx.reply(
+            "I couldn't update their nickname, so the reroll was cancelled.",
+            mention_author=False,
+        )
+        return None
+
+    previous_character = state.character_name
+    state.character_name = new_character.name
+    state.character_avatar_path = new_character.avatar_path
+    state.character_message = new_character.message
+    state.avatar_applied = False
+    persist_states()
+
+    increment_tf_stats(guild.id, target.id, new_character.name)
+
+    await send_history_message(
+        "TF Rerolled",
+        (
+            f"Triggered by: **{author.display_name}**\n"
+            f"Member: **{target.display_name}**\n"
+            f"Previous Character: **{previous_character}**\n"
+            f"New Character: **{new_character.name}**"
+        ),
+    )
+
+    original_name = state.original_nick or target.name
+    response_text = _format_character_message(
+        new_character.message,
+        original_name,
+        target.mention,
+        state.duration_label,
+        new_character.name,
+    )
+    emoji_prefix = _get_magic_emoji(guild)
+    try:
+        await ctx.channel.send(
+            f"{emoji_prefix} {response_text}",
+            allowed_mentions=discord.AllowedMentions(users=[target]),
+        )
+    except discord.HTTPException as exc:
+        logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
+
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
+    await ctx.send(
+        f"{target.display_name} has been rerolled into **{new_character.name}**.",
+        delete_after=10,
+    )
 
 
 @bot.command(name="tf", aliases=["TF"])
@@ -2218,6 +2376,14 @@ async def on_message(message: discord.Message):
             message.id,
             channel_id,
             ", ".join(str(c) for c in ALLOWED_CHANNEL_IDS),
+        )
+        return None
+
+    if not DEV_MODE and channel_id == DEV_CHANNEL_ID:
+        logger.info(
+            "Skipping message %s: dev channel %s is disabled while dev mode is off.",
+            message.id,
+            channel_id,
         )
         return None
 
