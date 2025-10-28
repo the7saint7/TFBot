@@ -848,6 +848,20 @@ def _is_emoji_char(ch: str) -> bool:
     return code >= 0x1F000 or 0x2600 <= code <= 0x27BF or 0x1F300 <= code <= 0x1FAFF
 
 
+
+
+def _strip_urls(text: str) -> tuple[str, bool]:
+    found = [False]
+
+    def repl(match: re.Match[str]) -> str:
+        found[0] = True
+        return ''
+
+    stripped = URL_RE.sub(repl, text)
+    if not found[0]:
+        return text, False
+    normalized = ' '.join(stripped.split())
+    return normalized.strip(), True
 def _select_font_for_segment(segment: Dict, base_font: "ImageFont.ImageFont") -> "ImageFont.ImageFont":
     """Return an appropriate font for this segment, handling bold/italic/emoji fallbacks."""
     size = getattr(base_font, "size", VN_TEXT_FONT_SIZE)
@@ -868,6 +882,7 @@ def _select_font_for_segment(segment: Dict, base_font: "ImageFont.ImageFont") ->
 
 
 CUSTOM_EMOJI_RE = re.compile(r"<(a?):([a-zA-Z0-9_]{2,}):(\d+)>")
+URL_RE = re.compile(r"https?://\S+")
 
 
 def parse_discord_formatting(text: str) -> Sequence[dict]:
@@ -1165,7 +1180,7 @@ def _prepare_reply_snippet(text: str, limit: int = 180) -> str:
     cleaned = " ".join(text.split())
     if len(cleaned) <= limit:
         return cleaned
-    return cleaned[: limit - 1].rstrip() + "â€¦"
+    return cleaned[: limit - 1].rstrip() + "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
 
 
 def _wrap_plain_text(draw, text: str, font, max_width: int) -> Sequence[str]:
@@ -1260,13 +1275,13 @@ def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
         return assets
     entries = sorted(outfits_dir.iterdir(), key=lambda p: p.name.lower())
 
-    # First pass – register standalone PNG outfits
+    # First pass Ã¢â‚¬â€œ register standalone PNG outfits
     for entry in entries:
         if entry.is_file() and entry.suffix.lower() == ".png":
             name = entry.stem
             assets[name.lower()] = OutfitAsset(name=name, base_path=entry, accessory_layers=())
 
-    # First pass – build outfit directories
+    # First pass Ã¢â‚¬â€œ build outfit directories
     for entry in entries:
         if entry.is_dir() and not entry.name.lower().startswith("acc"):
             primary = entry / f"{entry.name}.png"
@@ -1285,7 +1300,7 @@ def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
                 accessory_layers=tuple(layer for _, layer in accessories),
             )
 
-    # Second pass – apply global accessories (acc_* folders under outfits/)
+    # Second pass Ã¢â‚¬â€œ apply global accessories (acc_* folders under outfits/)
     for entry in entries:
         if entry.is_dir() and entry.name.lower().startswith("acc"):
             global_layers = _collect_accessory_layers(entry)
@@ -1858,7 +1873,7 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         logger.warning("Failed to load outfit %s: %s", outfit_path, exc)
         return None
 
-    # Step 1 – compose the base sprite by layering accessories and the face onto the outfit
+    # Step 1 Ã¢â‚¬â€œ compose the base sprite by layering accessories and the face onto the outfit
     for layer_path in outfit_asset.accessory_layers:
         if not layer_path.exists():
             continue
@@ -1882,7 +1897,7 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
             face_path,
         )
 
-    # Step 2 â€“ determine facing direction and mirror if the pose is defined as facing left
+    # Step 2 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ determine facing direction and mirror if the pose is defined as facing left
     pose_metadata = _get_pose_metadata(config, variant_dir.name)
     facing = str(pose_metadata.get("facing") or config.get("facing") or "left").lower()
     logger.debug("VN sprite: pose %s facing=%s", variant_dir.name, facing)
@@ -1892,10 +1907,10 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         outfit_image = ImageOps.mirror(outfit_image)
         logger.debug("VN sprite: sprite mirrored for pose %s", variant_dir.name)
 
-    # Step 3 â€“ crop away transparent rows from the top/bottom to tighten the sprite vertically
+    # Step 3 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ crop away transparent rows from the top/bottom to tighten the sprite vertically
     outfit_image = _crop_transparent_vertical(outfit_image)
 
-    # Step 4 â€“ honour any scale override from the character config (pose-level or global)
+    # Step 4 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ honour any scale override from the character config (pose-level or global)
     scale_value = pose_metadata.get("scale", config.get("scale", 1.0))
     try:
         scale_factor = float(scale_value)
@@ -2010,7 +2025,7 @@ def render_vn_panel(
             )
             avatar_image = avatar_image.resize(new_size, Image.LANCZOS)
 
-        # Step 5 – centre the prepared sprite within the avatar box
+        # Step 5 Ã¢â‚¬â€œ centre the prepared sprite within the avatar box
         crop_left = max(0, (avatar_image.width - target_w) // 2)
         crop_upper = 0
         crop_right = crop_left + target_w
@@ -2285,6 +2300,10 @@ async def relay_transformed_message(
                 rewritten[:120],
             )
             cleaned_content = rewritten.strip()
+    has_links = False
+    if cleaned_content:
+        cleaned_content, has_links = _strip_urls(cleaned_content)
+        cleaned_content = cleaned_content.strip()
 
     description = cleaned_content if cleaned_content else "*no message content*"
     formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else None
@@ -2338,30 +2357,23 @@ async def relay_transformed_message(
 
         payload["embed"] = embed
 
-    for attachment in message.attachments:
+    has_attachments = bool(message.attachments)
+    preserve_original = has_attachments or has_links
+    deleted = False
+    if not preserve_original:
+        deleted = True
         try:
-            files.append(await attachment.to_file())
-        except discord.HTTPException as exc:
-            logger.warning(
-                "Failed to mirror attachment %s from message %s: %s",
-                attachment.id,
+            await message.delete()
+        except discord.Forbidden:
+            deleted = False
+            logger.debug(
+                "Missing permission to delete message %s for TF relay in channel %s",
                 message.id,
-                exc,
+                message.channel.id,
             )
-
-    deleted = True
-    try:
-        await message.delete()
-    except discord.Forbidden:
-        deleted = False
-        logger.debug(
-            "Missing permission to delete message %s for TF relay in channel %s",
-            message.id,
-            message.channel.id,
-        )
-    except discord.HTTPException as exc:
-        deleted = False
-        logger.warning("Failed to delete message %s: %s", message.id, exc)
+        except discord.HTTPException as exc:
+            deleted = False
+            logger.warning("Failed to delete message %s: %s", message.id, exc)
 
     if not deleted and "embed" in payload:
         payload["embed"].set_footer(text="Grant Manage Messages so TF relay can replace posts.")
@@ -2385,6 +2397,14 @@ async def relay_transformed_message(
 
     if sent_message and cleaned_content:
         _register_relay_message(sent_message.id, state.character_name, cleaned_content)
+
+    if has_attachments and not has_links:
+        placeholder = "\u200b"
+        if message.content != placeholder:
+            try:
+                await message.edit(content=placeholder, attachments=message.attachments, suppress=True)
+            except discord.HTTPException as exc:
+                logger.debug("Unable to clear attachment message %s: %s", message.id, exc)
 
     return True
 
