@@ -2518,7 +2518,7 @@ async def secret_reset_command(ctx: commands.Context):
 
 @bot.command(name="reroll")
 @commands.guild_only()
-async def reroll_command(ctx: commands.Context, member: Optional[discord.Member] = None):
+async def reroll_command(ctx: commands.Context, *, character_name: str = ""):
     author = ctx.author
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
@@ -2527,21 +2527,50 @@ async def reroll_command(ctx: commands.Context, member: Optional[discord.Member]
         await ctx.reply("You lack permission to run this command.", mention_author=False)
         return None
 
-    target = member or author
-    if not isinstance(target, discord.Member):
-        await ctx.reply("Could not identify the member to reroll.", mention_author=False)
-        return None
-
     guild = ctx.guild
-    key = _state_key(guild.id, target.id)
-    state = active_transformations.get(key)
-    if state is None:
-        message = (
-            f"{target.display_name} is not currently transformed; nothing to reroll."
-            if target != author
-            else "You are not currently transformed; nothing to reroll."
+    target_member: Optional[discord.Member] = None
+    state: Optional[TransformationState] = None
+
+    query = character_name.strip().lower()
+    if query:
+        first_token = query.split(" ", 1)[0]
+        matching_states = [
+            s
+            for s in active_transformations.values()
+            if s.guild_id == guild.id and s.character_name.split(" ", 1)[0].lower() == first_token
+        ]
+        if not matching_states:
+            await ctx.reply(
+                f"No active transformation found for character `{character_name}`.",
+                mention_author=False,
+            )
+            return None
+        state = matching_states[0]
+        _, target_member = await fetch_member(state.guild_id, state.user_id)
+        if target_member is None:
+            await ctx.reply(
+                f"Unable to locate the member transformed into {state.character_name}.",
+                mention_author=False,
+            )
+            return None
+    else:
+        target_member = author
+        key = _state_key(guild.id, target_member.id)
+        state = active_transformations.get(key)
+        if state is None:
+            await ctx.reply(
+                "You are not currently transformed; nothing to reroll.",
+                mention_author=False,
+            )
+            return None
+
+    key = _state_key(guild.id, target_member.id)
+    current_state = active_transformations.get(key)
+    if current_state is None or current_state != state:
+        await ctx.reply(
+            "Unable to locate the transformation for this member.",
+            mention_author=False,
         )
-        await ctx.reply(message, mention_author=False)
         return None
 
     used_characters = {
@@ -2563,9 +2592,9 @@ async def reroll_command(ctx: commands.Context, member: Optional[discord.Member]
 
     new_character = random.choice(available_characters)
     try:
-        await target.edit(nick=new_character.name, reason="TF reroll")
+        await target_member.edit(nick=new_character.name, reason="TF reroll")
     except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning("Failed to update nickname for reroll on %s: %s", target.id, exc)
+        logger.warning("Failed to update nickname for reroll on %s: %s", target_member.id, exc)
         await ctx.reply(
             "I couldn't update their nickname, so the reroll was cancelled.",
             mention_author=False,
@@ -2579,23 +2608,23 @@ async def reroll_command(ctx: commands.Context, member: Optional[discord.Member]
     state.avatar_applied = False
     persist_states()
 
-    increment_tf_stats(guild.id, target.id, new_character.name)
+    increment_tf_stats(guild.id, target_member.id, new_character.name)
 
     await send_history_message(
         "TF Rerolled",
         (
             f"Triggered by: **{author.display_name}**\n"
-            f"Member: **{target.display_name}**\n"
+            f"Member: **{target_member.display_name}**\n"
             f"Previous Character: **{previous_character}**\n"
             f"New Character: **{new_character.name}**"
         ),
     )
 
-    original_name = _member_profile_name(target)
+    original_name = _member_profile_name(target_member)
     response_text = _format_character_message(
         new_character.message,
         original_name,
-        target.mention,
+        target_member.mention,
         state.duration_label,
         new_character.name,
     )
@@ -2603,7 +2632,7 @@ async def reroll_command(ctx: commands.Context, member: Optional[discord.Member]
     try:
         await ctx.channel.send(
             f"{emoji_prefix} {response_text}",
-            allowed_mentions=discord.AllowedMentions(users=[target]),
+            allowed_mentions=discord.AllowedMentions(users=[target_member]),
         )
     except discord.HTTPException as exc:
         logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
@@ -2614,7 +2643,7 @@ async def reroll_command(ctx: commands.Context, member: Optional[discord.Member]
         pass
 
     await ctx.send(
-        f"{target.display_name} has been rerolled into **{new_character.name}**.",
+        f"{target_member.display_name} has been rerolled into **{new_character.name}**.",
         delete_after=10,
     )
 
@@ -3040,4 +3069,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
