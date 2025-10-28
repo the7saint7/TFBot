@@ -126,6 +126,13 @@ class TFCharacter:
     message: str
 
 
+@dataclass(frozen=True)
+class OutfitAsset:
+    name: str
+    base_path: Path
+    accessory_layers: Sequence[Path] = ()
+
+
 @dataclass
 class TransformationState:
     user_id: int
@@ -1159,6 +1166,58 @@ def _truncate_text_to_width(draw, text: str, font, max_width: int) -> str:
     return truncated.rstrip() + ellipsis
 
 
+def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
+    if not accessory_dir.is_dir():
+        return None
+    pngs = sorted(p for p in accessory_dir.rglob("*.png") if p.is_file())
+    if not pngs:
+        return None
+    for candidate in pngs:
+        if candidate.stem.lower() == "on":
+            return candidate
+    for candidate in pngs:
+        if "on" in candidate.stem.lower():
+            return candidate
+    for candidate in pngs:
+        parents = [parent.name.lower() for parent in candidate.parents]
+        if "on" in parents:
+            return candidate
+    return pngs[0]
+
+
+def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
+    assets: Dict[str, OutfitAsset] = {}
+    outfits_dir = variant_dir / "outfits"
+    if not outfits_dir.exists():
+        return assets
+    for entry in sorted(outfits_dir.iterdir(), key=lambda p: p.name.lower()):
+        if entry.is_file() and entry.suffix.lower() == ".png":
+            name = entry.stem
+            assets[name.lower()] = OutfitAsset(name=name, base_path=entry, accessory_layers=())
+        elif entry.is_dir():
+            primary = entry / f"{entry.name}.png"
+            if not primary.exists():
+                primary = next((p for p in entry.glob("*.png")), None)
+            if not primary:
+                primary = next((p for p in entry.rglob("*.png")), None)
+            if not primary:
+                continue
+            accessories: list[Path] = []
+            for accessory_dir in sorted(
+                (child for child in entry.iterdir() if child.is_dir()),
+                key=lambda p: p.name.lower(),
+            ):
+                layer = _default_accessory_layer(accessory_dir)
+                if layer:
+                    accessories.append(layer)
+            assets[entry.name.lower()] = OutfitAsset(
+                name=entry.name,
+                base_path=primary,
+                accessory_layers=tuple(accessories),
+            )
+    return assets
+
+
 def _tokenize_for_layout(text: str, is_emoji: bool) -> Sequence[str]:
     if not text:
         return []
@@ -1319,21 +1378,16 @@ def _select_outfit_path(
     config: Dict,
     preferred: Optional[str] = None,
     preferred_pose: Optional[str] = None,
-) -> tuple[Optional[Path], Optional[Path]]:
+) -> tuple[Optional[Path], Optional[OutfitAsset]]:
     if not variant_dirs:
         return None, None
 
-    variant_outfits: dict[Path, list[Path]] = {}
+    variant_outfits: dict[Path, Dict[str, OutfitAsset]] = {}
     for variant_dir in variant_dirs:
-        outfits_dir = variant_dir / "outfits"
-        if not outfits_dir.exists():
-            logger.warning("VN sprite: outfit directory missing at %s", outfits_dir)
+        assets = _discover_outfit_assets(variant_dir)
+        if not assets:
             continue
-        outfits = sorted(outfits_dir.rglob("*.png"))
-        if not outfits:
-            logger.warning("VN sprite: no outfit PNGs in %s", outfits_dir)
-            continue
-        variant_outfits[variant_dir] = outfits
+        variant_outfits[variant_dir] = assets
 
     if not variant_outfits:
         logger.warning(
@@ -1370,31 +1424,31 @@ def _select_outfit_path(
             normalized_targets.append(lower.rstrip(".png"))
         else:
             normalized_targets.append(lower)
-            normalized_targets.append(f"{lower}.png")
 
     for target in normalized_targets:
         for variant_dir in search_variants:
-            outfits = variant_outfits.get(variant_dir)
-            if not outfits:
-                continue
-            for outfit in outfits:
-                if outfit.name.lower() == target or outfit.stem.lower() == target:
-                    logger.debug(
-                        "VN sprite: using outfit %s for variant %s",
-                        outfit.name,
-                        variant_dir.name,
-                    )
-                    return variant_dir, outfit
+            assets = variant_outfits.get(variant_dir, {})
+            asset = assets.get(target)
+            if asset is None:
+                asset = assets.get(target.rstrip(".png"))
+            if asset:
+                logger.debug(
+                    "VN sprite: using outfit %s for variant %s",
+                    asset.base_path.name,
+                    variant_dir.name,
+                )
+                return variant_dir, asset
 
     for variant_dir in search_variants:
-        outfits = variant_outfits.get(variant_dir)
-        if outfits:
+        assets = variant_outfits.get(variant_dir, {})
+        if assets:
+            first_asset = next(iter(sorted(assets.values(), key=lambda a: a.name.lower())))
             logger.debug(
                 "VN sprite: defaulting to first outfit %s for variant %s",
-                outfits[0].name,
+                first_asset.base_path.name,
                 variant_dir.name,
             )
-            return variant_dir, outfits[0]
+            return variant_dir, first_asset
 
     return None, None
 
@@ -1485,12 +1539,9 @@ def list_pose_outfits(character_name: str) -> Dict[str, list[str]]:
         return {}
     pose_map: Dict[str, list[str]] = {}
     for variant_dir in variant_dirs:
-        outfits_dir = variant_dir / "outfits"
-        if not outfits_dir.exists():
-            continue
-        options = sorted(png_path.stem for png_path in outfits_dir.rglob("*.png"))
-        if options:
-            pose_map[variant_dir.name] = options
+        assets = _discover_outfit_assets(variant_dir)
+        if assets:
+            pose_map[variant_dir.name] = sorted(asset.name for asset in assets.values())
     return pose_map
 
 def list_available_outfits(character_name: str) -> Sequence[str]:
@@ -1631,21 +1682,21 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
             preferred_pose or "auto",
             preferred_outfit,
         )
-    variant_dir, outfit_path = _select_outfit_path(
+    variant_dir, outfit_asset = _select_outfit_path(
         variant_dirs,
         config,
         preferred_outfit,
         preferred_pose,
     )
-    if not variant_dir or not outfit_path or not outfit_path.exists():
+    if not variant_dir or not outfit_asset:
         logger.warning(
-            "VN sprite: outfit not found for %s (variant %s, tried %s)",
+            "VN sprite: outfit not found for %s (variant %s)",
             character_dir.name,
             variant_dir.name if variant_dir else "unknown",
-            outfit_path,
         )
         return None
 
+    outfit_path = outfit_asset.base_path
     face_path = _select_face_path(variant_dir)
 
     cache_file: Optional[Path] = None
@@ -1653,8 +1704,11 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         face_token = "noface"
         if face_path and face_path.exists():
             face_token = face_path.stem.lower()
+        accessory_token = "noacc"
+        if outfit_asset.accessory_layers:
+            accessory_token = "-".join(layer.stem.lower() for layer in outfit_asset.accessory_layers)
         cache_dir = VN_CACHE_DIR / character_dir.name.lower() / variant_dir.name.lower()
-        cache_file = cache_dir / f"{outfit_path.stem.lower()}__{face_token}.png"
+        cache_file = cache_dir / f"{outfit_path.stem.lower()}__{face_token}__{accessory_token}.png"
         if cache_file.exists():
             try:
                 cached = Image.open(cache_file).convert("RGBA")
@@ -1668,6 +1722,15 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
     except OSError as exc:
         logger.warning("Failed to load outfit %s: %s", outfit_path, exc)
         return None
+
+    for layer_path in outfit_asset.accessory_layers:
+        if not layer_path.exists():
+            continue
+        try:
+            layer_image = Image.open(layer_path).convert("RGBA")
+            outfit_image.paste(layer_image, (0, 0), layer_image)
+        except OSError as exc:
+            logger.warning("Failed to load accessory %s: %s", layer_path, exc)
 
     if face_path and face_path.exists():
         try:
@@ -2977,3 +3040,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
