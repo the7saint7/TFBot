@@ -137,7 +137,7 @@ class OutfitAsset:
 class TransformationState:
     user_id: int
     guild_id: int
-    character_name: str
+    args: str
     character_avatar_path: str
     character_message: str
     original_nick: Optional[str]
@@ -1279,6 +1279,23 @@ def _crop_transparent_top(image: "Image.Image") -> "Image.Image":
     return cropped
 
 
+def _crop_transparent_left(image: "Image.Image") -> "Image.Image":
+    """Remove transparent columns from the left of an RGBA sprite while keeping height."""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if not bbox:
+        return image
+    left, _, right, _ = bbox
+    if left <= 0 or right - left <= 0:
+        return image
+    right = min(image.width, max(left + (right - left), left + 1))
+    cropped = image.crop((left, 0, right, image.height))
+    logger.debug("VN sprite: trimmed transparent left (%s -> %s)", image.size, cropped.size)
+    return cropped
+
+
 def _load_character_config(character_dir: Path) -> Dict:
     if yaml is None:
         return {}
@@ -1747,6 +1764,7 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         )
 
     final_image = _crop_transparent_top(outfit_image)
+    final_image = _crop_transparent_left(final_image)
     if cache_file:
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1794,7 +1812,7 @@ def render_vn_panel(
     text_box = (178, 80, 775, 250)
     name_padding = 10
     text_padding = 12
-    avatar_box = (4, 4, 200, 250)
+    avatar_box = (4, 4, 250, 250)
     avatar_width = avatar_box[2] - avatar_box[0]
     avatar_height = avatar_box[3] - avatar_box[1]
 
@@ -2518,7 +2536,7 @@ async def secret_reset_command(ctx: commands.Context):
 
 @bot.command(name="reroll")
 @commands.guild_only()
-async def reroll_command(ctx: commands.Context, *, character_name: str = ""):
+async def reroll_command(ctx: commands.Context, *, args: str = ""):
     author = ctx.author
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
@@ -2531,9 +2549,21 @@ async def reroll_command(ctx: commands.Context, *, character_name: str = ""):
     target_member: Optional[discord.Member] = None
     state: Optional[TransformationState] = None
 
-    query = character_name.strip().lower()
+    forced_character: Optional[TFCharacter] = None
+    query = args.strip().lower()
     if query:
-        first_token = query.split(" ", 1)[0]
+        parts = query.split()
+        first_token = parts[0]
+        if len(parts) > 1:
+            forced_name = parts[1]
+            forced_match = next((c for c in CHARACTER_POOL if c.name.split(" ", 1)[0].lower() == forced_name), None)
+            if forced_match is None:
+                await ctx.reply(
+                    f"Unknown target character `{forced_name}`. Provide a valid character first name.",
+                    mention_author=False,
+                )
+                return None
+            forced_character = forced_match
         matching_states = [
             s
             for s in active_transformations.values()
@@ -2541,7 +2571,7 @@ async def reroll_command(ctx: commands.Context, *, character_name: str = ""):
         ]
         if not matching_states:
             await ctx.reply(
-                f"No active transformation found for character `{character_name}`.",
+                f"No active transformation found for character `{first_token}`.",
                 mention_author=False,
             )
             return None
@@ -2583,14 +2613,30 @@ async def reroll_command(ctx: commands.Context, *, character_name: str = ""):
         for character in CHARACTER_POOL
         if character.name not in used_characters and character.name != state.character_name
     ]
-    if not available_characters:
-        await ctx.reply(
-            "No alternative characters are available to reroll right now.",
-            mention_author=False,
-        )
-        return None
+    forced_mode = forced_character is not None
 
-    new_character = random.choice(available_characters)
+    if forced_mode:
+        if forced_character.name == state.character_name:
+            await ctx.reply(
+                f"They are already transformed into {forced_character.name}.",
+                mention_author=False,
+            )
+            return None
+        if forced_character.name in used_characters:
+            await ctx.reply(
+                f"{forced_character.name} is already in use by another transformation.",
+                mention_author=False,
+            )
+            return None
+        new_character = forced_character
+    else:
+        if not available_characters:
+            await ctx.reply(
+                "No alternative characters are available to reroll right now.",
+                mention_author=False,
+            )
+            return None
+        new_character = random.choice(available_characters)
     try:
         await target_member.edit(nick=new_character.name, reason="TF reroll")
     except (discord.Forbidden, discord.HTTPException) as exc:
@@ -2610,24 +2656,39 @@ async def reroll_command(ctx: commands.Context, *, character_name: str = ""):
 
     increment_tf_stats(guild.id, target_member.id, new_character.name)
 
+    history_details = (
+        f"Triggered by: **{author.display_name}**\n"
+        f"Member: **{target_member.display_name}**\n"
+        f"Previous Character: **{previous_character}**\n"
+        f"New Character: **{new_character.name}**"
+    )
+    if forced_mode:
+        history_details += "\nReason: Forced reroll override."
     await send_history_message(
         "TF Rerolled",
-        (
-            f"Triggered by: **{author.display_name}**\n"
-            f"Member: **{target_member.display_name}**\n"
-            f"Previous Character: **{previous_character}**\n"
-            f"New Character: **{new_character.name}**"
-        ),
+        history_details,
     )
 
     original_name = _member_profile_name(target_member)
-    response_text = _format_character_message(
-        new_character.message,
-        original_name,
-        target_member.mention,
-        state.duration_label,
-        new_character.name,
-    )
+    if forced_mode:
+        custom_template = (
+            "barely has time to react before Syn swoops in with a grin and swaps them straight into {character}. Syn just had to spice things up."
+        )
+        response_text = _format_character_message(
+            custom_template,
+            original_name,
+            target_member.mention,
+            state.duration_label,
+            new_character.name,
+        )
+    else:
+        response_text = _format_character_message(
+            new_character.message,
+            original_name,
+            target_member.mention,
+            state.duration_label,
+            new_character.name,
+        )
     emoji_prefix = _get_magic_emoji(guild)
     try:
         await ctx.channel.send(
@@ -2642,8 +2703,11 @@ async def reroll_command(ctx: commands.Context, *, character_name: str = ""):
     except discord.HTTPException:
         pass
 
+    summary_message = f"{target_member.display_name} has been rerolled into **{new_character.name}**."
+    if forced_mode:
+        summary_message += " (Syn insisted on this one.)"
     await ctx.send(
-        f"{target_member.display_name} has been rerolled into **{new_character.name}**.",
+        summary_message,
         delete_after=10,
     )
 
