@@ -18,15 +18,16 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+load_dotenv()
+
 try:
     import yaml
 except ImportError:
     yaml = None
 
 from tf_characters import TF_CHARACTERS as CHARACTER_DATA
+from ai_rewriter import AI_REWRITE_ENABLED, rewrite_message_for_character
 
-
-load_dotenv()
 
 logging.basicConfig(
     level=os.getenv("TFBOT_LOG_LEVEL", "INFO"),
@@ -410,6 +411,20 @@ if _VN_CACHE_DIR_SETTING:
         VN_CACHE_DIR = _vn_cache_path.resolve()
 else:
     VN_CACHE_DIR = None
+
+
+def _load_character_context() -> Dict[str, str]:
+    context_path = BASE_DIR / "data" / "character_context.json"
+    if not context_path.exists():
+        return {}
+    try:
+        return json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load character context dataset: %s", exc)
+        return {}
+
+
+CHARACTER_CONTEXT = _load_character_context()
 
 
 @lru_cache(maxsize=64)
@@ -1401,6 +1416,27 @@ async def relay_transformed_message(
         return False
 
     cleaned_content = message.content.strip()
+    if (
+        AI_REWRITE_ENABLED
+        and cleaned_content
+        and not cleaned_content.startswith(str(bot.command_prefix))
+    ):
+        context_snippet = CHARACTER_CONTEXT.get(state.character_name) or state.character_message
+        rewritten = await rewrite_message_for_character(
+            original_text=cleaned_content,
+            character_name=state.character_name,
+            character_context=context_snippet,
+            user_name=message.author.display_name,
+        )
+        if rewritten and rewritten.strip():
+            logger.debug(
+                "AI rewrite applied for %s: %s -> %s",
+                state.character_name,
+                cleaned_content[:120],
+                rewritten[:120],
+            )
+            cleaned_content = rewritten.strip()
+
     description = cleaned_content if cleaned_content else "*no message content*"
     formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else None
     custom_emoji_images: Dict[str, "Image.Image"] = {}

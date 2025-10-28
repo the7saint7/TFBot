@@ -38,6 +38,16 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | `TFBOT_VN_CACHE_DIR` | Directory that stores cached composite VN avatars (set empty to disable) | `vn_cache` |
 | `TFBOT_VN_SELECTIONS` | JSON file storing per-character outfit overrides | `tf_outfits.json` |
 | `TFBOT_STATS_FILE` | JSON file storing per-user TF counts | `tf_stats.json` |
+| `TFBOT_AI_REWRITE` | Enable GPT paraphrasing for character voice (`true`/`false`) | `false` |
+| `TFBOT_AI_MODEL` | OpenAI chat model used for rewrites | `gpt-3.5-turbo-1106` |
+| `TFBOT_AI_MAX_TOKENS` | Maximum tokens to generate during rewrites | `80` |
+| `TFBOT_AI_TEMPERATURE` | Sampling temperature for rewrite completions | `0.5` |
+| `TFBOT_AI_TIMEOUT` | Seconds to wait before abandoning an AI rewrite | `2.0` |
+| `TFBOT_AI_CONCURRENCY` | Maximum simultaneous rewrite requests | `1` |
+| `TFBOT_AI_BACKOFF` | Seconds to pause after receiving a rate-limit response | `1.5` |
+| `TFBOT_AI_MIN_INTERVAL` | Minimum seconds between rewrite requests | `0.75` |
+| `TFBOT_AI_SYSTEM_PROMPT` | Override the system prompt used for rewrites | _(built-in)_ |
+| `TFBOT_AI_API_KEY` / `OPENAI_API_KEY` | OpenAI API key (either variable works) | _(required when rewrites enabled)_ |
 
 ## Running
 ```bash
