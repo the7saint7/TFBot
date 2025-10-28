@@ -1283,14 +1283,20 @@ def _crop_transparent_left(image: "Image.Image") -> "Image.Image":
     """Remove transparent columns from the left of an RGBA sprite while keeping height."""
     if image.mode != "RGBA":
         image = image.convert("RGBA")
+    if image.width <= 1:
+        return image
     alpha = image.getchannel("A")
-    bbox = alpha.getbbox()
-    if not bbox:
+    pixels = alpha.load()
+    left = 0
+    right = image.width
+    # move left bound until any non-transparent pixel is found
+    while left < image.width:
+        column = [pixels[left, y] for y in range(image.height)]
+        if any(column):
+            break
+        left += 1
+    if left >= right - 1:
         return image
-    left, _, right, _ = bbox
-    if left <= 0 or right - left <= 0:
-        return image
-    right = min(image.width, max(left + (right - left), left + 1))
     cropped = image.crop((left, 0, right, image.height))
     logger.debug("VN sprite: trimmed transparent left (%s -> %s)", image.size, cropped.size)
     return cropped
