@@ -1794,7 +1794,7 @@ def render_vn_panel(
     text_box = (178, 80, 775, 250)
     name_padding = 10
     text_padding = 12
-    avatar_box = (4, 4, 160, 250)
+    avatar_box = (4, 4, 200, 250)
     avatar_width = avatar_box[2] - avatar_box[0]
     avatar_height = avatar_box[3] - avatar_box[1]
 
