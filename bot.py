@@ -1729,8 +1729,22 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         if cache_file.exists():
             try:
                 cached = Image.open(cache_file).convert("RGBA")
-                logger.debug("VN sprite: loaded cached avatar %s", cache_file)
-                return cached
+                trimmed_cached = _crop_transparent_top(cached)
+                trimmed_cached = _crop_transparent_left(trimmed_cached)
+                if trimmed_cached.size != cached.size:
+                    try:
+                        trimmed_cached.save(cache_file)
+                        logger.debug(
+                            "VN sprite: refreshed cached avatar %s (%s -> %s)",
+                            cache_file,
+                            cached.size,
+                            trimmed_cached.size,
+                        )
+                    except OSError as exc:
+                        logger.warning("VN sprite: unable to refresh cached avatar %s: %s", cache_file, exc)
+                else:
+                    logger.debug("VN sprite: loaded cached avatar %s", cache_file)
+                return trimmed_cached
             except OSError as exc:
                 logger.warning("VN sprite: failed to load cached avatar %s: %s (rebuilding)", cache_file, exc)
 
