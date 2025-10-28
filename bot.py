@@ -1185,11 +1185,16 @@ def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
     return pngs[0]
 
 
-def _collect_accessory_layers(entry: Path) -> list[tuple[int, Path]]:
-    """Gather accessory layers defined under the outfit entry, respecting `acc-` naming and order."""
+def _collect_accessory_layers(entry: Path, include_all: bool = False) -> list[tuple[int, Path]]:
+    """Gather accessory layers defined under the outfit entry, respecting naming and order."""
     accessories: list[tuple[int, Path]] = []
     for accessory_dir in sorted(
-        (child for child in entry.iterdir() if child.is_dir() and child.name.lower().startswith("acc-")),
+        (
+            child
+            for child in entry.iterdir()
+            if child.is_dir()
+            and (include_all or child.name.lower().startswith("acc"))
+        ),
         key=lambda p: p.name.lower(),
     ):
         layer = _default_accessory_layer(accessory_dir)
@@ -1205,6 +1210,8 @@ def _collect_accessory_layers(entry: Path) -> list[tuple[int, Path]]:
                     order = int(suffix)
                 except ValueError:
                     order = 0
+        if not include_all and not accessory_dir.name.lower().startswith("acc"):
+            continue
         accessories.append((order, layer))
     accessories.sort(key=lambda item: item[0])
     return accessories
@@ -1235,7 +1242,7 @@ def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
                 continue
             accessories = []
             # Collect outfit-specific accessories (acc- folders scoped to this entry)
-            accessories.extend(_collect_accessory_layers(entry))
+            accessories.extend(_collect_accessory_layers(entry, include_all=True))
             assets[entry.name.lower()] = OutfitAsset(
                 name=entry.name,
                 base_path=primary,
@@ -1909,11 +1916,11 @@ def render_vn_panel(
     base_text_font = _load_vn_font(VN_TEXT_FONT_SIZE)
 
     # Layout constants derived from vn_base.png geometry.
-    name_box = (170, 10, 303, 26)
-    text_box = (178, 80, 775, 250)
+    name_box = (180, 10, 193, 26)
+    text_box = (188, 80, 765, 250)
     name_padding = 10
     text_padding = 12
-    avatar_box = (0, 4, 220, 250)
+    avatar_box = (0, 4, 215, 250)
     avatar_width = avatar_box[2] - avatar_box[0]
     avatar_height = avatar_box[3] - avatar_box[1]
 
