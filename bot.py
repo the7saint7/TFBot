@@ -93,7 +93,6 @@ MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 tf_stats: Dict[str, Dict[str, Dict[str, object]]] = {}
 _vn_config_cache: Dict[str, Dict] = {}
 
-
 @dataclass(frozen=True)
 class TFCharacter:
     name: str
@@ -113,6 +112,12 @@ class TransformationState:
     expires_at: datetime
     duration_label: str
     avatar_applied: bool = False
+
+
+@dataclass
+class ReplyContext:
+    author: str
+    text: str
 
 
 def _parse_channel_ids(raw: str) -> Set[int]:
@@ -425,6 +430,116 @@ def _load_character_context() -> Dict[str, str]:
 
 
 CHARACTER_CONTEXT = _load_character_context()
+
+_REPLY_LOG_SETTING = os.getenv("TFBOT_REPLY_LOG", "transform_replies.json").strip()
+if _REPLY_LOG_SETTING:
+    _reply_path = Path(_REPLY_LOG_SETTING)
+    if not _reply_path.is_absolute():
+        REPLY_LOG_FILE = (BASE_DIR / _reply_path).resolve()
+    else:
+        REPLY_LOG_FILE = _reply_path.resolve()
+else:
+    REPLY_LOG_FILE = (BASE_DIR / "transform_replies.json").resolve()
+
+
+def _load_reply_log() -> Dict[int, ReplyContext]:
+    if not REPLY_LOG_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(REPLY_LOG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to read reply log %s: %s", REPLY_LOG_FILE, exc)
+        return {}
+    result: Dict[int, ReplyContext] = {}
+    for key, value in raw.items():
+        try:
+            message_id = int(key)
+            author = value.get("author", "Unknown")
+            text = value.get("text", "")
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if text:
+            result[message_id] = ReplyContext(author=author, text=text)
+    return result
+
+
+def _persist_reply_log() -> None:
+    try:
+        REPLY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            str(message_id): {"author": ctx.author, "text": ctx.text}
+            for message_id, ctx in TRANSFORM_MESSAGE_LOG.items()
+        }
+        REPLY_LOG_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("Failed to persist reply log %s: %s", REPLY_LOG_FILE, exc)
+
+
+TRANSFORM_MESSAGE_LOG: Dict[int, ReplyContext] = _load_reply_log()
+
+
+def _register_relay_message(message_id: int, author: str, text: str) -> None:
+    if not text:
+        return
+    TRANSFORM_MESSAGE_LOG[message_id] = ReplyContext(author=author, text=text)
+    if len(TRANSFORM_MESSAGE_LOG) > 500:
+        for key in list(TRANSFORM_MESSAGE_LOG.keys())[:100]:
+            TRANSFORM_MESSAGE_LOG.pop(key, None)
+    _persist_reply_log()
+    logger.debug("Reply log registered id=%s author=%s text=%s", message_id, author, text[:120])
+
+
+async def _resolve_reply_context(message: discord.Message) -> Optional[ReplyContext]:
+    reference = message.reference
+    if not reference or not reference.message_id:
+        return None
+
+    cached = TRANSFORM_MESSAGE_LOG.get(reference.message_id)
+    resolved_msg = reference.resolved
+    target_msg: Optional[discord.Message] = None
+
+    if isinstance(resolved_msg, discord.Message):
+        target_msg = resolved_msg
+    else:
+        try:
+            target_msg = await message.channel.fetch_message(reference.message_id)  # type: ignore[arg-type]
+        except discord.HTTPException as exc:
+            logger.debug("Unable to fetch referenced message %s: %s", reference.message_id, exc)
+            target_msg = None
+
+    if target_msg is None:
+        if cached:
+            logger.debug("Reply context resolved from cache for %s", reference.message_id)
+        return cached
+
+    author = getattr(target_msg.author, "display_name", None) or getattr(
+        target_msg.author, "name", "Unknown"
+    )
+
+    content = (target_msg.content or "").strip()
+    if content:
+        context = ReplyContext(author=author, text=content)
+        TRANSFORM_MESSAGE_LOG[reference.message_id] = context
+        _persist_reply_log()
+        logger.debug("Reply context resolved from message %s", reference.message_id)
+        return context
+
+    if cached:
+        return cached
+
+    if target_msg.embeds:
+        embed = target_msg.embeds[0]
+        if embed.description:
+            context = ReplyContext(author=author, text=embed.description.strip())
+            TRANSFORM_MESSAGE_LOG[reference.message_id] = context
+            _persist_reply_log()
+            logger.debug("Reply context resolved from embed %s", reference.message_id)
+            return context
+
+    return None
 
 
 @lru_cache(maxsize=64)
@@ -779,6 +894,40 @@ def _fit_text_segments(
     return chosen_lines, chosen_font
 
 
+def _font_line_height(font) -> int:
+    try:
+        bbox = font.getbbox("Ag")
+        return max(1, bbox[3] - bbox[1])
+    except Exception:  # pylint: disable=broad-except
+        return getattr(font, "size", VN_TEXT_FONT_SIZE)
+
+
+def _prepare_reply_snippet(text: str, limit: int = 180) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _wrap_plain_text(draw, text: str, font, max_width: int) -> Sequence[str]:
+    if not text:
+        return []
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        width = draw.textlength(candidate, font=font)
+        if current and width > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
 def _tokenize_for_layout(text: str, is_emoji: bool) -> Sequence[str]:
     if not text:
         return []
@@ -1122,6 +1271,7 @@ def render_vn_panel(
     attachment_id: Optional[str] = None,
     formatted_segments: Optional[Sequence[dict]] = None,
     custom_emoji_images: Optional[Dict[str, "Image.Image"]] = None,
+    reply_context: Optional[ReplyContext] = None,
 ) -> Optional[discord.File]:
     if MESSAGE_STYLE != "vn":
         return None
@@ -1247,12 +1397,51 @@ def render_vn_panel(
         working_content = f"{original_name} remains quietly transformed..."
 
     max_width = text_box[2] - text_box[0] - text_padding * 2
-    max_height = text_box[3] - text_box[1] - text_padding * 2
+    total_height = text_box[3] - text_box[1] - text_padding * 2
+
+    reply_label_font = None
+    reply_body_font = None
+    reply_label_text = None
+    reply_lines: Sequence[str] = []
+    reply_block_height = 0
+
+    if reply_context and reply_context.text:
+        reply_label_font = _load_vn_font(max(12, VN_TEXT_FONT_SIZE - 6))
+        reply_body_font = _load_vn_font(max(12, VN_TEXT_FONT_SIZE - 8))
+        reply_label_text = f"Replying to {reply_context.author}:"
+        reply_label_height = _font_line_height(reply_label_font)
+        snippet_text = _prepare_reply_snippet(reply_context.text)
+        reply_lines = _wrap_plain_text(draw, snippet_text, reply_body_font, max_width)
+        body_line_height = _font_line_height(reply_body_font)
+        body_height = body_line_height * max(1, len(reply_lines)) if reply_lines else body_line_height
+        reply_block_height = reply_label_height + body_height + 8
+        logger.debug(
+            "Rendering reply context for %s -> %s: %s",
+            state.character_name,
+            reply_context.author,
+            snippet_text,
+        )
+
+    available_height = max(total_height - reply_block_height, _font_line_height(base_text_font) * 2)
+
     segments = list(formatted_segments) if formatted_segments else []
     if not segments:
         segments = list(parse_discord_formatting(working_content))
-    lines, text_font = _fit_text_segments(draw, segments, base_text_font, max_width, max_height)
+    lines, text_font = _fit_text_segments(draw, segments, base_text_font, max_width, available_height)
     text_y = text_box[1] + text_padding
+
+    if reply_label_font and reply_label_text:
+        reply_fill = (200, 200, 200, 255)
+        text_x = text_box[0] + text_padding
+        draw.text((text_x, text_y), reply_label_text, fill=reply_fill, font=reply_label_font)
+        text_y += _font_line_height(reply_label_font)
+        if reply_lines:
+            text_y += 2
+            for line_text in reply_lines:
+                draw.text((text_x, text_y), line_text, fill=reply_fill, font=reply_body_font)
+                text_y += _font_line_height(reply_body_font)
+        text_y += 6
+
     base_line_height = getattr(text_font, "size", VN_TEXT_FONT_SIZE)
     for line in lines:
         if not line:
@@ -1416,6 +1605,7 @@ async def relay_transformed_message(
         return False
 
     cleaned_content = message.content.strip()
+    reply_context = await _resolve_reply_context(message)
     if (
         AI_REWRITE_ENABLED
         and cleaned_content
@@ -1448,6 +1638,13 @@ async def relay_transformed_message(
         if formatted_segments is None:
             formatted_segments = parse_discord_formatting(cleaned_content)
         custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments)
+        if reply_context:
+            logger.debug(
+                "Replying panel: %s -> %s snippet=%s",
+                state.character_name,
+                reply_context.author,
+                reply_context.text[:120],
+            )
         vn_file = render_vn_panel(
             state=state,
             message_content=cleaned_content,
@@ -1456,6 +1653,7 @@ async def relay_transformed_message(
             attachment_id=str(message.id),
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
+            reply_context=reply_context,
         )
         if vn_file:
             files.append(vn_file)
@@ -1519,11 +1717,15 @@ async def relay_transformed_message(
     if files:
         send_kwargs["files"] = files
 
+    sent_message: Optional[discord.Message] = None
     try:
-        await message.channel.send(**send_kwargs)
+        sent_message = await message.channel.send(**send_kwargs)
     except discord.HTTPException as exc:
         logger.warning("Failed to relay TF message %s: %s", message.id, exc)
         return False
+
+    if sent_message and cleaned_content:
+        _register_relay_message(sent_message.id, state.character_name, cleaned_content)
 
     return True
 
