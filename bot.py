@@ -75,6 +75,30 @@ VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
 VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
 VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
 VN_AVATAR_SCALE = max(0.1, _float_from_env("TFBOT_VN_AVATAR_SCALE", 1.0))
+_VN_BG_ROOT_SETTING = os.getenv("TFBOT_VN_BG_ROOT", "").strip()
+_VN_BG_DEFAULT_SETTING = os.getenv("TFBOT_VN_BG_DEFAULT", "school/cafeteria.png").strip()
+VN_BACKGROUND_DEFAULT_RELATIVE = Path(_VN_BG_DEFAULT_SETTING) if _VN_BG_DEFAULT_SETTING else None
+if _VN_BG_ROOT_SETTING:
+    candidate_bg_root = Path(_VN_BG_ROOT_SETTING).expanduser()
+    VN_BACKGROUND_ROOT = candidate_bg_root if candidate_bg_root.exists() else None
+elif VN_GAME_ROOT:
+    candidate_bg_root = VN_GAME_ROOT / "game" / "images" / "bg"
+    VN_BACKGROUND_ROOT = candidate_bg_root if candidate_bg_root.exists() else None
+else:
+    VN_BACKGROUND_ROOT = None
+if VN_BACKGROUND_ROOT and VN_BACKGROUND_DEFAULT_RELATIVE:
+    VN_BACKGROUND_DEFAULT_PATH = (VN_BACKGROUND_ROOT / VN_BACKGROUND_DEFAULT_RELATIVE).resolve()
+    if not VN_BACKGROUND_DEFAULT_PATH.exists():
+        logger.warning(
+            "VN background: default background %s does not exist under %s",
+            VN_BACKGROUND_DEFAULT_RELATIVE,
+            VN_BACKGROUND_ROOT,
+        )
+        VN_BACKGROUND_DEFAULT_PATH = None
+else:
+    VN_BACKGROUND_DEFAULT_PATH = None
+_BG_SELECTION_FILE_SETTING = os.getenv("TFBOT_VN_BG_SELECTIONS", "tf_backgrounds.json").strip()
+VN_BACKGROUND_SELECTION_FILE = Path(_BG_SELECTION_FILE_SETTING) if _BG_SELECTION_FILE_SETTING else None
 VN_NAME_DEFAULT_COLOR: Tuple[int, int, int, int] = (255, 220, 180, 255)
 _VN_CACHE_DIR_SETTING = os.getenv("TFBOT_VN_CACHE_DIR", "vn_cache").strip()
 TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
@@ -93,6 +117,8 @@ MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 tf_stats: Dict[str, Dict[str, Dict[str, object]]] = {}
 _vn_config_cache: Dict[str, Dict] = {}
+_VN_BACKGROUND_IMAGES: list[Path] = []
+background_selections: Dict[str, str] = {}
 
 @dataclass(frozen=True)
 class TFCharacter:
@@ -173,6 +199,87 @@ def _normalize_pose_name(pose: Optional[str]) -> Optional[str]:
     if not stripped:
         return None
     return stripped.lower()
+
+
+def _load_background_images() -> Sequence[Path]:
+    global _VN_BACKGROUND_IMAGES
+    if _VN_BACKGROUND_IMAGES:
+        return _VN_BACKGROUND_IMAGES
+    if VN_BACKGROUND_ROOT and VN_BACKGROUND_ROOT.exists():
+        try:
+            _VN_BACKGROUND_IMAGES = sorted(
+                path
+                for path in VN_BACKGROUND_ROOT.rglob("*.png")
+                if path.is_file()
+            )
+        except OSError as exc:
+            logger.warning("VN background: failed to scan directory %s: %s", VN_BACKGROUND_ROOT, exc)
+            _VN_BACKGROUND_IMAGES = []
+    else:
+        _VN_BACKGROUND_IMAGES = []
+    return _VN_BACKGROUND_IMAGES
+
+
+def _compose_background_layer(panel_size: Tuple[int, int], background_path: Optional[Path]) -> Optional["Image.Image"]:
+    backgrounds = _load_background_images()
+    if background_path is None or not background_path.exists():
+        if not backgrounds:
+            return None
+        background_path = random.choice(backgrounds)
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(background_path) as background_image:
+            fitted = ImageOps.fit(
+                background_image.convert("RGBA"),
+                panel_size,
+                Image.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+    except OSError as exc:
+        logger.warning("VN background: failed to load %s: %s", background_path, exc)
+        try:
+            _VN_BACKGROUND_IMAGES.remove(background_path)
+        except ValueError:
+            pass
+        return None
+    layer = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+    layer.paste(fitted, (0, 0), fitted)
+    return layer
+
+
+def list_background_choices() -> Sequence[Path]:
+    return list(_load_background_images())
+
+
+def get_selected_background_path(user_id: int) -> Optional[Path]:
+    if VN_BACKGROUND_ROOT is None:
+        return None
+    key = str(user_id)
+    selected = background_selections.get(key)
+    if selected:
+        candidate = (VN_BACKGROUND_ROOT / selected).resolve()
+        if candidate.exists():
+            return candidate
+        logger.warning("VN background: stored selection %s missing for user %s", selected, user_id)
+        background_selections.pop(key, None)
+        persist_background_selections()
+    if VN_BACKGROUND_DEFAULT_PATH and VN_BACKGROUND_DEFAULT_PATH.exists():
+        return VN_BACKGROUND_DEFAULT_PATH
+    backgrounds = _load_background_images()
+    if backgrounds:
+        return backgrounds[0]
+    return None
+
+
+def set_selected_background(user_id: int, background_path: Path) -> bool:
+    if VN_BACKGROUND_ROOT is None:
+        return False
+    relative = _relative_background_path(background_path)
+    if not relative:
+        return False
+    background_selections[str(user_id)] = relative
+    persist_background_selections()
+    return True
 
 
 def _build_character_pool(source: Sequence[Dict[str, str]]) -> Sequence[TFCharacter]:
@@ -327,6 +434,43 @@ def persist_outfit_selections() -> None:
     except OSError as exc:
         logger.warning("Failed to persist outfit selections: %s", exc)
 
+
+def _relative_background_path(path: Path) -> Optional[str]:
+    if VN_BACKGROUND_ROOT is None:
+        return None
+    try:
+        relative = path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
+    except ValueError:
+        return None
+    return relative.as_posix()
+
+
+def load_background_selections() -> Dict[str, str]:
+    if VN_BACKGROUND_SELECTION_FILE is None or not VN_BACKGROUND_SELECTION_FILE.exists():
+        return {}
+    try:
+        data = json.loads(VN_BACKGROUND_SELECTION_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            normalized: Dict[str, str] = {}
+            for key, value in data.items():
+                if not isinstance(value, str):
+                    value = str(value)
+                normalized[str(key)] = value.strip()
+            return normalized
+    except json.JSONDecodeError as exc:
+        logger.warning("Failed to parse %s: %s", VN_BACKGROUND_SELECTION_FILE, exc)
+    return {}
+
+
+def persist_background_selections() -> None:
+    if VN_BACKGROUND_SELECTION_FILE is None:
+        return
+    try:
+        VN_BACKGROUND_SELECTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        VN_BACKGROUND_SELECTION_FILE.write_text(json.dumps(background_selections, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to persist background selections: %s", exc)
+
 def load_states_from_disk() -> Sequence[TransformationState]:
     if not TF_STATE_FILE.exists():
         return []
@@ -359,6 +503,7 @@ def load_stats_from_disk() -> Dict[str, Dict[str, Dict[str, object]]]:
 tf_stats = load_stats_from_disk()
 VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
 vn_outfit_selection = load_outfit_selections()
+background_selections = load_background_selections()
 
 
 def increment_tf_stats(guild_id: int, user_id: int, character_name: str) -> None:
@@ -1283,26 +1428,23 @@ def _select_face_path(variant_dir: Path) -> Optional[Path]:
 
 
 def _candidate_character_keys(raw_name: str) -> Sequence[str]:
-    name = raw_name.lower().strip()
+    name = raw_name.strip()
     if not name:
         return []
-    candidates = [name]
-    if " " in name:
-        first_word = name.split(" ", 1)[0]
-        candidates.append(first_word)
-        candidates.append(name.replace(" ", ""))
-        candidates.append(name.replace(" ", "_"))
-    if "-" in name:
-        candidates.append(name.split("-", 1)[0])
-        candidates.append(name.replace("-", ""))
-    # Ensure unique order
-    seen = set()
-    ordered = []
-    for cand in candidates:
-        if cand not in seen:
-            seen.add(cand)
-            ordered.append(cand)
-    return ordered
+    first_word = name.split(" ", 1)[0].lower()
+    if not first_word:
+        return []
+    candidates: list[str] = [first_word]
+    stripped = first_word.replace('"', "").replace("'", "")
+    if stripped and stripped not in candidates:
+        candidates.append(stripped)
+    hyphen_removed = stripped.replace("-", "")
+    if hyphen_removed and hyphen_removed not in candidates:
+        candidates.append(hyphen_removed)
+    underscore_variant = stripped.replace("-", "_")
+    if underscore_variant and underscore_variant not in candidates:
+        candidates.append(underscore_variant)
+    return candidates
 
 
 def resolve_character_directory(character_name: str) -> tuple[Optional[Path], Sequence[str]]:
@@ -1558,6 +1700,10 @@ def render_vn_panel(
         return None
 
     base = Image.open(VN_BASE_IMAGE).convert("RGBA")
+    background_path = get_selected_background_path(state.user_id)
+    background_layer = _compose_background_layer(base.size, background_path)
+    if background_layer:
+        base = Image.alpha_composite(background_layer, base)
     draw = ImageDraw.Draw(base)
 
     from PIL import Image
@@ -2527,6 +2673,119 @@ async def tf_stats_command(ctx: commands.Context):
             await ctx.message.delete()
         except discord.HTTPException:
             pass
+
+
+@bot.command(name="bg")
+async def background_command(ctx: commands.Context, *, selection: str = ""):
+    if VN_BACKGROUND_ROOT is None:
+        message = "Backgrounds are not configured on this bot."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    choices = list_background_choices()
+    if not choices:
+        message = "No background images were found in the configured directory."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    selection = selection.strip()
+    if not selection:
+        lines: list[str] = []
+        for idx, path in enumerate(choices, start=1):
+            try:
+                relative = path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
+                display = relative.as_posix()
+            except ValueError:
+                display = str(path)
+            lines.append(f"{idx}: {display}")
+
+        chunks: list[str] = []
+        current: list[str] = []
+        length = 0
+        for line in lines:
+            if length + len(line) + 1 > 1900 and current:
+                chunks.append("\n".join(current))
+                current = []
+                length = 0
+            current.append(line)
+            length += len(line) + 1
+        if current:
+            chunks.append("\n".join(current))
+
+        default_display = (
+            VN_BACKGROUND_DEFAULT_RELATIVE.as_posix()
+            if VN_BACKGROUND_DEFAULT_RELATIVE
+            else "system default"
+        )
+        instructions = (
+            "Use `!bg <number>` to apply that background to your VN panel.\n"
+            "Example: `!bg 45` selects option 45 from the list.\n"
+            f"The default background is `{default_display}`."
+        )
+
+        try:
+            for chunk in chunks:
+                await ctx.author.send(f"```\n{chunk}\n```")
+            await ctx.author.send(instructions)
+        except discord.Forbidden:
+            message = "I couldn't DM you. Please enable direct messages, then rerun `!bg`."
+            if ctx.guild:
+                await ctx.reply(message, mention_author=False)
+            else:
+                await ctx.send(message)
+            return
+
+        ack = "I've sent you a DM with the list of available backgrounds."
+        if ctx.guild:
+            await ctx.reply(ack, mention_author=False)
+        else:
+            await ctx.send(ack)
+        return
+
+    try:
+        index = int(selection)
+    except ValueError:
+        message = f"`{selection}` isn't a valid background number. Use `!bg` with no arguments to see the list."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    if index < 1 or index > len(choices):
+        message = f"Background number must be between 1 and {len(choices)}."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    selected_path = choices[index - 1]
+    if not set_selected_background(ctx.author.id, selected_path):
+        message = "Unable to update your background at this time."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    try:
+        relative = selected_path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
+        display = relative.as_posix()
+    except ValueError:
+        display = str(selected_path)
+
+    confirmation = f"Background set to `{display}`."
+    if ctx.guild:
+        await ctx.reply(confirmation, mention_author=False)
+    else:
+        await ctx.send(confirmation)
 
 
 
