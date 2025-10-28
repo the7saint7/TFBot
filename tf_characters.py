@@ -330,5 +330,10 @@ TF_CHARACTERS = [
         "avatar_path": "avatars/rudy.png",
         "message": "sniffs a strange glowing tennis ball Syn left in the yard, and the air pops with magic. A quick shimmer runs through them, tail wag slowing as awareness clicks on—they’re still loyal, still curious, but now definitely understand every sarcastic thing humans say.",
     },
+    {
+        "name": "Catrina",
+        "avatar_path": "avatars/catrina.png",
+        "message": "triggers one of Syn’s weirder pranks—a charm meant for ‘feline agility training.’ A puff of magic later, their balance is flawless, ears twitch at every sound, and they can’t shake the urge to chase anything that moves.",
+    },
 ]
 
