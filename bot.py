@@ -1142,6 +1142,23 @@ def _wrap_plain_text(draw, text: str, font, max_width: int) -> Sequence[str]:
     return lines
 
 
+def _truncate_text_to_width(draw, text: str, font, max_width: int) -> str:
+    if not text:
+        return "..."
+    if max_width <= 0:
+        return "..."
+    ellipsis = "..."
+    width = draw.textlength(text, font=font)
+    if width <= max_width:
+        return text
+    truncated = text
+    while truncated and draw.textlength(truncated + ellipsis, font=font) > max_width:
+        truncated = truncated[:-1]
+    if not truncated:
+        return ellipsis
+    return truncated.rstrip() + ellipsis
+
+
 def _tokenize_for_layout(text: str, is_emoji: bool) -> Sequence[str]:
     if not text:
         return []
@@ -1312,7 +1329,7 @@ def _select_outfit_path(
         if not outfits_dir.exists():
             logger.warning("VN sprite: outfit directory missing at %s", outfits_dir)
             continue
-        outfits = sorted(outfits_dir.glob("*.png"))
+        outfits = sorted(outfits_dir.rglob("*.png"))
         if not outfits:
             logger.warning("VN sprite: no outfit PNGs in %s", outfits_dir)
             continue
@@ -1471,7 +1488,7 @@ def list_pose_outfits(character_name: str) -> Dict[str, list[str]]:
         outfits_dir = variant_dir / "outfits"
         if not outfits_dir.exists():
             continue
-        options = sorted(png_path.stem for png_path in outfits_dir.glob("*.png"))
+        options = sorted(png_path.stem for png_path in outfits_dir.rglob("*.png"))
         if options:
             pose_map[variant_dir.name] = options
     return pose_map
@@ -1817,22 +1834,18 @@ def render_vn_panel(
     max_width = text_box[2] - text_box[0] - text_padding * 2
     total_height = text_box[3] - text_box[1] - text_padding * 2
 
-    reply_label_font = None
-    reply_body_font = None
-    reply_label_text = None
-    reply_lines: Sequence[str] = []
+    reply_font = None
+    reply_line: Optional[str] = None
     reply_block_height = 0
 
     if reply_context and reply_context.text:
-        reply_label_font = _load_vn_font(max(12, VN_TEXT_FONT_SIZE - 6))
-        reply_body_font = _load_vn_font(max(12, VN_TEXT_FONT_SIZE - 8))
-        reply_label_text = f"Replying to {reply_context.author}:"
-        reply_label_height = _font_line_height(reply_label_font)
-        snippet_text = _prepare_reply_snippet(reply_context.text)
-        reply_lines = _wrap_plain_text(draw, snippet_text, reply_body_font, max_width)
-        body_line_height = _font_line_height(reply_body_font)
-        body_height = body_line_height * max(1, len(reply_lines)) if reply_lines else body_line_height
-        reply_block_height = reply_label_height + body_height + 8
+        reply_font = _load_vn_font(max(10, VN_TEXT_FONT_SIZE - 10))
+        label_text = f"Replying to {reply_context.author}: "
+        snippet_text = _prepare_reply_snippet(reply_context.text).replace("\n", " ").strip()
+        available_width = max_width - draw.textlength(label_text, font=reply_font)
+        truncated_snippet = _truncate_text_to_width(draw, snippet_text, reply_font, available_width)
+        reply_line = f"{label_text}{truncated_snippet}"
+        reply_block_height = _font_line_height(reply_font) + 6
         logger.debug(
             "Rendering reply context for %s -> %s: %s",
             state.character_name,
@@ -1848,17 +1861,11 @@ def render_vn_panel(
     lines, text_font = _fit_text_segments(draw, segments, base_text_font, max_width, available_height)
     text_y = text_box[1] + text_padding
 
-    if reply_label_font and reply_label_text:
-        reply_fill = (200, 200, 200, 255)
+    if reply_font and reply_line:
+        reply_fill = (190, 190, 190, 255)
         text_x = text_box[0] + text_padding
-        draw.text((text_x, text_y), reply_label_text, fill=reply_fill, font=reply_label_font)
-        text_y += _font_line_height(reply_label_font)
-        if reply_lines:
-            text_y += 2
-            for line_text in reply_lines:
-                draw.text((text_x, text_y), line_text, fill=reply_fill, font=reply_body_font)
-                text_y += _font_line_height(reply_body_font)
-        text_y += 6
+        draw.text((text_x, text_y), reply_line, fill=reply_fill, font=reply_font)
+        text_y += _font_line_height(reply_font) + 6
 
     base_line_height = getattr(text_font, "size", VN_TEXT_FONT_SIZE)
     for line in lines:
