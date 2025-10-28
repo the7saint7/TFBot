@@ -137,7 +137,7 @@ class OutfitAsset:
 class TransformationState:
     user_id: int
     guild_id: int
-    args: str
+    character_name: str
     character_avatar_path: str
     character_message: str
     original_nick: Optional[str]
