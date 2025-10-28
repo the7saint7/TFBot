@@ -90,11 +90,6 @@ TF_CHARACTERS = [
         "message": "opens a study guide that Syn ‘helped’ annotate, and a cool little pulse slips in behind their eyes. Their face settles calm, their posture relaxed, and their thoughts turn clever in a way that feels a little dangerous to everyone else.",
     },
     {
-        "name": "Grace Reinhardt",
-        "avatar_path": "avatars/grace.png",
-        "message": "leans on the nurse’s counter and accidentally triggers a low, tired glow Syn stashed there. Their outfit relaxes into casual authority, and a dry, seen-it-all mood drifts in, like they’re already diagnosing the room and unimpressed about it.",
-    },
-    {
         "name": "Gwen Strauss",
         "avatar_path": "avatars/gwen.png",
         "message": "tries on a bracelet from the rack, not noticing the tiny rune worked into the tag, and a soft flash runs along their arms. Their look turns sharp retail-cute, and their patience drops to ‘customer service minimum’ right away.",
@@ -329,6 +324,11 @@ TF_CHARACTERS = [
         "name": "Riley Evans",
         "avatar_path": "avatars/riley.png",
         "message": "picks up a tiny folded note with Syn’s sigil on it, and a nervous spark jumps in their chest. Their stance goes a little smaller, their face goes red fast, and they can’t stop thinking about how cute everybody suddenly looks.",
+    },
+    {
+        "name": "Rudy",
+        "avatar_path": "avatars/rudy.png",
+        "message": "sniffs a strange glowing tennis ball Syn left in the yard, and the air pops with magic. A quick shimmer runs through them, tail wag slowing as awareness clicks on—they’re still loyal, still curious, but now definitely understand every sarcastic thing humans say.",
     },
 ]
 

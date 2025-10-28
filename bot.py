@@ -113,6 +113,7 @@ class TransformationState:
     expires_at: datetime
     duration_label: str
     avatar_applied: bool = False
+    original_display_name: str = ""
 
 
 @dataclass
@@ -155,6 +156,23 @@ def _is_admin(member: discord.abc.User) -> bool:
         roles: Iterable[discord.Role] = getattr(member, "roles", [])
         return any(role.name.lower() == "admin" for role in roles)
     return False
+
+
+def _member_profile_name(member: discord.Member) -> str:
+    """Return the user's profile name, ignoring any server nickname."""
+    global_name = getattr(member, "global_name", None)
+    if isinstance(global_name, str) and global_name.strip():
+        return global_name.strip()
+    return member.name
+
+
+def _normalize_pose_name(pose: Optional[str]) -> Optional[str]:
+    if pose is None:
+        return None
+    stripped = pose.strip()
+    if not stripped:
+        return None
+    return stripped.lower()
 
 
 def _build_character_pool(source: Sequence[Dict[str, str]]) -> Sequence[TFCharacter]:
@@ -227,6 +245,7 @@ def _serialize_state(state: TransformationState) -> Dict[str, object]:
         "character_avatar_path": state.character_avatar_path,
         "character_message": state.character_message,
         "original_nick": state.original_nick,
+        "original_display_name": state.original_display_name,
         "started_at": state.started_at.isoformat(),
         "expires_at": state.expires_at.isoformat(),
         "duration_label": state.duration_label,
@@ -244,6 +263,7 @@ def _deserialize_state(payload: Dict[str, object]) -> TransformationState:
         ),
         character_message=str(payload.get("character_message", "")),
         original_nick=payload.get("original_nick"),
+        original_display_name=str(payload.get("original_display_name", "") or ""),
         started_at=datetime.fromisoformat(str(payload["started_at"])),
         expires_at=datetime.fromisoformat(str(payload["expires_at"])),
         duration_label=str(payload["duration_label"]),
@@ -263,13 +283,39 @@ def persist_stats() -> None:
 
 
 
-def load_outfit_selections() -> Dict[str, str]:
+def load_outfit_selections() -> Dict[str, Dict[str, str]]:
     if not VN_SELECTION_FILE.exists():
         return {}
     try:
         data = json.loads(VN_SELECTION_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            return {str(k).lower(): str(v) for k, v in data.items()}
+            normalized: Dict[str, Dict[str, str]] = {}
+            for key, value in data.items():
+                entry: Dict[str, str] = {}
+                pose_value: Optional[str] = None
+                outfit_value: Optional[str] = None
+                if isinstance(value, dict):
+                    pose_raw = value.get("pose")
+                    outfit_raw = value.get("outfit") or value.get("name")
+                    if isinstance(pose_raw, str):
+                        pose_value = pose_raw.strip()
+                    elif pose_raw is not None:
+                        pose_value = str(pose_raw).strip()
+                    if isinstance(outfit_raw, str):
+                        outfit_value = outfit_raw.strip()
+                    elif outfit_raw is not None:
+                        outfit_value = str(outfit_raw).strip()
+                elif isinstance(value, str):
+                    outfit_value = value.strip()
+                elif value is not None:
+                    outfit_value = str(value).strip()
+
+                if outfit_value:
+                    if pose_value:
+                        entry["pose"] = pose_value
+                    entry["outfit"] = outfit_value
+                    normalized[str(key).lower()] = entry
+            return normalized
     except json.JSONDecodeError as exc:
         logger.warning("Failed to parse %s: %s", VN_SELECTION_FILE, exc)
     return {}
@@ -369,10 +415,33 @@ async def revert_transformation(state: TransformationState, *, expired: bool) ->
     guild, member = await fetch_member(state.guild_id, state.user_id)
     reason = "TF expired" if expired else "TF reverted"
     if member:
-        try:
-            await member.edit(nick=state.original_nick, reason=reason)
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            logger.warning("Failed to restore nickname for %s: %s", member.id, exc)
+        if not state.original_display_name:
+            state.original_display_name = _member_profile_name(member)
+        desired_nick = state.original_nick if state.original_nick else None
+        attempts: list[tuple[Optional[str], str]] = []
+        attempts.append((desired_nick, reason))
+        if desired_nick is None and state.original_display_name:
+            attempts.append((state.original_display_name, f"{reason} (profile fallback)"))
+        restored = False
+        for nick_value, attempt_reason in attempts:
+            try:
+                await member.edit(nick=nick_value, reason=attempt_reason)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "Failed to restore nickname for %s (value=%s): %s",
+                    member.id,
+                    nick_value,
+                    exc,
+                )
+                continue
+            restored = True
+            break
+        if not restored:
+            logger.warning(
+                "Unable to restore nickname for %s in guild %s after TF revert.",
+                member.id,
+                state.guild_id,
+            )
     else:
         logger.warning("Could not locate member %s in guild %s to revert TF", state.user_id, state.guild_id)
 
@@ -1057,30 +1126,68 @@ def _resolve_character_name_color(character_name: str) -> Tuple[int, int, int, i
 
 
 def _select_variant_dir(character_dir: Path, config: Dict) -> Optional[Path]:
-    variants = {child.name.lower(): child for child in character_dir.iterdir() if child.is_dir()}
-    if not variants:
+    ordered_variants = _ordered_variant_dirs(character_dir, config)
+    if not ordered_variants:
         logger.warning("VN sprite: no variants found under %s", character_dir.name)
         return None
-    preferred_names = []
+    return ordered_variants[0]
+
+
+def _ordered_variant_dirs(character_dir: Path, config: Dict) -> Sequence[Path]:
+    variants = {child.name.lower(): child for child in character_dir.iterdir() if child.is_dir()}
+    if not variants:
+        return []
+    preferred_names: list[str] = []
     poses = config.get("poses")
     if isinstance(poses, dict):
         preferred_names.extend(name.lower() for name in poses.keys())
     preferred_names.append("a")
+    preferred_names.extend(sorted(variants.keys()))
+
+    ordered: list[Path] = []
+    seen: set[str] = set()
     for name in preferred_names:
-        if name in variants:
-            return variants[name]
-    return variants[sorted(variants.keys())[0]]
+        if name in variants and name not in seen:
+            ordered.append(variants[name])
+            seen.add(name)
+    return ordered
 
 
-def _select_outfit_path(variant_dir: Path, config: Dict, preferred: Optional[str] = None) -> Optional[Path]:
-    outfits_dir = variant_dir / "outfits"
-    if not outfits_dir.exists():
-        logger.warning("VN sprite: outfit directory missing at %s", outfits_dir)
-        return None
-    outfits = sorted(outfits_dir.glob("*.png"))
-    if not outfits:
-        logger.warning("VN sprite: no outfit PNGs in %s", outfits_dir)
-        return None
+def _select_outfit_path(
+    variant_dirs: Sequence[Path],
+    config: Dict,
+    preferred: Optional[str] = None,
+    preferred_pose: Optional[str] = None,
+) -> tuple[Optional[Path], Optional[Path]]:
+    if not variant_dirs:
+        return None, None
+
+    variant_outfits: dict[Path, list[Path]] = {}
+    for variant_dir in variant_dirs:
+        outfits_dir = variant_dir / "outfits"
+        if not outfits_dir.exists():
+            logger.warning("VN sprite: outfit directory missing at %s", outfits_dir)
+            continue
+        outfits = sorted(outfits_dir.glob("*.png"))
+        if not outfits:
+            logger.warning("VN sprite: no outfit PNGs in %s", outfits_dir)
+            continue
+        variant_outfits[variant_dir] = outfits
+
+    if not variant_outfits:
+        logger.warning(
+            "VN sprite: no outfits discovered for variants %s",
+            ", ".join(v.name for v in variant_dirs),
+        )
+        return None, None
+
+    search_variants = [variant for variant in variant_dirs if variant in variant_outfits]
+    if not search_variants:
+        return None, None
+
+    normalized_pose = _normalize_pose_name(preferred_pose)
+    if normalized_pose:
+        search_variants.sort(key=lambda var: 0 if var.name.lower() == normalized_pose else 1)
 
     candidates: list[str] = []
     if preferred:
@@ -1091,27 +1198,44 @@ def _select_outfit_path(variant_dir: Path, config: Dict, preferred: Optional[str
     if VN_DEFAULT_OUTFIT:
         candidates.append(VN_DEFAULT_OUTFIT)
 
-    normalized_candidates = []
+    normalized_targets: list[str] = []
     for name in candidates:
         name = name.strip()
         if not name:
             continue
         lower = name.lower()
-        if not lower.endswith(".png"):
-            normalized_candidates.append(lower)
-            normalized_candidates.append(f"{lower}.png")
+        if lower.endswith(".png"):
+            normalized_targets.append(lower)
+            normalized_targets.append(lower.rstrip(".png"))
         else:
-            normalized_candidates.append(lower)
-            normalized_candidates.append(lower.rstrip(".png"))
+            normalized_targets.append(lower)
+            normalized_targets.append(f"{lower}.png")
 
-    for target in normalized_candidates:
-        for outfit in outfits:
-            if outfit.name.lower() == target or outfit.stem.lower() == target:
-                logger.debug("VN sprite: using outfit %s for variant %s", outfit.name, variant_dir.name)
-                return outfit
+    for target in normalized_targets:
+        for variant_dir in search_variants:
+            outfits = variant_outfits.get(variant_dir)
+            if not outfits:
+                continue
+            for outfit in outfits:
+                if outfit.name.lower() == target or outfit.stem.lower() == target:
+                    logger.debug(
+                        "VN sprite: using outfit %s for variant %s",
+                        outfit.name,
+                        variant_dir.name,
+                    )
+                    return variant_dir, outfit
 
-    logger.debug("VN sprite: defaulting to first outfit %s for variant %s", outfits[0].name, variant_dir.name)
-    return outfits[0]
+    for variant_dir in search_variants:
+        outfits = variant_outfits.get(variant_dir)
+        if outfits:
+            logger.debug(
+                "VN sprite: defaulting to first outfit %s for variant %s",
+                outfits[0].name,
+                variant_dir.name,
+            )
+            return variant_dir, outfits[0]
+
+    return None, None
 
 def _select_face_path(variant_dir: Path) -> Optional[Path]:
     faces_dir = variant_dir / "faces"
@@ -1192,43 +1316,132 @@ def resolve_character_directory(character_name: str) -> tuple[Optional[Path], Se
             return candidate, attempted
     return None, attempted
 
-def list_available_outfits(character_name: str) -> Sequence[str]:
+def list_pose_outfits(character_name: str) -> Dict[str, list[str]]:
     directory, attempted = resolve_character_directory(character_name)
     if directory is None:
         logger.debug("VN sprite: cannot list outfits for %s (tried %s)", character_name, attempted)
-        return []
+        return {}
     config = _load_character_config(directory)
-    variant_dir = _select_variant_dir(directory, config)
-    if not variant_dir:
-        return []
-    outfits_dir = variant_dir / "outfits"
-    if not outfits_dir.exists():
-        return []
-    outfits = sorted({p.stem for p in outfits_dir.glob("*.png")})
-    return outfits
+    variant_dirs = _ordered_variant_dirs(directory, config)
+    if not variant_dirs:
+        return {}
+    pose_map: Dict[str, list[str]] = {}
+    for variant_dir in variant_dirs:
+        outfits_dir = variant_dir / "outfits"
+        if not outfits_dir.exists():
+            continue
+        options = sorted(png_path.stem for png_path in outfits_dir.glob("*.png"))
+        if options:
+            pose_map[variant_dir.name] = options
+    return pose_map
+
+def list_available_outfits(character_name: str) -> Sequence[str]:
+    pose_map = list_pose_outfits(character_name)
+    outfits: set[str] = set()
+    for options in pose_map.values():
+        outfits.update(options)
+    return sorted(outfits)
 
 def get_selected_outfit_name(character_name: str) -> Optional[str]:
+    _, outfit = get_selected_pose_outfit(character_name)
+    return outfit
+
+def get_selected_pose_outfit(character_name: str) -> tuple[Optional[str], Optional[str]]:
     directory, _ = resolve_character_directory(character_name)
     if directory is None:
-        return None
-    return vn_outfit_selection.get(directory.name.lower())
+        return None, None
+    return get_selected_pose_outfit_for_dir(directory)
 
 def set_selected_outfit_name(character_name: str, outfit_name: str) -> bool:
+    return set_selected_pose_outfit(character_name, None, outfit_name)
+
+def set_selected_pose_outfit(character_name: str, pose_name: Optional[str], outfit_name: str) -> bool:
     directory, attempted = resolve_character_directory(character_name)
     if directory is None:
         logger.debug("VN sprite: cannot set outfit for %s (tried %s)", character_name, attempted)
         return False
-    outfits = list_available_outfits(character_name)
-    if outfit_name.lower() not in [o.lower() for o in outfits]:
+    pose_outfits = list_pose_outfits(character_name)
+    if not pose_outfits:
         return False
-    vn_outfit_selection[directory.name.lower()] = outfit_name
+
+    normalized_outfit = outfit_name.strip()
+    if not normalized_outfit:
+        return False
+    normalized_pose = _normalize_pose_name(pose_name)
+
+    matched_pose: Optional[str] = None
+    matched_outfit: Optional[str] = None
+
+    for pose, outfits in pose_outfits.items():
+        outfit_lookup = {option.lower(): option for option in outfits}
+        option = outfit_lookup.get(normalized_outfit.lower())
+        if not option:
+            continue
+        if normalized_pose is None or pose.lower() == normalized_pose:
+            matched_pose = pose
+            matched_outfit = option
+            break
+
+    if matched_outfit is None:
+        # No direct match; allow fallback to any pose if specific pose requested but not found.
+        if normalized_pose:
+            logger.debug(
+                "VN sprite: pose %s not available for outfit %s (character %s)",
+                normalized_pose,
+                outfit_name,
+                character_name,
+            )
+            return False
+        # Attempt to select first pose containing the outfit.
+        for pose, outfits in pose_outfits.items():
+            outfit_lookup = {option.lower(): option for option in outfits}
+            option = outfit_lookup.get(normalized_outfit.lower())
+            if option:
+                matched_pose = pose
+                matched_outfit = option
+                break
+
+    if matched_outfit is None or matched_pose is None:
+        return False
+
+    key = directory.name.lower()
+    vn_outfit_selection[key] = {"pose": matched_pose, "outfit": matched_outfit}
     persist_outfit_selections()
     compose_game_avatar.cache_clear()
-    logger.info("VN sprite: outfit override for %s set to %s", directory.name, outfit_name)
+    logger.info(
+        "VN sprite: outfit override for %s set to pose %s outfit %s",
+        directory.name,
+        matched_pose,
+        matched_outfit,
+    )
     return True
 
 def get_selected_outfit_for_dir(directory: Path) -> Optional[str]:
-    return vn_outfit_selection.get(directory.name.lower())
+    _, outfit = get_selected_pose_outfit_for_dir(directory)
+    return outfit
+
+def get_selected_pose_outfit_for_dir(directory: Path) -> tuple[Optional[str], Optional[str]]:
+    entry = vn_outfit_selection.get(directory.name.lower())
+    if not entry:
+        return None, None
+    pose: Optional[str] = None
+    outfit: Optional[str] = None
+    if isinstance(entry, dict):
+        pose_raw = entry.get("pose")
+        outfit_raw = entry.get("outfit") or entry.get("name")
+        if isinstance(pose_raw, str):
+            pose = pose_raw.strip() or None
+        elif pose_raw is not None:
+            pose = str(pose_raw).strip() or None
+        if isinstance(outfit_raw, str):
+            outfit = outfit_raw.strip() or None
+        elif outfit_raw is not None:
+            outfit = str(outfit_raw).strip() or None
+    elif isinstance(entry, str):
+        outfit = entry.strip() or None
+    else:
+        outfit = str(entry).strip() or None
+    return pose, outfit
 
 
 
@@ -1247,20 +1460,30 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         return None
 
     config = _load_character_config(character_dir)
-    variant_dir = _select_variant_dir(character_dir, config)
-    if not variant_dir:
+    variant_dirs = _ordered_variant_dirs(character_dir, config)
+    if not variant_dirs:
         logger.debug("VN sprite: no variant directory found for %s", character_dir.name)
         return None
 
-    preferred_outfit = get_selected_outfit_for_dir(character_dir)
+    preferred_pose, preferred_outfit = get_selected_pose_outfit_for_dir(character_dir)
     if preferred_outfit:
-        logger.debug("VN sprite: preferred outfit override for %s is %s", character_dir.name, preferred_outfit)
-    outfit_path = _select_outfit_path(variant_dir, config, preferred_outfit)
-    if not outfit_path or not outfit_path.exists():
+        logger.debug(
+            "VN sprite: preferred outfit override for %s is pose %s outfit %s",
+            character_dir.name,
+            preferred_pose or "auto",
+            preferred_outfit,
+        )
+    variant_dir, outfit_path = _select_outfit_path(
+        variant_dirs,
+        config,
+        preferred_outfit,
+        preferred_pose,
+    )
+    if not variant_dir or not outfit_path or not outfit_path.exists():
         logger.warning(
             "VN sprite: outfit not found for %s (variant %s, tried %s)",
             character_dir.name,
-            variant_dir.name,
+            variant_dir.name if variant_dir else "unknown",
             outfit_path,
         )
         return None
@@ -1863,6 +2086,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     now = _now()
     expires_at = now + duration_delta
     original_nick = member.nick
+    profile_name = _member_profile_name(member)
 
     if member.guild and member.guild.owner_id == member.id:
         logger.warning(
@@ -1892,6 +2116,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         expires_at=expires_at,
         duration_label=duration_label,
         avatar_applied=False,
+        original_display_name=profile_name,
     )
     active_transformations[key] = state
     persist_states()
@@ -1914,7 +2139,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         f"Original Name: **{member.name}**\nCharacter: **{character.name}**\nDuration: {duration_label}.",
     )
 
-    original_name = original_nick or member.name
+    original_name = profile_name
     response_text = _format_character_message(
         character.message,
         original_name,
@@ -2151,7 +2376,7 @@ async def reroll_command(ctx: commands.Context, member: Optional[discord.Member]
         ),
     )
 
-    original_name = state.original_nick or target.name
+    original_name = _member_profile_name(target)
     response_text = _format_character_message(
         new_character.message,
         original_name,
@@ -2258,18 +2483,34 @@ async def tf_stats_command(ctx: commands.Context):
     try:
         await ctx.author.send(embed=embed)
         if current_state:
-            outfits = list_available_outfits(current_state.character_name)
-            if outfits:
-                selected = get_selected_outfit_name(current_state.character_name)
-                formatted = []
-                for option in outfits:
-                    label = option
-                    if selected and option.lower() == selected.lower():
-                        label = f"{option} (current)"
-                    formatted.append(label)
+            pose_outfits = list_pose_outfits(current_state.character_name)
+            if pose_outfits:
+                selected_pose, selected_outfit = get_selected_pose_outfit(current_state.character_name)
+                selected_pose_normalized = _normalize_pose_name(selected_pose)
+                selected_outfit_normalized = (
+                    selected_outfit.lower() if selected_outfit else None
+                )
+                pose_lines: list[str] = []
+                for pose, options in pose_outfits.items():
+                    entries: list[str] = []
+                    for option in options:
+                        display = option
+                        if (
+                            selected_outfit_normalized
+                            and option.lower() == selected_outfit_normalized
+                            and (
+                                selected_pose_normalized is None
+                                or pose.lower() == selected_pose_normalized
+                            )
+                        ):
+                            display = f"{option} (current)"
+                        entries.append(display)
+                    pose_lines.append(f"{pose}: {', '.join(entries)}")
                 outfit_note = (
-                    f"Outfits available for {current_state.character_name}: {', '.join(formatted)}.\n"
-                    "Use `!outfit <name>` while you are transformed to switch outfits."
+                    f"Outfits available for {current_state.character_name}:\n"
+                    + "\n".join(f"- {line}" for line in pose_lines)
+                    + "\nUse `!outfit <outfit>` to pick by name or "
+                    + "`!outfit <pose> <outfit>` (you can also separate with ':' or '/')."
                 )
                 try:
                     await ctx.author.send(outfit_note)
@@ -2293,7 +2534,7 @@ async def tf_stats_command(ctx: commands.Context):
 async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
     outfit_name = outfit_name.strip()
     if not outfit_name:
-        message = "Usage: !outfit <outfit name>"
+        message = "Usage: !outfit <outfit>` or `!outfit <pose> <outfit>`"
         if ctx.guild:
             await ctx.reply(message, mention_author=False)
         else:
@@ -2310,8 +2551,8 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
             await ctx.send(message)
         return
 
-    outfits = list_available_outfits(state.character_name)
-    if not outfits:
+    pose_outfits = list_pose_outfits(state.character_name)
+    if not pose_outfits:
         message = f"No outfits are available for {state.character_name}."
         if ctx.guild:
             await ctx.reply(message, mention_author=False)
@@ -2319,25 +2560,68 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
             await ctx.send(message)
         return
 
-    normalized = outfit_name.lower()
-    match = next((o for o in outfits if o.lower() == normalized), None)
-    if match is None:
-        message = f"Unknown outfit `{outfit_name}`. Available: {', '.join(outfits)}"
+    parsed_pose: Optional[str] = None
+    parsed_outfit: Optional[str] = None
+
+    for separator in (":", "/"):
+        if separator in outfit_name:
+            left, right = outfit_name.split(separator, 1)
+            parsed_pose = left.strip()
+            parsed_outfit = right.strip()
+            break
+
+    if parsed_outfit is None:
+        parts = outfit_name.split()
+        if len(parts) >= 2:
+            parsed_pose = parts[0].strip()
+            parsed_outfit = " ".join(parts[1:]).strip()
+        else:
+            parsed_outfit = outfit_name
+
+    if not parsed_outfit:
+        message = "Please provide the outfit to select. Example: `!outfit cheer` or `!outfit b cheer`."
         if ctx.guild:
             await ctx.reply(message, mention_author=False)
         else:
             await ctx.send(message)
         return
 
-    if not set_selected_outfit_name(state.character_name, match):
-        message = "Unable to update outfit at this time."
+    if parsed_pose:
+        normalized_pose = _normalize_pose_name(parsed_pose)
+        known_poses = {pose.lower() for pose in pose_outfits.keys()}
+        if normalized_pose not in known_poses:
+            message = (
+                f"Unknown pose `{parsed_pose}`. Available poses: {', '.join(pose_outfits.keys())}."
+            )
+            if ctx.guild:
+                await ctx.reply(message, mention_author=False)
+            else:
+                await ctx.send(message)
+            return
+    else:
+        normalized_pose = None
+
+    if not set_selected_pose_outfit(state.character_name, parsed_pose if normalized_pose else None, parsed_outfit):
+        pose_lines = []
+        for pose, options in pose_outfits.items():
+            pose_lines.append(f"{pose}: {', '.join(options)}")
+        message = (
+            f"Unable to update outfit. Available options:\n"
+            + "\n".join(f"- {line}" for line in pose_lines)
+        )
         if ctx.guild:
             await ctx.reply(message, mention_author=False)
         else:
             await ctx.send(message)
         return
 
-    confirmation = f"Outfit for {state.character_name} set to `{match}`. Future messages will use this outfit."
+    selected_pose, selected_outfit = get_selected_pose_outfit(state.character_name)
+    pose_label = selected_pose or "auto"
+    outfit_label = selected_outfit or parsed_outfit
+    confirmation = (
+        f"Outfit for {state.character_name} set to `{outfit_label}` (pose `{pose_label}`). "
+        "Future messages will use this combination."
+    )
     if ctx.guild:
         await ctx.reply(confirmation, mention_author=False)
     else:
