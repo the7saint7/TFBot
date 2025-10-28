@@ -33,6 +33,9 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | `TFBOT_VN_GAME_ROOT` | Path to Student Transfer game root for sprite composition | _(empty)_ |
 | `TFBOT_VN_OUTFIT` | Default outfit filename when composing sprites | `casual.png` |
 | `TFBOT_VN_FACE` | Default face sprite filename when composing sprites | `0.png` |
+| `TFBOT_VN_AVATAR_MODE` | `game` to build sprites from Student Transfer assets or `user` to keep member avatars | `game` |
+| `TFBOT_VN_AVATAR_SCALE` | Scaling factor applied to VN avatars before cropping into the panel | `1.0` |
+| `TFBOT_VN_CACHE_DIR` | Directory that stores cached composite VN avatars (set empty to disable) | `vn_cache` |
 | `TFBOT_VN_SELECTIONS` | JSON file storing per-character outfit overrides | `tf_outfits.json` |
 | `TFBOT_STATS_FILE` | JSON file storing per-user TF counts | `tf_stats.json` |
 

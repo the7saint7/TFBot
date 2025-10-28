@@ -8,4 +8,4 @@ __pycache__/
 !.env.example
 tf_state.json
 tf_stats.json
-
+vn_cache/

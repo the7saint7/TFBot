@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -73,6 +74,7 @@ VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
 VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
 VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
 VN_AVATAR_SCALE = max(0.1, _float_from_env("TFBOT_VN_AVATAR_SCALE", 1.0))
+_VN_CACHE_DIR_SETTING = os.getenv("TFBOT_VN_CACHE_DIR", "vn_cache").strip()
 TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 minutes", timedelta(minutes=10)),
     ("1 hour", timedelta(hours=1)),
@@ -400,6 +402,15 @@ async def fetch_member(guild_id: int, user_id: int) -> Tuple[Optional[discord.Gu
 
 BASE_DIR = Path(__file__).resolve().parent
 
+if _VN_CACHE_DIR_SETTING:
+    _vn_cache_path = Path(_VN_CACHE_DIR_SETTING)
+    if not _vn_cache_path.is_absolute():
+        VN_CACHE_DIR = (BASE_DIR / _vn_cache_path).resolve()
+    else:
+        VN_CACHE_DIR = _vn_cache_path.resolve()
+else:
+    VN_CACHE_DIR = None
+
 
 @lru_cache(maxsize=64)
 def _load_vn_font(size: int) -> "ImageFont.ImageFont":
@@ -467,6 +478,9 @@ def _select_font_for_segment(segment: Dict, base_font: "ImageFont.ImageFont") ->
     return font
 
 
+CUSTOM_EMOJI_RE = re.compile(r"<(a?):([a-zA-Z0-9_]{2,}):(\d+)>")
+
+
 def parse_discord_formatting(text: str) -> Sequence[dict]:
     """Parse a subset of Discord markdown into renderable text segments."""
     segments: list[dict] = []
@@ -527,6 +541,31 @@ def parse_discord_formatting(text: str) -> Sequence[dict]:
             )
             i += 1
             continue
+        if ch == "<":
+            match = CUSTOM_EMOJI_RE.match(text, i)
+            if match:
+                emit_buffer()
+                animated = match.group(1) == "a"
+                name = match.group(2)
+                emoji_id = int(match.group(3))
+                key = f"{emoji_id}{'a' if animated else ''}"
+                segments.append(
+                    {
+                        "text": f":{name}:",
+                        "bold": bold,
+                        "italic": italic,
+                        "strike": strike,
+                        "emoji": False,
+                        "custom_emoji": {
+                            "name": name,
+                            "id": emoji_id,
+                            "animated": animated,
+                            "key": key,
+                        },
+                    }
+                )
+                i = match.end()
+                continue
         if _is_emoji_char(ch):
             emit_buffer()
             cluster_chars = [ch]
@@ -593,6 +632,29 @@ def layout_formatted_text(draw, segments: Sequence[dict], base_font, max_width: 
     for segment in segments:
         if segment.get("newline"):
             push_line(force_blank=True)
+            continue
+
+        custom_meta = segment.get("custom_emoji")
+        if custom_meta:
+            emoji_size = getattr(base_font, "size", baseline_height)
+            if current_x > 0 and current_x + emoji_size > max_width:
+                push_line()
+            line.append(
+                {
+                    "text": segment.get("text", ""),
+                    "font": base_font,
+                    "strike": False,
+                    "bold": segment.get("bold"),
+                    "italic": segment.get("italic"),
+                    "emoji": False,
+                    "custom_emoji": custom_meta,
+                    "color": (240, 240, 240, 255),
+                    "width": emoji_size,
+                    "height": emoji_size,
+                    "fallback_text": segment.get("text", ""),
+                }
+            )
+            current_x += emoji_size
             continue
 
         text = segment.get("text", "")
@@ -990,13 +1052,29 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         )
         return None
 
+    face_path = _select_face_path(variant_dir)
+
+    cache_file: Optional[Path] = None
+    if VN_CACHE_DIR:
+        face_token = "noface"
+        if face_path and face_path.exists():
+            face_token = face_path.stem.lower()
+        cache_dir = VN_CACHE_DIR / character_dir.name.lower() / variant_dir.name.lower()
+        cache_file = cache_dir / f"{outfit_path.stem.lower()}__{face_token}.png"
+        if cache_file.exists():
+            try:
+                cached = Image.open(cache_file).convert("RGBA")
+                logger.debug("VN sprite: loaded cached avatar %s", cache_file)
+                return cached
+            except OSError as exc:
+                logger.warning("VN sprite: failed to load cached avatar %s: %s (rebuilding)", cache_file, exc)
+
     try:
         outfit_image = Image.open(outfit_path).convert("RGBA")
     except OSError as exc:
         logger.warning("Failed to load outfit %s: %s", outfit_path, exc)
         return None
 
-    face_path = _select_face_path(variant_dir)
     if face_path and face_path.exists():
         try:
             face_image = Image.open(face_path).convert("RGBA")
@@ -1011,7 +1089,15 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
             face_path,
         )
 
-    return _crop_transparent_top(outfit_image)
+    final_image = _crop_transparent_top(outfit_image)
+    if cache_file:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            final_image.save(cache_file)
+            logger.debug("VN sprite: cached avatar saved to %s", cache_file)
+        except OSError as exc:
+            logger.warning("VN sprite: unable to save cached avatar %s: %s", cache_file, exc)
+    return final_image
 
 def render_vn_panel(
     state: TransformationState,
@@ -1019,6 +1105,8 @@ def render_vn_panel(
     character_display_name: str,
     original_name: str,
     attachment_id: Optional[str] = None,
+    formatted_segments: Optional[Sequence[dict]] = None,
+    custom_emoji_images: Optional[Dict[str, "Image.Image"]] = None,
 ) -> Optional[discord.File]:
     if MESSAGE_STYLE != "vn":
         return None
@@ -1139,13 +1227,16 @@ def render_vn_panel(
     name_y = name_box[1] + name_padding
     draw.text((name_x, name_y), name_text, fill=(255, 220, 180, 255), font=name_font)
 
-    if not message_content.strip():
-        message_content = f"{original_name} remains quietly transformed..."
+    working_content = message_content.strip()
+    if not working_content:
+        working_content = f"{original_name} remains quietly transformed..."
 
     max_width = text_box[2] - text_box[0] - text_padding * 2
     max_height = text_box[3] - text_box[1] - text_padding * 2
-    formatted_segments = parse_discord_formatting(message_content.strip())
-    lines, text_font = _fit_text_segments(draw, formatted_segments, base_text_font, max_width, max_height)
+    segments = list(formatted_segments) if formatted_segments else []
+    if not segments:
+        segments = list(parse_discord_formatting(working_content))
+    lines, text_font = _fit_text_segments(draw, segments, base_text_font, max_width, max_height)
     text_y = text_box[1] + text_padding
     base_line_height = getattr(text_font, "size", VN_TEXT_FONT_SIZE)
     for line in lines:
@@ -1160,6 +1251,26 @@ def render_vn_panel(
             text_segment = segment.get("text", "")
             width = segment.get("width", 0)
             height = segment.get("height") or getattr(font_segment, "size", base_line_height)
+            custom_meta = segment.get("custom_emoji")
+            if custom_meta:
+                key = custom_meta.get("key")
+                emoji_img = None
+                if custom_emoji_images and key:
+                    emoji_img = custom_emoji_images.get(key)
+                if emoji_img is not None:
+                    emoji_render = emoji_img.copy()
+                    target_w = int(width) or base_line_height
+                    target_h = int(height) or base_line_height
+                    emoji_render.thumbnail((target_w, target_h), Image.LANCZOS)
+                    offset_y = text_y + max(0, base_line_height - emoji_render.height)
+                    base.paste(emoji_render, (int(text_x), int(offset_y)), emoji_render)
+                else:
+                    fallback = segment.get("fallback_text") or text_segment or custom_meta.get("name") or ""
+                    if fallback:
+                        draw.text((text_x, text_y), fallback, fill=fill, font=text_font)
+                max_height = max(max_height, height)
+                text_x += width
+                continue
             if text_segment:
                 draw.text((text_x, text_y), text_segment, fill=fill, font=font_segment)
                 if segment.get("strike"):
@@ -1210,6 +1321,75 @@ async def fetch_avatar_bytes(path_or_url: str) -> Optional[bytes]:
         return None
 
 
+async def prepare_custom_emoji_images(
+    message: discord.Message,
+    segments: Sequence[dict],
+) -> Dict[str, "Image.Image"]:
+    """Load custom Discord emojis referenced in the message for VN rendering."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return {}
+
+    needed: Dict[str, dict] = {}
+    for segment in segments:
+        meta = segment.get("custom_emoji")
+        if not meta:
+            continue
+        key = meta.get("key")
+        if key and key not in needed:
+            needed[key] = meta
+    if not needed:
+        return {}
+
+    cache_dir: Optional[Path] = None
+    if VN_CACHE_DIR:
+        cache_dir = VN_CACHE_DIR / "__emojis__"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, "Image.Image"] = {}
+    for key, meta in needed.items():
+        emoji_id = meta.get("id")
+        if emoji_id is None:
+            continue
+        cache_path = cache_dir / f"{emoji_id}.png" if cache_dir else None
+        image_obj = None
+        if cache_path and cache_path.exists():
+            try:
+                image_obj = Image.open(cache_path).convert("RGBA")
+            except OSError as exc:
+                logger.warning("VN emoji cache read failed (%s): %s", cache_path, exc)
+                image_obj = None
+        if image_obj is None:
+            emoji_url = None
+            if message.guild:
+                emoji_obj = discord.utils.get(message.guild.emojis, id=int(emoji_id))
+                if emoji_obj:
+                    emoji_url = str(emoji_obj.url)
+            if emoji_url is None:
+                ext = "gif" if meta.get("animated") else "png"
+                emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}?quality=lossless"
+            data = await fetch_avatar_bytes(emoji_url)
+            if not data:
+                continue
+            try:
+                image_obj = Image.open(io.BytesIO(data))
+                if getattr(image_obj, "is_animated", False):
+                    image_obj.seek(0)
+                image_obj = image_obj.convert("RGBA")
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("VN sprite: failed to decode emoji %s: %s", emoji_id, exc)
+                continue
+            if cache_path:
+                try:
+                    image_obj.save(cache_path, format="PNG")
+                except OSError as exc:
+                    logger.warning("VN sprite: unable to store emoji cache %s: %s", cache_path, exc)
+        if image_obj:
+            results[key] = image_obj
+    return results
+
+
 async def relay_transformed_message(
     message: discord.Message,
     state: TransformationState,
@@ -1222,17 +1402,24 @@ async def relay_transformed_message(
 
     cleaned_content = message.content.strip()
     description = cleaned_content if cleaned_content else "*no message content*"
+    formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else None
+    custom_emoji_images: Dict[str, "Image.Image"] = {}
 
     files: list[discord.File] = []
     payload: dict = {}
 
     if MESSAGE_STYLE == "vn":
+        if formatted_segments is None:
+            formatted_segments = parse_discord_formatting(cleaned_content)
+        custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments)
         vn_file = render_vn_panel(
             state=state,
             message_content=cleaned_content,
             character_display_name=state.character_name,
             original_name=message.author.display_name,
             attachment_id=str(message.id),
+            formatted_segments=formatted_segments,
+            custom_emoji_images=custom_emoji_images,
         )
         if vn_file:
             files.append(vn_file)
