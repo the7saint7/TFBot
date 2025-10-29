@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
 import aiohttp
 import discord
@@ -855,13 +855,112 @@ def _strip_urls(text: str) -> tuple[str, bool]:
 
     def repl(match: re.Match[str]) -> str:
         found[0] = True
-        return ''
+        return ""
 
     stripped = URL_RE.sub(repl, text)
     if not found[0]:
         return text, False
-    normalized = ' '.join(stripped.split())
+    normalized = " ".join(stripped.split())
     return normalized.strip(), True
+
+
+MENTION_TOKEN_RE = re.compile(r"<(@!?|@&|#)(\d+)>")
+MENTION_PLACEHOLDER_PATTERN = re.compile(r"\uFFF0([a-z]+):(\d+)\uFFF1")
+MENTION_COLORS = {
+    "user": (114, 137, 218, 255),
+    "role": (89, 102, 242, 255),
+    "channel": (67, 181, 129, 255),
+}
+
+
+def _prepare_panel_mentions(
+    message: discord.Message,
+    text: str,
+) -> tuple[str, Dict[str, dict], bool]:
+    """Replace raw mention tokens with placeholders and gather render metadata."""
+    if not text:
+        return text, {}, False
+
+    guild = message.guild
+    if guild is None:
+        return text, {}, False
+
+    user_lookup = {member.id: member for member in getattr(message, "mentions", [])}
+    role_lookup = {role.id: role for role in getattr(message, "role_mentions", [])}
+    channel_lookup = {
+        channel.id: channel for channel in getattr(message, "channel_mentions", [])
+    }
+
+    parts: list[str] = []
+    last_index = 0
+    mention_lookup: Dict[str, dict] = {}
+    has_mentions = False
+
+    for match in MENTION_TOKEN_RE.finditer(text):
+        parts.append(text[last_index:match.start()])
+        token = match.group(1)
+        try:
+            target_id = int(match.group(2))
+        except (TypeError, ValueError):
+            parts.append(match.group(0))
+            last_index = match.end()
+            continue
+
+        mention_type = "user"
+        display = f"@{target_id}"
+        text_color = (255, 255, 255, 255)
+
+        if token == "@&":
+            mention_type = "role"
+            role_obj = role_lookup.get(target_id) or guild.get_role(target_id)
+            if role_obj:
+                display = f"@{role_obj.name}"
+        elif token == "#":
+            mention_type = "channel"
+            channel_obj = channel_lookup.get(target_id) or guild.get_channel(target_id)
+            if channel_obj:
+                display = f"#{channel_obj.name}"
+            else:
+                display = f"#{target_id}"
+        else:
+            member = user_lookup.get(target_id) or guild.get_member(target_id)
+            display_name = member.display_name if member else str(target_id)
+            display = f"@{display_name}"
+
+        placeholder = f"\uFFF0{mention_type}:{target_id}\uFFF1"
+        if placeholder not in mention_lookup:
+            mention_lookup[placeholder] = {
+                "type": mention_type,
+                "id": target_id,
+                "display": display,
+                "bg_color": MENTION_COLORS.get(mention_type, MENTION_COLORS["user"]),
+                "text_color": text_color,
+            }
+        parts.append(placeholder)
+        last_index = match.end()
+        has_mentions = True
+
+    parts.append(text[last_index:])
+    return "".join(parts), mention_lookup, has_mentions
+
+
+def _apply_mention_placeholders(text: str, mention_lookup: Mapping[str, dict]) -> str:
+    """Swap mention placeholders for their display strings."""
+    if not text or not mention_lookup:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        placeholder = match.group(0)
+        meta = mention_lookup.get(placeholder)
+        if meta:
+            return meta.get("display", "")
+        mention_kind = match.group(1)
+        identifier = match.group(2)
+        if mention_kind == "channel":
+            return f"#{identifier}"
+        return f"@{identifier}"
+
+    return MENTION_PLACEHOLDER_PATTERN.sub(repl, text)
 def _select_font_for_segment(segment: Dict, base_font: "ImageFont.ImageFont") -> "ImageFont.ImageFont":
     """Return an appropriate font for this segment, handling bold/italic/emoji fallbacks."""
     size = getattr(base_font, "size", VN_TEXT_FONT_SIZE)
@@ -1241,29 +1340,42 @@ def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
 def _collect_accessory_layers(entry: Path, include_all: bool = False) -> list[tuple[int, Path]]:
     """Gather accessory layers defined under the outfit entry, respecting naming and order."""
     accessories: list[tuple[int, Path]] = []
-    for accessory_dir in sorted(
-        (
-            child
-            for child in entry.iterdir()
-            if child.is_dir()
-            and (include_all or child.name.lower().startswith("acc"))
-        ),
-        key=lambda p: p.name.lower(),
-    ):
-        layer = _default_accessory_layer(accessory_dir)
-        if not layer:
-            continue
-        # Determine layer order from suffix
-        layer_name = accessory_dir.name
+    seen_paths: set[Path] = set()
+
+    def _add_layer(path: Path, source_name: str) -> None:
+        normalized_name = source_name.lower()
         order = 0
-        if "-" in layer_name:
-            suffix = layer_name.rsplit("-", 1)[-1]
+        if "-" in normalized_name:
+            suffix = normalized_name.rsplit("-", 1)[-1]
             if suffix.lstrip("-").isdigit():
                 try:
                     order = int(suffix)
                 except ValueError:
                     order = 0
-        accessories.append((order, layer))
+        if path not in seen_paths:
+            accessories.append((order, path))
+            seen_paths.add(path)
+
+    for child in sorted(
+        (
+            child
+            for child in entry.iterdir()
+            if (include_all or child.name.lower().startswith("acc"))
+        ),
+        key=lambda p: p.name.lower(),
+    ):
+        if child.is_dir():
+            layer = _default_accessory_layer(child)
+            if layer:
+                _add_layer(layer, child.name)
+        elif child.is_file() and child.suffix.lower() == ".png":
+            _add_layer(child, child.stem)
+
+    if not accessories and entry.is_dir() and (include_all or entry.name.lower().startswith("acc")):
+        layer = _default_accessory_layer(entry)
+        if layer:
+            _add_layer(layer, entry.name)
+
     accessories.sort(key=lambda item: item[0])
     return accessories
 
@@ -1651,19 +1763,31 @@ def _candidate_character_keys(raw_name: str) -> Sequence[str]:
     name = raw_name.strip()
     if not name:
         return []
-    first_word = name.split(" ", 1)[0].lower()
-    if not first_word:
+    first_token = name.split(" ", 1)[0]
+    if not first_token:
         return []
-    candidates: list[str] = [first_word]
-    stripped = first_word.replace('"', "").replace("'", "")
-    if stripped and stripped not in candidates:
-        candidates.append(stripped)
+    candidates: list[str] = []
+
+    def _add(token: str) -> None:
+        value = token.strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    primary = first_token.lower()
+    _add(primary)
+
+    stripped = primary.replace('"', "").replace("'", "")
+    _add(stripped)
+
+    hyphen_base = stripped.split("-", 1)[0]
+    _add(hyphen_base)
+
     hyphen_removed = stripped.replace("-", "")
-    if hyphen_removed and hyphen_removed not in candidates:
-        candidates.append(hyphen_removed)
+    _add(hyphen_removed)
+
     underscore_variant = stripped.replace("-", "_")
-    if underscore_variant and underscore_variant not in candidates:
-        candidates.append(underscore_variant)
+    _add(underscore_variant)
+
     return candidates
 
 
