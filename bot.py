@@ -48,6 +48,7 @@ from tfbot.state import (
     state_key,
 )
 from tfbot.legacy_embed import build_legacy_embed
+from tfbot.history import publish_history_snapshot
 from tfbot.panels import (
     VN_AVATAR_MODE,
     VN_AVATAR_SCALE,
@@ -540,6 +541,10 @@ async def send_history_message(title: str, description: str) -> None:
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as exc:
         logger.warning("Failed to send history message: %s", exc)
+    try:
+        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to refresh history snapshot: %s", exc)
 
 
 def _format_character_message(
@@ -782,6 +787,10 @@ async def on_ready():
             )
     await log_guild_permissions()
     await log_channel_access()
+    try:
+        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to refresh history snapshot on startup: %s", exc)
 
 
 @bot.command(name="synreset", hidden=True)
@@ -1231,6 +1240,10 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     except discord.Forbidden:
         if ctx.guild:
             await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
+    try:
+        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to refresh history snapshot after background change: %s", exc)
 
 
 
@@ -1337,6 +1350,10 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
         f"Outfit for {state.character_name} set to `{outfit_label}` (pose `{pose_label}`). "
         "Future messages will use this combination."
     )
+    try:
+        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to refresh history snapshot after outfit change: %s", exc)
     if ctx.guild:
         await ctx.reply(confirmation, mention_author=False)
     else:

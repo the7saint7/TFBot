@@ -40,7 +40,7 @@ TF_CHARACTERS = [
         "message": "leans into a pink-glow charm Syn ‘forgot’ on the couch, and a mellow warmth spreads through them until their outfit hangs cute and casual. Their mood slides easy and social, like it’s already a party and they’re already the draw.",
     },
     {
-        "name": "Cassandra \"Cassie\" Wright",
+        "name": "Cassie Wright",
         "avatar_path": "avatars/cassie.png",
         "message": "checks her reflection in a compact that’s humming with Syn’s magic, and in one blink their look sharpens into money and expectation. They feel that practiced confidence settle in, the kind that assumes service and doesn’t wait in lines.",
     },
