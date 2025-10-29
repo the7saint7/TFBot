@@ -3256,10 +3256,21 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
             await ctx.send(message)
         return
 
+    await ensure_state_restored()
+
     guild_id = ctx.guild.id if ctx.guild else None
     state = find_active_transformation(ctx.author.id, guild_id)
     if not state:
-        message = "You need to be transformed to change outfits."
+        fallback_state = find_active_transformation(ctx.author.id)
+        if fallback_state and ctx.guild and fallback_state.guild_id != guild_id:
+            target_guild = bot.get_guild(fallback_state.guild_id)
+            guild_name = target_guild.name if target_guild else f"server {fallback_state.guild_id}"
+            message = (
+                "You're transformed right now, but in a different server. "
+                f"Use this command in **{guild_name}** to change that outfit."
+            )
+        else:
+            message = "You need to be transformed to change outfits."
         if ctx.guild:
             await ctx.reply(message, mention_author=False)
         else:
