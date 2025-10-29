@@ -1513,7 +1513,7 @@ def render_vn_panel(
     text_box = (188, 80, 765, 250)
     name_padding = 10
     text_padding = 12
-    avatar_box = (0, 4, 215, 250)
+    avatar_box = (0, 4, 220, 250)
     avatar_width = avatar_box[2] - avatar_box[0]
     avatar_height = avatar_box[3] - avatar_box[1]
 
@@ -1521,32 +1521,39 @@ def render_vn_panel(
 
     avatar_image = compose_game_avatar(state.character_name)
     if avatar_image is not None:
-        cropped = _crop_transparent_top(avatar_image)
-        scale = VN_AVATAR_SCALE
-        if scale != 1.0:
-            width = int(cropped.width * scale)
-            height = int(cropped.height * scale)
-            width = max(1, width)
-            height = max(1, height)
-            cropped = cropped.resize((width, height), Image.LANCZOS)
+        cropped = _crop_transparent_vertical(avatar_image)
+        base_scale = max(VN_AVATAR_SCALE, 0.01)
+        if base_scale != 1.0:
+            scaled_width = max(1, int(cropped.width * base_scale))
+            scaled_height = max(1, int(cropped.height * base_scale))
+            cropped = cropped.resize((scaled_width, scaled_height), Image.LANCZOS)
 
-        if cropped.width < avatar_width or cropped.height < avatar_height:
-            canvas = Image.new('RGBA', (avatar_width, avatar_height), (0, 0, 0, 0))
-            offset_x = max(0, (avatar_width - cropped.width) // 2)
-            offset_y = max(0, (avatar_height - cropped.height) // 2)
-            canvas.paste(cropped, (offset_x, offset_y), cropped)
-            cropped = canvas
+        fit_scale = min(
+            avatar_width / cropped.width if cropped.width else 1.0,
+            avatar_height / cropped.height if cropped.height else 1.0,
+            1.0,
+        )
+        if fit_scale < 1.0:
+            scaled_width = max(1, int(cropped.width * fit_scale))
+            scaled_height = max(1, int(cropped.height * fit_scale))
+            cropped = cropped.resize((scaled_width, scaled_height), Image.LANCZOS)
+
+        canvas = Image.new("RGBA", (avatar_width, avatar_height), (0, 0, 0, 0))
+        offset_x = max(0, (avatar_width - cropped.width) // 2)
+        offset_y = max(0, (avatar_height - cropped.height) // 2)
+        canvas.paste(cropped, (offset_x, offset_y), cropped)
 
         pos_x = avatar_box[0]
         pos_y = avatar_box[1]
-        base.paste(cropped, (pos_x, pos_y), cropped)
+        base.paste(canvas, (pos_x, pos_y), canvas)
         logger.debug(
-            "VN sprite: pasted avatar for %s at (%s, %s) size %s (scale=%s)",
+            "VN sprite: pasted avatar for %s at (%s, %s) size %s (base_scale=%s fit_scale=%s)",
             state.character_name,
             pos_x,
             pos_y,
-            cropped.size,
-            scale,
+            canvas.size,
+            base_scale,
+            fit_scale,
         )
     else:
         logger.warning(
@@ -1559,7 +1566,8 @@ def render_vn_panel(
     name_x = name_box[0] + name_padding
     name_y = name_box[1] + name_padding
     name_font = _load_vn_font(VN_NAME_FONT_SIZE, style="bold")
-    draw.text((name_x, name_y), name_text, fill=VN_NAME_DEFAULT_COLOR, font=name_font)
+    name_color = resolve_character_name_color(state.character_name)
+    draw.text((name_x, name_y), name_text, fill=name_color, font=name_font)
 
     working_content = message_content.strip()
     if not working_content:
@@ -1794,7 +1802,6 @@ __all__ = [
     "fetch_avatar_bytes",
     "prepare_custom_emoji_images",
 ]
-
 
 
 
