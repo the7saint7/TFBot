@@ -50,6 +50,8 @@ from tfbot.state import (
 from tfbot.legacy_embed import build_legacy_embed
 from tfbot.history import publish_history_snapshot
 from tfbot.panels import (
+    VN_BACKGROUND_ROOT,
+    VN_BACKGROUND_DEFAULT_RELATIVE,
     VN_AVATAR_MODE,
     VN_AVATAR_SCALE,
     apply_mention_placeholders,
