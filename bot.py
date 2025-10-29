@@ -244,10 +244,16 @@ async def revert_transformation(state: TransformationState, *, expired: bool) ->
     persist_states()
 
     username = member.name if member else state.original_nick or "Unknown"
-    await send_history_message(
-        "TF Reverted",
-        f"Original Name: **{username}**\nCharacter: **{state.character_name}**\nReason: {reason}.",
-    )
+    try:
+        await publish_history_snapshot(
+            bot,
+            active_transformations,
+            tf_stats,
+            CHARACTER_POOL,
+            current_history_channel_id(),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to refresh history snapshot after TF revert: %s", exc)
 
 
 async def fetch_member(guild_id: int, user_id: int) -> Tuple[Optional[discord.Guild], Optional[discord.Member]]:
