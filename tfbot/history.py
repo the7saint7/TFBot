@@ -319,15 +319,13 @@ def _chunk_sections(sections: Sequence[str], max_length: int = 3600, max_chunks:
     return chunks
 
 
-def _history_channel_id() -> int:
-    raw = os.getenv("TFBOT_HISTORY_SNAPSHOT_CHANNEL")
-    if raw and raw.isdigit():
-        return int(raw)
-    return DEFAULT_HISTORY_CHANNEL_ID
-
-
-async def _fetch_history_channel(bot: discord.Client) -> discord.TextChannel:
-    channel_id = _history_channel_id()
+async def _fetch_history_channel(bot: discord.Client, channel_id: Optional[int]) -> discord.TextChannel:
+    if channel_id is None:
+        raw = os.getenv("TFBOT_HISTORY_SNAPSHOT_CHANNEL")
+        if raw and raw.isdigit():
+            channel_id = int(raw)
+        else:
+            channel_id = DEFAULT_HISTORY_CHANNEL_ID
     channel = bot.get_channel(channel_id)
     if channel is None:
         try:
@@ -540,9 +538,10 @@ async def publish_history_snapshot(
     active_states: Mapping[Tuple[int, int], TransformationState],
     tf_stats: Mapping[str, Mapping[str, Mapping[str, object]]],
     character_pool: Sequence[TFCharacter],
+    channel_id: Optional[int] = None,
 ) -> None:
     try:
-        channel = await _fetch_history_channel(bot)
+        channel = await _fetch_history_channel(bot, channel_id)
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Unable to prepare history channel: %s", exc)
         return

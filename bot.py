@@ -95,6 +95,7 @@ logger = logging.getLogger("tfbot")
 DEV_CHANNEL_ID = 1432191400983662766
 DEV_TF_CHANCE = 0.75
 TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
+TF_HISTORY_DEV_CHANNEL_ID = int_from_env("TFBOT_HISTORY_DEV_CHANNEL_ID", 1433105932392595609)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
 MESSAGE_STYLE = os.getenv("TFBOT_MESSAGE_STYLE", "classic").lower()
@@ -524,10 +525,10 @@ async def relay_transformed_message(
 
 
 async def send_history_message(title: str, description: str) -> None:
-    channel = bot.get_channel(TF_HISTORY_CHANNEL_ID)
+    channel = bot.get_channel(current_history_channel_id())
     if channel is None:
         try:
-            channel = await bot.fetch_channel(TF_HISTORY_CHANNEL_ID)
+            channel = await bot.fetch_channel(current_history_channel_id())
         except discord.HTTPException as exc:
             logger.warning("Cannot send history message, channel lookup failed: %s", exc)
             return
@@ -542,7 +543,13 @@ async def send_history_message(title: str, description: str) -> None:
     except discord.HTTPException as exc:
         logger.warning("Failed to send history message: %s", exc)
     try:
-        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+        await publish_history_snapshot(
+            bot,
+            active_transformations,
+            tf_stats,
+            CHARACTER_POOL,
+            current_history_channel_id(),
+        )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Failed to refresh history snapshot: %s", exc)
 
@@ -769,6 +776,10 @@ def enable_dev_mode() -> None:
     )
 
 
+def current_history_channel_id() -> int:
+    return TF_HISTORY_DEV_CHANNEL_ID if DEV_MODE else TF_HISTORY_CHANNEL_ID
+
+
 @bot.event
 async def on_ready():
     await ensure_state_restored()
@@ -788,7 +799,13 @@ async def on_ready():
     await log_guild_permissions()
     await log_channel_access()
     try:
-        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+        await publish_history_snapshot(
+            bot,
+            active_transformations,
+            tf_stats,
+            CHARACTER_POOL,
+            current_history_channel_id(),
+        )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Failed to refresh history snapshot on startup: %s", exc)
 
@@ -1241,7 +1258,13 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
         if ctx.guild:
             await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
     try:
-        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+        await publish_history_snapshot(
+            bot,
+            active_transformations,
+            tf_stats,
+            CHARACTER_POOL,
+            current_history_channel_id(),
+        )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Failed to refresh history snapshot after background change: %s", exc)
 
@@ -1351,7 +1374,13 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
         "Future messages will use this combination."
     )
     try:
-        await publish_history_snapshot(bot, active_transformations, tf_stats, CHARACTER_POOL)
+        await publish_history_snapshot(
+            bot,
+            active_transformations,
+            tf_stats,
+            CHARACTER_POOL,
+            current_history_channel_id(),
+        )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Failed to refresh history snapshot after outfit change: %s", exc)
     if ctx.guild:
