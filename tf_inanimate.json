@@ -34,5 +34,17 @@
       "For a brief second, the crystal flashes bright blue, as if trying to shout something.",
       "The orb spins slowly, emitting a low, magical hum that might just be a groan."
     ]
-  }  
+  },
+  {
+    "name": "Chair",
+    "avatar_path": "avatars/chair.png",
+    "message": "found a sigil hidden under their school chair. In a blink, their limbs stiffen and twist, reshaping into smooth wood and soft padding. Their body bends backward until they realize—they’ve become a chair. They can’t move, can’t shout, only watch.",
+    "responses": [
+      "The chair creaks softly, like it’s trying to clear its throat.",
+      "One leg twitches, then stills again, pretending nothing happened.",
+      "A faint squeak echoes from the seat — maybe it was the wood… or maybe not.",
+      "The chair tilts ever so slightly, as if sighing in quiet defeat.",
+      "A muffled groan seems to come from somewhere deep inside the upholstery."
+    ]
+  }
 ]

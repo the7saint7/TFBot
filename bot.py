@@ -152,7 +152,7 @@ def _default_inanimate_forms() -> Tuple[Dict[str, object], ...]:
             "responses": [
                 "*Bristles rustle as you sweep across the floor on your own.*",
                 "*You lean dramatically against the wall, awaiting orders.*",
-                "*A chill runs down your handle—if you still had a spine.*",
+                "*A chill runs down your handleâ€”if you still had a spine.*",
             ],
         },
     )
@@ -203,6 +203,48 @@ def _load_inanimate_forms() -> Tuple[Dict[str, object], ...]:
 
 
 INANIMATE_FORMS = _load_inanimate_forms()
+
+
+_history_refresh_task: Optional[asyncio.Task] = None
+_history_refresh_lock = asyncio.Lock()
+_history_refresh_seq = 0
+
+
+def schedule_history_refresh(delay: float = 0.2) -> None:
+    """Debounce history snapshot updates."""
+    global _history_refresh_task, _history_refresh_seq  # pylint: disable=global-statement
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+
+    _history_refresh_seq += 1
+    sequence_id = _history_refresh_seq
+
+    if _history_refresh_task and not _history_refresh_task.done():
+        _history_refresh_task.cancel()
+
+    async def runner(expected_seq: int) -> None:
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+            async with _history_refresh_lock:
+                if expected_seq != _history_refresh_seq:
+                    return
+                await publish_history_snapshot(
+                    bot,
+                    active_transformations,
+                    tf_stats,
+                    CHARACTER_POOL,
+                    current_history_channel_id(),
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to refresh history snapshot: %s", exc)
+
+    _history_refresh_task = loop.create_task(runner(sequence_id))
 
 def _get_magic_emoji(guild: Optional[discord.Guild]) -> str:
     if guild is None or guild.id is None:
@@ -331,17 +373,7 @@ async def revert_transformation(state: TransformationState, *, expired: bool) ->
     active_transformations.pop(key, None)
     persist_states()
 
-    username = member.name if member else state.original_nick or "Unknown"
-    try:
-        await publish_history_snapshot(
-            bot,
-            active_transformations,
-            tf_stats,
-            CHARACTER_POOL,
-            current_history_channel_id(),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("Failed to refresh history snapshot after TF revert: %s", exc)
+    schedule_history_refresh()
 
 
 async def fetch_member(guild_id: int, user_id: int) -> Tuple[Optional[discord.Guild], Optional[discord.Member]]:
@@ -654,16 +686,7 @@ async def send_history_message(title: str, description: str) -> None:
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as exc:
         logger.warning("Failed to send history message: %s", exc)
-    try:
-        await publish_history_snapshot(
-            bot,
-            active_transformations,
-            tf_stats,
-            CHARACTER_POOL,
-            current_history_channel_id(),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("Failed to refresh history snapshot: %s", exc)
+    schedule_history_refresh()
 
 
 def _format_character_message(
@@ -941,16 +964,7 @@ async def on_ready():
             )
     await log_guild_permissions()
     await log_channel_access()
-    try:
-        await publish_history_snapshot(
-            bot,
-            active_transformations,
-            tf_stats,
-            CHARACTER_POOL,
-            current_history_channel_id(),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("Failed to refresh history snapshot on startup: %s", exc)
+    schedule_history_refresh()
 
 
 @bot.command(name="synreset", hidden=True)
@@ -1501,16 +1515,7 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     except discord.Forbidden:
         if ctx.guild:
             await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
-    try:
-        await publish_history_snapshot(
-            bot,
-            active_transformations,
-            tf_stats,
-            CHARACTER_POOL,
-            current_history_channel_id(),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("Failed to refresh history snapshot after background change: %s", exc)
+    schedule_history_refresh()
 
 
 
@@ -1617,16 +1622,7 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
         f"Outfit for {state.character_name} set to `{outfit_label}` (pose `{pose_label}`). "
         "Future messages will use this combination."
     )
-    try:
-        await publish_history_snapshot(
-            bot,
-            active_transformations,
-            tf_stats,
-            CHARACTER_POOL,
-            current_history_channel_id(),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("Failed to refresh history snapshot after outfit change: %s", exc)
+    schedule_history_refresh()
     if ctx.guild:
         await ctx.reply(confirmation, mention_author=False)
     else:
@@ -1720,7 +1716,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
