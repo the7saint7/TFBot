@@ -1,5 +1,6 @@
-import argparse
+﻿import argparse
 import asyncio
+import importlib.util
 import io
 import json
 import logging
@@ -24,7 +25,9 @@ try:
 except ImportError:
     yaml = None
 
-from tf_characters import TF_CHARACTERS as CHARACTER_DATA
+BASE_DIR = Path(__file__).resolve().parent
+
+from tf_characters import TF_CHARACTERS as _DEFAULT_CHARACTER_DATA
 from ai_rewriter import AI_REWRITE_ENABLED, rewrite_message_for_character
 from tfbot.models import (
     OutfitAsset,
@@ -204,6 +207,8 @@ def _load_inanimate_forms() -> Tuple[Dict[str, object], ...]:
 
 INANIMATE_FORMS = _load_inanimate_forms()
 
+CHARACTER_DATA_FILE_SETTING = os.getenv("TFBOT_CHARACTERS_FILE", "").strip()
+_CHARACTER_AVATAR_ROOT_SETTING = os.getenv("TFBOT_AVATAR_ROOT", "").strip()
 
 _history_refresh_task: Optional[asyncio.Task] = None
 _history_refresh_lock = asyncio.Lock()
@@ -246,6 +251,55 @@ def schedule_history_refresh(delay: float = 0.2) -> None:
 
     _history_refresh_task = loop.create_task(runner(sequence_id))
 
+
+def _resolve_avatar_root() -> Optional[Path]:
+    if not _CHARACTER_AVATAR_ROOT_SETTING:
+        return None
+    root = Path(_CHARACTER_AVATAR_ROOT_SETTING)
+    if not root.is_absolute():
+        root = (BASE_DIR / root).resolve()
+    return root
+
+
+def _load_character_dataset() -> Sequence[Dict[str, str]]:
+    if CHARACTER_DATA_FILE_SETTING:
+        dataset_path = Path(CHARACTER_DATA_FILE_SETTING).expanduser()
+        if not dataset_path.is_absolute():
+            dataset_path = (BASE_DIR / dataset_path).resolve()
+        if dataset_path.exists():
+            suffix = dataset_path.suffix.lower()
+            if suffix == ".py":
+                try:
+                    spec = importlib.util.spec_from_file_location(
+                        "_tf_character_override",
+                        dataset_path,
+                    )
+                    module = importlib.util.module_from_spec(spec) if spec and spec.loader else None
+                    if module and spec and spec.loader:
+                        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+                        data = getattr(module, "TF_CHARACTERS", None)
+                        if isinstance(data, list):
+                            return data
+                        logger.warning("TF_CHARACTERS missing or invalid in %s; using default.", dataset_path)
+                    else:
+                        logger.warning("Unable to load character module from %s; using default.", dataset_path)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Failed to import character dataset %s: %s. Using default.", dataset_path, exc)
+            else:
+                try:
+                    data = json.loads(dataset_path.read_text(encoding="utf-8"))
+                    if isinstance(data, list):
+                        return data
+                    logger.warning("Character dataset %s is not a list; using default.", dataset_path)
+                except json.JSONDecodeError as exc:
+                    logger.warning("Failed to parse character dataset %s: %s. Using default.", dataset_path, exc)
+        else:
+            logger.warning("Character dataset %s not found; falling back to default.", dataset_path)
+    return _DEFAULT_CHARACTER_DATA
+
+
+CHARACTER_AVATAR_ROOT = _resolve_avatar_root()
+
 def _get_magic_emoji(guild: Optional[discord.Guild]) -> str:
     if guild is None or guild.id is None:
         return f":{MAGIC_EMOJI_NAME}:"
@@ -260,15 +314,29 @@ def _get_magic_emoji(guild: Optional[discord.Guild]) -> str:
     return MAGIC_EMOJI_CACHE[guild.id]
 
 
-def _build_character_pool(source: Sequence[Dict[str, str]]) -> Sequence[TFCharacter]:
+def _build_character_pool(
+    source: Sequence[Dict[str, str]],
+    avatar_root: Optional[Path] = None,
+) -> Sequence[TFCharacter]:
     pool: list[TFCharacter] = []
     for entry in source:
         try:
+            avatar_path = str(entry.get("avatar_path", "")).strip()
+            if (
+                avatar_root
+                and avatar_path
+                and not avatar_path.startswith(("http://", "https://"))
+            ):
+                candidate = Path(avatar_path)
+                if not candidate.is_absolute():
+                    avatar_path = str((avatar_root / candidate).resolve())
+                else:
+                    avatar_path = str(candidate)
             pool.append(
                 TFCharacter(
                     name=entry["name"],
-                    avatar_path=entry.get("avatar_path", ""),
-                    message=entry.get("message", ""),
+                    avatar_path=avatar_path,
+                    message=str(entry.get("message", "")),
                 )
             )
         except KeyError as exc:
@@ -278,7 +346,7 @@ def _build_character_pool(source: Sequence[Dict[str, str]]) -> Sequence[TFCharac
     return pool
 
 
-CHARACTER_POOL = _build_character_pool(CHARACTER_DATA)
+CHARACTER_POOL = _build_character_pool(_load_character_dataset(), CHARACTER_AVATAR_ROOT)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:

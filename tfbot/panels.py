@@ -49,7 +49,19 @@ VN_GAME_ROOT = (
     if os.getenv("TFBOT_VN_GAME_ROOT")
     else None
 )
-VN_ASSET_ROOT = VN_GAME_ROOT / "game" / "images" / "characters" if VN_GAME_ROOT else None
+_VN_ASSET_ROOT_SETTING = os.getenv("TFBOT_VN_ASSET_ROOT", "").strip()
+if _VN_ASSET_ROOT_SETTING:
+    candidate_asset_root = Path(_VN_ASSET_ROOT_SETTING).expanduser()
+    if candidate_asset_root.exists():
+        VN_ASSET_ROOT = candidate_asset_root.resolve()
+    else:
+        VN_ASSET_ROOT = None
+        logger.warning("VN asset root %s does not exist.", candidate_asset_root)
+elif VN_GAME_ROOT:
+    candidate_asset_root = VN_GAME_ROOT / "game" / "images" / "characters"
+    VN_ASSET_ROOT = candidate_asset_root if candidate_asset_root.exists() else None
+else:
+    VN_ASSET_ROOT = None
 VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
 VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
 VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
@@ -1802,6 +1814,5 @@ __all__ = [
     "fetch_avatar_bytes",
     "prepare_custom_emoji_images",
 ]
-
 
 
