@@ -107,6 +107,7 @@ TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 hours", timedelta(hours=10)),
 ]
 DEV_TRANSFORM_DURATION = ("2 minutes", timedelta(minutes=2))
+INANIMATE_DURATION = timedelta(minutes=10)
 REQUIRED_GUILD_PERMISSIONS = {
     "send_messages": "Send Messages (needed to respond in channels)",
     "embed_links": "Embed Links (history channel logging)",
@@ -117,6 +118,91 @@ MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 
 configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE)
 tf_stats.update(load_stats_from_disk())
+
+INANIMATE_DATA_FILE = Path(os.getenv("TFBOT_INANIMATE_FILE", "tf_inanimate.json")).expanduser()
+INANIMATE_TF_CHANCE = float(os.getenv("TFBOT_INANIMATE_CHANCE", "0"))
+
+
+def _default_inanimate_forms() -> Tuple[Dict[str, object], ...]:
+    return (
+        {
+            "name": "Bewitched Pumpkin",
+            "avatar_path": "avatars/inanimate/pumpkin.png",
+            "message": "A carved grin flickers to life as candlelight dances from within.",
+            "responses": [
+                "*Your carved grin flickers with eerie candlelight.*",
+                "*Seeds tumble out as you wobble helplessly on the table.*",
+                "*The wind whistles through your hollow interior.*",
+            ],
+        },
+        {
+            "name": "Haunted Locker",
+            "avatar_path": "avatars/inanimate/locker.png",
+            "message": "Metal hinges groan, and a chill seeps through with every creak.",
+            "responses": [
+                "*The locker door creaks open with a metallic groan.*",
+                "*A stack of dusty textbooks rattles inside.*",
+                "*Someone scribbled 'boo' across your dented surface.*",
+            ],
+        },
+        {
+            "name": "Sentient Broom",
+            "avatar_path": "avatars/inanimate/broom.png",
+            "message": "Bristles rustle to life, eager to sweep the nearest floor.",
+            "responses": [
+                "*Bristles rustle as you sweep across the floor on your own.*",
+                "*You lean dramatically against the wall, awaiting orders.*",
+                "*A chill runs down your handle—if you still had a spine.*",
+            ],
+        },
+    )
+
+
+def _load_inanimate_forms() -> Tuple[Dict[str, object], ...]:
+    if not INANIMATE_DATA_FILE.exists():
+        logger.info("Inanimate TF file %s not found; using defaults.", INANIMATE_DATA_FILE)
+        return _default_inanimate_forms()
+    try:
+        payload = json.loads(INANIMATE_DATA_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        logger.warning("Failed to parse %s (%s); using defaults.", INANIMATE_DATA_FILE, exc)
+        return _default_inanimate_forms()
+    if not isinstance(payload, list):
+        logger.warning("Inanimate TF file %s did not contain a list; using defaults.", INANIMATE_DATA_FILE)
+        return _default_inanimate_forms()
+
+    forms: list[Dict[str, object]] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        avatar_path = str(entry.get("avatar_path") or "").strip()
+        message = str(entry.get("message") or "").strip()
+        responses_field = entry.get("responses") or []
+        if not name or not message:
+            logger.debug("Skipping inanimate entry missing required fields: %s", entry)
+            continue
+        if isinstance(responses_field, list):
+            responses = [str(item).strip() for item in responses_field if str(item).strip()]
+        else:
+            responses = []
+        if not responses:
+            responses = [message]
+        forms.append(
+            {
+                "name": name,
+                "avatar_path": avatar_path,
+                "message": message,
+                "responses": responses,
+            }
+        )
+    if not forms:
+        logger.warning("No valid inanimate forms loaded from %s; using defaults.", INANIMATE_DATA_FILE)
+        return _default_inanimate_forms()
+    return tuple(forms)
+
+
+INANIMATE_FORMS = _load_inanimate_forms()
 
 def _get_magic_emoji(guild: Optional[discord.Guild]) -> str:
     if guild is None or guild.id is None:
@@ -414,11 +500,30 @@ async def relay_transformed_message(
         return False
 
     cleaned_content = message.content.strip()
+    original_content = cleaned_content
+    generated_inanimate_response = False
+    has_links = False
+    if state.is_inanimate:
+        options = state.inanimate_responses or (
+            "You emit a faint, spooky rattle.",
+        )
+        base_response = random.choice(options)
+        spoiler_line = ""
+        if original_content:
+            sanitized_original, has_links = strip_urls(original_content)
+            if sanitized_original:
+                sanitized_original = discord.utils.escape_mentions(sanitized_original)
+                sanitized_original = discord.utils.escape_markdown(sanitized_original)
+            if sanitized_original:
+                spoiler_line = f"\n||*{sanitized_original}*||"
+        cleaned_content = f"{base_response}{spoiler_line}"
+        generated_inanimate_response = True
     reply_context = await _resolve_reply_context(message)
     if (
         AI_REWRITE_ENABLED
         and cleaned_content
         and not cleaned_content.startswith(str(bot.command_prefix))
+        and not state.is_inanimate
     ):
         context_snippet = CHARACTER_CONTEXT.get(state.character_name) or state.character_message
         rewritten = await rewrite_message_for_character(
@@ -435,8 +540,7 @@ async def relay_transformed_message(
                 rewritten[:120],
             )
             cleaned_content = rewritten.strip()
-    has_links = False
-    if cleaned_content:
+    if cleaned_content and not state.is_inanimate:
         cleaned_content, has_links = strip_urls(cleaned_content)
         cleaned_content = cleaned_content.strip()
 
@@ -447,7 +551,7 @@ async def relay_transformed_message(
     files: list[discord.File] = []
     payload: dict = {}
 
-    if MESSAGE_STYLE == "vn":
+    if MESSAGE_STYLE == "vn" and not state.is_inanimate:
         if formatted_segments is None:
             formatted_segments = parse_discord_formatting(cleaned_content)
         custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments)
@@ -613,15 +717,43 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
 
     used_characters = {state.character_name for state in active_transformations.values()}
     available_characters = [character for character in CHARACTER_POOL if character.name not in used_characters]
-    if not available_characters:
+    character: Optional[TFCharacter] = None
+
+    inanimate_form = None
+    if INANIMATE_FORMS and random.random() <= INANIMATE_TF_CHANCE:
+        inanimate_form = random.choice(INANIMATE_FORMS)
+
+    if inanimate_form is None and not available_characters:
         logger.info("No available TF characters; skipping message %s", message.id)
         return None
 
-    character = random.choice(available_characters)
-    if DEV_MODE:
-        duration_label, duration_delta = DEV_TRANSFORM_DURATION
+    if inanimate_form is not None:
+        selected_name = str(inanimate_form.get("name") or "").strip() or "Mystery Relic"
+        character_avatar_path = str(inanimate_form.get("avatar_path") or "").strip()
+        character_message = str(inanimate_form.get("message") or "").strip()
+        responses_raw = inanimate_form.get("responses") or []
+        if isinstance(responses_raw, (list, tuple)):
+            inanimate_responses = tuple(
+                str(item).strip() for item in responses_raw if str(item).strip()
+            )
+        else:
+            inanimate_responses = tuple()
+        if not character_message:
+            character_message = "You feel unsettlingly still."
+        if not inanimate_responses:
+            inanimate_responses = (character_message,)
+        duration_label = "10 minutes"
+        duration_delta = INANIMATE_DURATION
     else:
-        duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
+        character = random.choice(available_characters)
+        selected_name = character.name
+        character_avatar_path = character.avatar_path
+        character_message = character.message
+        inanimate_responses = tuple()
+        if DEV_MODE:
+            duration_label, duration_delta = DEV_TRANSFORM_DURATION
+        else:
+            duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
     now = utc_now()
     expires_at = now + duration_delta
     original_nick = member.nick
@@ -636,7 +768,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         return None
 
     try:
-        await member.edit(nick=character.name, reason="TF event")
+        await member.edit(nick=selected_name, reason="TF event")
     except discord.Forbidden:
         logger.warning("Missing permissions to edit nickname for %s", member.id)
         return None
@@ -647,15 +779,17 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     state = TransformationState(
         user_id=member.id,
         guild_id=message.guild.id,
-        character_name=character.name,
-        character_avatar_path=character.avatar_path,
-        character_message=character.message,
+        character_name=selected_name,
+        character_avatar_path=character_avatar_path,
+        character_message=character_message,
         original_nick=original_nick,
         started_at=now,
         expires_at=expires_at,
         duration_label=duration_label,
         avatar_applied=False,
         original_display_name=profile_name,
+        is_inanimate=inanimate_form is not None,
+        inanimate_responses=inanimate_responses,
     )
     active_transformations[key] = state
     persist_states()
@@ -666,25 +800,26 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     logger.info(
         "TF applied to user %s (%s) for %s (expires at %s)",
         member.id,
-        character.name,
+        selected_name,
         duration_label,
         expires_at.isoformat(),
     )
 
-    increment_tf_stats(message.guild.id, member.id, character.name)
+    if character is not None:
+        increment_tf_stats(message.guild.id, member.id, character.name)
 
     await send_history_message(
         "TF Applied",
-        f"Original Name: **{member.name}**\nCharacter: **{character.name}**\nDuration: {duration_label}.",
+        f"Original Name: **{member.name}**\nCharacter: **{selected_name}**\nDuration: {duration_label}.",
     )
 
     original_name = profile_name
     response_text = _format_character_message(
-        character.message,
+        character_message,
         original_name,
         member.mention,
         duration_label,
-        character.name,
+        selected_name,
     )
     emoji_prefix = _get_magic_emoji(message.guild)
     response_text = f"{emoji_prefix} {response_text}"
@@ -870,39 +1005,92 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     state: Optional[TransformationState] = None
 
     forced_character: Optional[TFCharacter] = None
-    query = args.strip().lower()
+    forced_inanimate: Optional[Dict[str, object]] = None
+
+    query = args.strip()
     if query:
         parts = query.split()
-        first_token = parts[0]
-        if len(parts) > 1:
-            forced_name = parts[1]
-            forced_match = next((c for c in CHARACTER_POOL if c.name.split(" ", 1)[0].lower() == forced_name), None)
-            if forced_match is None:
-                await ctx.reply(
-                    f"Unknown target character `{forced_name}`. Provide a valid character first name.",
-                    mention_author=False,
-                )
-                return None
-            forced_character = forced_match
+        first_token = parts[0].lower()
+        forced_token = parts[1].lower() if len(parts) > 1 else None
+
         matching_states = [
             s
             for s in active_transformations.values()
-            if s.guild_id == guild.id and s.character_name.split(" ", 1)[0].lower() == first_token
-        ]
-        if not matching_states:
-            await ctx.reply(
-                f"No active transformation found for character `{first_token}`.",
-                mention_author=False,
+            if s.guild_id == guild.id
+            and (
+                s.character_name.split(" ", 1)[0].lower() == first_token
+                or s.character_name.lower() == first_token
             )
-            return None
-        state = matching_states[0]
-        _, target_member = await fetch_member(state.guild_id, state.user_id)
+        ]
+        target_member = None
+        if matching_states:
+            state = matching_states[0]
+            _, target_member = await fetch_member(state.guild_id, state.user_id)
+        else:
+            # Fallback: caller's own transformation
+            caller_state = find_active_transformation(author.id, guild.id)
+            if caller_state and (
+                caller_state.character_name.split(" ", 1)[0].lower() == first_token
+                or caller_state.character_name.lower() == first_token
+            ):
+                state = caller_state
+                target_member = author
+            else:
+                member_candidate = discord.utils.find(
+                    lambda m: (
+                        m.display_name.lower() == first_token
+                        or m.display_name.split(" ", 1)[0].lower() == first_token
+                        or m.name.lower() == first_token
+                        or m.name.split(" ", 1)[0].lower() == first_token
+                    ),
+                    guild.members if guild else [],
+                )
+                if member_candidate:
+                    state = find_active_transformation(member_candidate.id, guild.id)
+                    target_member = member_candidate
+                else:
+                    state = None
+            if state is None:
+                await ctx.reply(
+                    f"No active transformation found for `{first_token}`.",
+                    mention_author=False,
+                )
+                return None
+            if target_member is None:
+                _, target_member = await fetch_member(state.guild_id, state.user_id)
         if target_member is None:
             await ctx.reply(
                 f"Unable to locate the member transformed into {state.character_name}.",
                 mention_author=False,
             )
             return None
+
+        if forced_token:
+            forced_character = next(
+                (
+                    character
+                    for character in CHARACTER_POOL
+                    if character.name.split(" ", 1)[0].lower() == forced_token
+                    or character.name.lower() == forced_token
+                ),
+                None,
+            )
+            if forced_character is None:
+                forced_inanimate = next(
+                    (
+                        entry
+                        for entry in INANIMATE_FORMS
+                        if str(entry.get("name", "")).split(" ", 1)[0].lower() == forced_token
+                        or str(entry.get("name", "")).lower() == forced_token
+                    ),
+                    None,
+                )
+            if forced_character is None and forced_inanimate is None:
+                await ctx.reply(
+                    f"Unknown target `{forced_token}`. Provide a valid first name.",
+                    mention_author=False,
+                )
+                return None
     else:
         target_member = author
         key = state_key(guild.id, target_member.id)
@@ -923,42 +1111,72 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         )
         return None
 
-    used_characters = {
+    used_names = {
         current_state.character_name
         for current_key, current_state in active_transformations.items()
         if current_key != key
     }
-    available_characters = [
-        character
-        for character in CHARACTER_POOL
-        if character.name not in used_characters and character.name != state.character_name
-    ]
-    forced_mode = forced_character is not None
 
-    if forced_mode:
-        if forced_character.name == state.character_name:
-            await ctx.reply(
-                f"They are already transformed into {forced_character.name}.",
-                mention_author=False,
-            )
-            return None
-        if forced_character.name in used_characters:
-            await ctx.reply(
-                f"{forced_character.name} is already in use by another transformation.",
-                mention_author=False,
-            )
-            return None
-        new_character = forced_character
+    forced_mode = forced_character is not None or forced_inanimate is not None
+
+    new_name: str
+    new_avatar_path: str
+    new_message: str
+    new_is_inanimate: bool
+    new_responses: Tuple[str, ...]
+
+    if forced_inanimate is not None:
+        new_name = str(forced_inanimate.get("name") or "Mystery Relic")
+        new_avatar_path = str(forced_inanimate.get("avatar_path") or "")
+        new_message = str(forced_inanimate.get("message") or "You feel unsettlingly still.")
+        responses_raw = forced_inanimate.get("responses") or []
+        if isinstance(responses_raw, (list, tuple)):
+            new_responses = tuple(str(item).strip() for item in responses_raw if str(item).strip())
+        else:
+            new_responses = tuple()
+        if not new_responses:
+            new_responses = (new_message,)
+        new_is_inanimate = True
+    elif forced_character is not None:
+        new_name = forced_character.name
+        new_avatar_path = forced_character.avatar_path
+        new_message = forced_character.message
+        new_responses = tuple()
+        new_is_inanimate = False
     else:
+        available_characters = [
+            character
+            for character in CHARACTER_POOL
+            if character.name not in used_names and character.name != state.character_name
+        ]
         if not available_characters:
             await ctx.reply(
                 "No alternative characters are available to reroll right now.",
                 mention_author=False,
             )
             return None
-        new_character = random.choice(available_characters)
+        chosen = random.choice(available_characters)
+        new_name = chosen.name
+        new_avatar_path = chosen.avatar_path
+        new_message = chosen.message
+        new_responses = tuple()
+        new_is_inanimate = False
+
+    if new_name == state.character_name:
+        await ctx.reply(
+            f"They are already transformed into {new_name}.",
+            mention_author=False,
+        )
+        return None
+    if new_name in used_names:
+        await ctx.reply(
+            f"{new_name} is already in use by another transformation.",
+            mention_author=False,
+        )
+        return None
+
     try:
-        await target_member.edit(nick=new_character.name, reason="TF reroll")
+        await target_member.edit(nick=new_name, reason="TF reroll")
     except (discord.Forbidden, discord.HTTPException) as exc:
         logger.warning("Failed to update nickname for reroll on %s: %s", target_member.id, exc)
         await ctx.reply(
@@ -968,19 +1186,22 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         return None
 
     previous_character = state.character_name
-    state.character_name = new_character.name
-    state.character_avatar_path = new_character.avatar_path
-    state.character_message = new_character.message
+    state.character_name = new_name
+    state.character_avatar_path = new_avatar_path
+    state.character_message = new_message
     state.avatar_applied = False
+    state.is_inanimate = new_is_inanimate
+    state.inanimate_responses = new_responses
     persist_states()
 
-    increment_tf_stats(guild.id, target_member.id, new_character.name)
+    if not new_is_inanimate:
+        increment_tf_stats(guild.id, target_member.id, new_name)
 
     history_details = (
         f"Triggered by: **{author.display_name}**\n"
         f"Member: **{target_member.display_name}**\n"
         f"Previous Character: **{previous_character}**\n"
-        f"New Character: **{new_character.name}**"
+        f"New Character: **{new_name}**"
     )
     if forced_mode:
         history_details += "\nReason: Forced reroll override."
@@ -999,15 +1220,15 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             original_name,
             target_member.mention,
             state.duration_label,
-            new_character.name,
+            new_name,
         )
     else:
         response_text = _format_character_message(
-            new_character.message,
+            new_message,
             original_name,
             target_member.mention,
             state.duration_label,
-            new_character.name,
+            new_name,
         )
     emoji_prefix = _get_magic_emoji(guild)
     try:
@@ -1023,7 +1244,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     except discord.HTTPException:
         pass
 
-    summary_message = f"{target_member.display_name} has been rerolled into **{new_character.name}**."
+    summary_message = f"{target_member.display_name} has been rerolled into **{new_name}**."
     if forced_mode:
         summary_message += " (Syn insisted on this one.)"
     await ctx.send(
@@ -1084,7 +1305,22 @@ async def tf_stats_command(ctx: commands.Context):
     if characters:
         sorted_chars = sorted(characters.items(), key=lambda item: item[1], reverse=True)
         lines = [f"- {name}: **{count}**" for name, count in sorted_chars]
-        embed.add_field(name="By Character", value="\n".join(lines), inline=False)
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for line in lines:
+            line_len = len(line) + 1
+            if current and current_len + line_len > 1000:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            current.append(line)
+            current_len += line_len
+        if current:
+            chunks.append("\n".join(current))
+        for idx, chunk in enumerate(chunks):
+            name = "By Character" if idx == 0 else "\u200b"
+            embed.add_field(name=name, value=chunk or "\u200b", inline=False)
 
     key = state_key(guild_id, ctx.author.id)
     current_state = active_transformations.get(key)

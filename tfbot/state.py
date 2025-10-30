@@ -57,6 +57,8 @@ def serialize_state(state: TransformationState) -> Dict[str, object]:
         "expires_at": state.expires_at.isoformat(),
         "duration_label": state.duration_label,
         "avatar_applied": state.avatar_applied,
+        "is_inanimate": state.is_inanimate,
+        "inanimate_responses": list(state.inanimate_responses),
     }
 
 
@@ -77,6 +79,8 @@ def deserialize_state(payload: Dict[str, object]) -> TransformationState:
         expires_at=datetime.fromisoformat(str(payload["expires_at"])),
         duration_label=str(payload["duration_label"]),
         avatar_applied=bool(payload.get("avatar_applied", False)),
+        is_inanimate=bool(payload.get("is_inanimate", False)),
+        inanimate_responses=tuple(payload.get("inanimate_responses", ())),
     )
 
 

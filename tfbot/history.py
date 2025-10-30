@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - Pillow is an optional runtime dependen
 from .models import TFCharacter, TransformationState
 from .state import load_states_from_disk
 from .panels import (
+    BASE_DIR,
     VN_BACKGROUND_DEFAULT_RELATIVE,
     VN_BACKGROUND_ROOT,
     VN_FONT_BOLD_PATH,
@@ -62,6 +63,7 @@ class HistoryCardData:
     lines: Sequence[str]
     accent_color: Optional[Tuple[int, int, int]] = None
     user_id: Optional[int] = None
+    avatar_path: Optional[str] = None
 
 
 def _ensure_history_fonts() -> Tuple[Optional["ImageFont.FreeTypeFont"], Optional["ImageFont.FreeTypeFont"]]:
@@ -187,6 +189,15 @@ def _render_history_card(
         return None
 
     avatar_image = compose_game_avatar(entry.character_name)
+    if avatar_image is None and entry.avatar_path:
+        candidate = Path(entry.avatar_path)
+        if not candidate.is_absolute():
+            candidate = (BASE_DIR / candidate).resolve()
+        if candidate.exists():
+            try:
+                avatar_image = Image.open(candidate).convert("RGBA")
+            except OSError as exc:
+                logger.debug("History card: failed to load fallback avatar %s: %s", candidate, exc)
     if avatar_image is not None:
         avatar = avatar_image.copy().convert("RGBA")
         avatar.thumbnail((HISTORY_AVATAR_MAX_WIDTH, HISTORY_AVATAR_MAX_HEIGHT), Image.LANCZOS)
@@ -490,6 +501,7 @@ def _build_active_entries(
                 lines=card_lines,
                 accent_color=color_lookup.get(state.character_name.lower()),
                 user_id=state.user_id,
+                avatar_path=state.character_avatar_path,
             )
         )
     return sections, cards
@@ -528,6 +540,7 @@ def _build_available_entries(
                 title=character.name,
                 lines=card_lines,
                 accent_color=color_lookup.get(character.name.lower()),
+                avatar_path=getattr(character, "avatar_path", None),
             )
         )
     return sections, cards

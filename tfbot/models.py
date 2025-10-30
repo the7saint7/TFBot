@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -40,6 +40,8 @@ class TransformationState:
     duration_label: str
     avatar_applied: bool = False
     original_display_name: str = ""
+    is_inanimate: bool = False
+    inanimate_responses: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -55,4 +57,3 @@ __all__ = [
     "ReplyContext",
     "TransformKey",
 ]
-
