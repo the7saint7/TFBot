@@ -3,9 +3,13 @@
   "289928094272323585": "school/field/day.png",
   "688420718899232849": "school/newsroom/night_shut.png",
   "292508858268778496": "school/pool/day.png",
-  "205555313162584064": "house_morgan/bedroom_katrina/day_tv.png",
-  "441306781604511747": "school/hallway_2/day.png",
+  "205555313162584064": "bar/dusk.png",
+  "441306781604511747": "house_morgan/livingroom/day.png",
   "1116274322416349235": "mall/arcade.png",
   "1054717117540352101": "studio/gym.png",
-  "123456": "apartment/day.png"
+  "123456": "apartment/day.png",
+  "709517262104690758": "mall/court/dusk.png",
+  "296728190045650945": "house_davis/bedroom_john/night_shut.png",
+  "938372090845876275": "house_wright/bedroom_elizabeth/day.png",
+  "290198663462912010": "house_luten/livingroom/day.png"
 }

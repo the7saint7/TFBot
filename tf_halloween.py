@@ -120,7 +120,7 @@ TF_CHARACTERS = [
         "message": "steps on a sigil Syn hid in the kitchen tile and feels a warm, teasing buzz circle their chest and throat. Their smile turns knowing, their tone turns mom-sweet and nosy, and suddenly they’re already judging someone’s love life.",
     },
     {
-        "name": "Sayaka frog",
+        "name": "Frogyaka",
         "avatar_path": "avatars/sayaka_frog.png",
         "message": " steps on green paste and a flash of magic surrounds them. A sudden chill runs through their veins as their skin turns slick and green. Their arms and legs shrink, folding tight beneath them, and the world around them grows impossibly huge. Their clothes vanish in a puff of magic, replaced by a single startled croak. Syn’s laughter echoes somewhere above—‘Ribbit for me, cutie.’",
     },
@@ -183,6 +183,11 @@ TF_CHARACTERS = [
         "name": "Elicia (DeeAndDee)",
         "avatar_path": "avatars/zebia.png",
         "message": "finds a 20 sided dice and when they roll it a magical flash blinds them. When they can see again, they find their entire body has changed.. for the better.",
+    },
+    {
+        "name": "Maria Grandales",
+        "avatar_path": "avatars/maria.png",
+        "message": "lifts a camera charm Syn clipped to the strap, and a bright flash hits them before the shutter even clicks. Their stance angles into ‘looking for a story,’ and their thoughts start hunting for dirt like it’s oxygen.",
     },
 
 

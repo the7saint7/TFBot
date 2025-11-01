@@ -99,7 +99,7 @@ logger = logging.getLogger("tfbot")
 
 BOT_MODE = os.getenv("TFBOT_MODE", "classic").lower()
 GACHA_MODE = BOT_MODE == "gacha"
-DEV_CHANNEL_ID = 1432191400983662766
+DEV_CHANNEL_ID = 1433972163345387550
 DEV_TF_CHANCE = 0.75
 TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
 TF_HISTORY_DEV_CHANNEL_ID = int_from_env("TFBOT_HISTORY_DEV_CHANNEL_ID", 1433105932392595609)
@@ -898,10 +898,10 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         character_avatar_path = character.avatar_path
         character_message = character.message
         inanimate_responses = tuple()
-        if DEV_MODE:
-            duration_label, duration_delta = DEV_TRANSFORM_DURATION
-        else:
-            duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
+        # if DEV_MODE:
+        #     duration_label, duration_delta = DEV_TRANSFORM_DURATION
+        # else:
+        duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
     now = utc_now()
     expires_at = now + duration_delta
     original_nick = member.nick
@@ -1051,7 +1051,7 @@ def enable_dev_mode() -> None:
 
 
 def current_history_channel_id() -> int:
-    return TF_HISTORY_DEV_CHANNEL_ID if DEV_MODE else TF_HISTORY_CHANNEL_ID
+    return TF_HISTORY_CHANNEL_ID
 
 
 @bot.event
