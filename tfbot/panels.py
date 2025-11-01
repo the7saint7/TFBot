@@ -113,6 +113,34 @@ background_selections: Dict[str, str] = {}
 _vn_config_cache: Dict[str, Dict] = {}
 _VN_BACKGROUND_IMAGES: list[Path] = []
 
+@lru_cache(maxsize=1)
+def _get_overlay_assets() -> Dict[str, "Image.Image"]:
+    """Load optional overlay icons (rudy/frog/star/border)."""
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return {}
+
+    base_dir = VN_BASE_IMAGE.parent
+    asset_files = {
+        "rudy": "rudy.png",
+        "frog": "frog.png",
+        "star": "star.png",
+        "border_gold": "border_gold.png",
+        "border_epic": "border_epic.png",
+    }
+    assets: Dict[str, "Image.Image"] = {}
+    for key, filename in asset_files.items():
+        path = base_dir / filename
+        if not path.exists():
+            continue
+        try:
+            with Image.open(path) as img:
+                assets[key] = img.convert("RGBA")
+        except OSError as exc:
+            logger.warning("VN panel: failed to load overlay asset %s: %s", path, exc)
+    return assets
+
 
 def load_outfit_selections() -> Dict[str, Dict[str, str]]:
     if not VN_SELECTION_FILE.exists():
@@ -609,8 +637,12 @@ def set_selected_pose_outfit(
     return True
 
 
-@lru_cache(maxsize=128)
-def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
+@lru_cache(maxsize=512)
+def compose_game_avatar(
+    character_name: str,
+    pose_override: Optional[str] = None,
+    outfit_override: Optional[str] = None,
+) -> Optional["Image.Image"]:
     if VN_ASSET_ROOT is None:
         return None
     try:
@@ -630,6 +662,14 @@ def compose_game_avatar(character_name: str) -> Optional["Image.Image"]:
         return None
 
     preferred_pose, preferred_outfit = get_selected_pose_outfit_for_dir(character_dir)
+    if pose_override:
+        cleaned_pose = pose_override.strip()
+        if cleaned_pose:
+            preferred_pose = cleaned_pose
+    if outfit_override:
+        cleaned_outfit = outfit_override.strip()
+        if cleaned_outfit:
+            preferred_outfit = cleaned_outfit
     if preferred_outfit:
         logger.debug(
             "VN sprite: preferred outfit override for %s is pose %s outfit %s",
@@ -1505,6 +1545,12 @@ def render_vn_panel(
     formatted_segments: Sequence[dict],
     custom_emoji_images: Dict[str, "Image.Image"],
     reply_context: Optional[ReplyContext],
+    gacha_star_count: Optional[int] = None,
+    gacha_rudy: Optional[int] = None,
+    gacha_frog: Optional[int] = None,
+    gacha_outfit_override: Optional[str] = None,
+    gacha_pose_override: Optional[str] = None,
+    gacha_border: Optional[str] = None,
 ) -> Optional[discord.File]:
     try:
         from PIL import Image, ImageDraw
@@ -1516,10 +1562,20 @@ def render_vn_panel(
         return None
 
     try:
-        base = Image.open(VN_BASE_IMAGE).convert("RGBA")
+        with Image.open(VN_BASE_IMAGE) as base_image:
+            base = base_image.convert("RGBA")
     except OSError as exc:
         logger.warning("VN panel: failed to open base image %s: %s", VN_BASE_IMAGE, exc)
         return None
+
+    assets = _get_overlay_assets()
+
+    border_img = None
+    if gacha_border:
+        border_key = f"border_{gacha_border.lower()}"
+        border_src = assets.get(border_key)
+        if border_src is not None:
+            border_img = border_src.resize(base.size, Image.LANCZOS)
 
     name_box = (180, 10, 193, 26)
     text_box = (188, 80, 765, 250)
@@ -1531,7 +1587,11 @@ def render_vn_panel(
 
     draw = ImageDraw.Draw(base)
 
-    avatar_image = compose_game_avatar(state.character_name)
+    avatar_image = compose_game_avatar(
+        state.character_name,
+        pose_override=gacha_pose_override,
+        outfit_override=gacha_outfit_override,
+    )
     if avatar_image is not None:
         cropped = _crop_transparent_vertical(avatar_image)
         base_scale = max(VN_AVATAR_SCALE, 0.01)
@@ -1580,6 +1640,144 @@ def render_vn_panel(
     name_font = _load_vn_font(VN_NAME_FONT_SIZE, style="bold")
     name_color = resolve_character_name_color(state.character_name)
     draw.text((name_x, name_y), name_text, fill=name_color, font=name_font)
+
+    overlay_rows: list[dict] = []
+    OVERLAY_PADDING = 6
+    ROW_SPACING = 4
+    TEXT_GAP = 6
+    COIN_GROUP_GAP = 14
+    STAR_GAP = 4
+
+    def _resize_icon(source: Optional["Image.Image"], target_height: int) -> Optional["Image.Image"]:
+        if source is None:
+            return None
+        icon = source.copy()
+        if icon.height != target_height:
+            width = max(1, int(icon.width * target_height / icon.height))
+            icon = icon.resize((width, target_height), Image.LANCZOS)
+        return icon
+
+    def _finalize_row(segments: list[dict]) -> None:
+        if not segments:
+            return
+        row_height = max(seg["height"] for seg in segments)
+        row_width = 0
+        for seg in segments:
+            row_width += seg["width"]
+            row_width += seg.get("gap_after", 0)
+        overlay_rows.append(
+            {
+                "segments": segments,
+                "width": row_width,
+                "height": row_height,
+            }
+        )
+
+    info_font = _load_vn_font(max(14, VN_TEXT_FONT_SIZE - 8), style="bold")
+    coin_data = [
+        (key, amount) for key, amount in (("rudy", gacha_rudy), ("frog", gacha_frog)) if amount is not None
+    ]
+    if coin_data:
+        coin_segments: list[dict] = []
+        for idx, (icon_key, amount) in enumerate(coin_data):
+            amount_text = str(amount)
+            text_width = draw.textlength(amount_text, font=info_font)
+            text_height = _font_line_height(info_font)
+            icon_img = _resize_icon(assets.get(icon_key), 22)
+            if icon_img is not None:
+                coin_segments.append(
+                    {
+                        "type": "icon",
+                        "image": icon_img,
+                        "width": icon_img.width,
+                        "height": icon_img.height,
+                        "gap_after": TEXT_GAP,
+                    }
+                )
+            coin_segments.append(
+                {
+                    "type": "text",
+                    "text": amount_text,
+                    "font": info_font,
+                    "width": text_width,
+                    "height": text_height,
+                    "fill": (220, 220, 220, 255),
+                    "gap_after": COIN_GROUP_GAP if idx < len(coin_data) - 1 else 0,
+                }
+            )
+        if coin_segments:
+            coin_segments[-1]["gap_after"] = 0
+            _finalize_row(coin_segments)
+
+    if gacha_star_count:
+        star_count = max(0, min(int(gacha_star_count), 3))
+        if star_count > 0:
+            star_icon_src = _resize_icon(assets.get("star"), 20)
+            star_segments: list[dict] = []
+            if star_icon_src is not None:
+                for idx in range(star_count):
+                    star_segments.append(
+                        {
+                            "type": "icon",
+                            "image": star_icon_src.copy(),
+                            "width": star_icon_src.width,
+                            "height": star_icon_src.height,
+                            "gap_after": STAR_GAP if idx < star_count - 1 else 0,
+                        }
+                    )
+            else:
+                star_font = _load_vn_font(max(18, VN_NAME_FONT_SIZE - 6), style="bold")
+                star_text = "★" * star_count
+                star_segments.append(
+                    {
+                        "type": "text",
+                        "text": star_text,
+                        "font": star_font,
+                        "width": draw.textlength(star_text, font=star_font),
+                        "height": _font_line_height(star_font),
+                        "fill": (255, 215, 0, 255),
+                        "gap_after": 0,
+                    }
+                )
+            if star_segments:
+                _finalize_row(star_segments)
+
+    if overlay_rows:
+        overlay_width = max(row["width"] for row in overlay_rows) + OVERLAY_PADDING * 2
+        overlay_height = sum(row["height"] for row in overlay_rows)
+        if len(overlay_rows) > 1:
+            overlay_height += ROW_SPACING * (len(overlay_rows) - 1)
+        overlay_height += OVERLAY_PADDING * 2
+        overlay_right = base.width - 10
+        overlay_left = max(name_box[0], overlay_right - overlay_width)
+        overlay_top = name_box[1]
+        overlay_bottom = overlay_top + overlay_height
+
+        draw.rectangle((overlay_left, overlay_top, overlay_right, overlay_bottom), fill=(20, 20, 20, 210))
+
+        cursor_y = overlay_top + OVERLAY_PADDING
+        for row_index, row in enumerate(overlay_rows):
+            row_x = overlay_right - OVERLAY_PADDING - row["width"]
+            for segment in row["segments"]:
+                gap = segment.get("gap_after", 0)
+                if segment["type"] == "icon":
+                    icon_img = segment["image"]
+                    offset_y = cursor_y + max(0, (row["height"] - icon_img.height) // 2)
+                    base.paste(icon_img, (int(row_x), int(offset_y)), icon_img)
+                    row_x += icon_img.width + gap
+                else:
+                    text_height = segment["height"]
+                    text_y = cursor_y + max(0, (row["height"] - text_height) // 2)
+                    draw.text(
+                        (row_x, text_y),
+                        segment["text"],
+                        font=segment["font"],
+                        fill=segment.get("fill", (220, 220, 220, 255)),
+                    )
+                    row_x += segment["width"] + gap
+            cursor_y += row["height"]
+            if row_index < len(overlay_rows) - 1:
+                cursor_y += ROW_SPACING
 
     working_content = message_content.strip()
     if not working_content:
@@ -1673,6 +1871,9 @@ def render_vn_panel(
             max_height = max(max_height, height)
             text_x += width
         text_y += max_height + 6
+    if border_img is not None:
+        base = Image.alpha_composite(base, border_img)
+
     output = io.BytesIO()
     base.save(output, format="PNG")
     output.seek(0)

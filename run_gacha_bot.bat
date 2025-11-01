@@ -26,6 +26,7 @@ if exist requirements.txt (
     if errorlevel 1 goto pip_fail
 )
 
+set "TFBOT_MODE=gacha"
 python bot.py
 exit /b 0
 

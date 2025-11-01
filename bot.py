@@ -97,13 +97,15 @@ logging.basicConfig(
 logger = logging.getLogger("tfbot")
 
 
+BOT_MODE = os.getenv("TFBOT_MODE", "classic").lower()
+GACHA_MODE = BOT_MODE == "gacha"
 DEV_CHANNEL_ID = 1432191400983662766
 DEV_TF_CHANCE = 0.75
 TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
 TF_HISTORY_DEV_CHANNEL_ID = int_from_env("TFBOT_HISTORY_DEV_CHANNEL_ID", 1433105932392595609)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
-MESSAGE_STYLE = os.getenv("TFBOT_MESSAGE_STYLE", "classic").lower()
+MESSAGE_STYLE = os.getenv("TFBOT_MESSAGE_STYLE", "vn" if GACHA_MODE else "classic").lower()
 TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 minutes", timedelta(minutes=10)),
     ("1 hour", timedelta(hours=1)),
@@ -114,7 +116,6 @@ INANIMATE_DURATION = timedelta(minutes=10)
 REQUIRED_GUILD_PERMISSIONS = {
     "send_messages": "Send Messages (needed to respond in channels)",
     "embed_links": "Embed Links (history channel logging)",
-    "manage_nicknames": "Manage Nicknames (apply/revert TF names and avatars)",
 }
 MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
@@ -217,6 +218,8 @@ _history_refresh_seq = 0
 
 def schedule_history_refresh(delay: float = 0.2) -> None:
     """Debounce history snapshot updates."""
+    if GACHA_MODE:
+        return
     global _history_refresh_task, _history_refresh_seq  # pylint: disable=global-statement
 
     try:
@@ -347,6 +350,7 @@ def _build_character_pool(
 
 
 CHARACTER_POOL = _build_character_pool(_load_character_dataset(), CHARACTER_AVATAR_ROOT)
+GACHA_MANAGER = None
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
@@ -363,6 +367,64 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents)
+
+
+class GuardedHelpCommand(commands.DefaultHelpCommand):
+    """Custom help command that can ignore specific channels."""
+
+    def __init__(self, blocked_channel_ids: set[int], **options):
+        super().__init__(**options)
+        self.blocked_channel_ids = blocked_channel_ids
+
+    async def _should_block(self) -> bool:
+        ctx = self.context
+        if ctx is None or not self.blocked_channel_ids:
+            return False
+        channel_id = getattr(ctx.channel, "id", None)
+        if channel_id in self.blocked_channel_ids:
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
+            return True
+        return False
+
+    async def send_bot_help(self, mapping):
+        if await self._should_block():
+            return
+        await super().send_bot_help(mapping)
+
+    async def send_cog_help(self, cog):
+        if await self._should_block():
+            return
+        await super().send_cog_help(cog)
+
+    async def send_group_help(self, group):
+        if await self._should_block():
+            return
+        await super().send_group_help(group)
+
+    async def send_command_help(self, command):
+        if await self._should_block():
+            return
+        await super().send_command_help(command)
+
+    async def send_error_message(self, error):
+        if await self._should_block():
+            return
+        await super().send_error_message(error)
+
+
+if not GACHA_MODE:
+    blocked_help_channels: set[int] = set()
+    _blocked_channel_id = int_from_env("TFBOT_GACHA_CHANNEL_ID", 0)
+    if _blocked_channel_id:
+        blocked_help_channels.add(_blocked_channel_id)
+    if blocked_help_channels:
+        bot.help_command = GuardedHelpCommand(blocked_help_channels, verify_checks=False)
+    else:
+        bot.help_command = commands.DefaultHelpCommand()
+
 
 async def ensure_state_restored() -> None:
     if tf_state.STATE_RESTORED:
@@ -407,31 +469,6 @@ async def revert_transformation(state: TransformationState, *, expired: bool) ->
     if member:
         if not state.original_display_name:
             state.original_display_name = member_profile_name(member)
-        desired_nick = state.original_nick if state.original_nick else None
-        attempts: list[tuple[Optional[str], str]] = []
-        attempts.append((desired_nick, reason))
-        if desired_nick is None and state.original_display_name:
-            attempts.append((state.original_display_name, f"{reason} (profile fallback)"))
-        restored = False
-        for nick_value, attempt_reason in attempts:
-            try:
-                await member.edit(nick=nick_value, reason=attempt_reason)
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                logger.warning(
-                    "Failed to restore nickname for %s (value=%s): %s",
-                    member.id,
-                    nick_value,
-                    exc,
-                )
-                continue
-            restored = True
-            break
-        if not restored:
-            logger.warning(
-                "Unable to restore nickname for %s in guild %s after TF revert.",
-                member.id,
-                state.guild_id,
-            )
     else:
         logger.warning("Could not locate member %s in guild %s to revert TF", state.user_id, state.guild_id)
 
@@ -594,6 +631,12 @@ async def relay_transformed_message(
     state: TransformationState,
     *,
     reference: Optional[discord.MessageReference] = None,
+    gacha_stars: Optional[int] = None,
+    gacha_outfit: Optional[str] = None,
+    gacha_pose: Optional[str] = None,
+    gacha_rudy: Optional[int] = None,
+    gacha_frog: Optional[int] = None,
+    gacha_border: Optional[str] = None,
 ) -> bool:
     guild = message.guild
     if guild is None:
@@ -671,6 +714,12 @@ async def relay_transformed_message(
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
             reply_context=reply_context,
+            gacha_star_count=gacha_stars,
+            gacha_outfit_override=gacha_outfit,
+            gacha_pose_override=gacha_pose,
+            gacha_rudy=gacha_rudy,
+            gacha_frog=gacha_frog,
+            gacha_border=gacha_border,
         )
         if vn_file:
             files.append(vn_file)
@@ -736,6 +785,14 @@ async def relay_transformed_message(
     return True
 
 
+if GACHA_MODE:
+    from tfbot.gacha import setup_gacha_mode
+
+    GACHA_MANAGER = setup_gacha_mode(
+        bot,
+        character_pool=CHARACTER_POOL,
+        relay_fn=relay_transformed_message,
+    )
 async def send_history_message(title: str, description: str) -> None:
     channel = bot.get_channel(current_history_channel_id())
     if channel is None:
@@ -849,23 +906,6 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     expires_at = now + duration_delta
     original_nick = member.nick
     profile_name = member_profile_name(member)
-
-    if member.guild and member.guild.owner_id == member.id:
-        logger.warning(
-            "Cannot apply TF nickname to server owner %s in guild %s",
-            member.id,
-            member.guild.id,
-        )
-        return None
-
-    try:
-        await member.edit(nick=selected_name, reason="TF event")
-    except discord.Forbidden:
-        logger.warning("Missing permissions to edit nickname for %s", member.id)
-        return None
-    except discord.HTTPException as exc:
-        logger.warning("Failed to edit nickname for %s: %s", member.id, exc)
-        return None
 
     state = TransformationState(
         user_id=member.id,
@@ -1253,16 +1293,6 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     if new_name in used_names:
         await ctx.reply(
             f"{new_name} is already in use by another transformation.",
-            mention_author=False,
-        )
-        return None
-
-    try:
-        await target_member.edit(nick=new_name, reason="TF reroll")
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        logger.warning("Failed to update nickname for reroll on %s: %s", target_member.id, exc)
-        await ctx.reply(
-            "I couldn't update their nickname, so the reroll was cancelled.",
             mention_author=False,
         )
         return None
@@ -1716,6 +1746,11 @@ async def on_message(message: discord.Message):
         await bot.invoke(ctx)
 
     if command_invoked:
+        return None
+
+    if GACHA_MODE:
+        if GACHA_MANAGER is not None:
+            await GACHA_MANAGER.handle_message(message, command_invoked=command_invoked)
         return None
 
     is_admin_user = is_admin(message.author)
