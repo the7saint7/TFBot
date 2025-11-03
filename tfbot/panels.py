@@ -322,16 +322,24 @@ def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
     pngs = sorted(p for p in accessory_dir.rglob("*.png") if p.is_file())
     if not pngs:
         return None
-    for candidate in pngs:
-        if candidate.stem.lower() == "on":
-            return candidate
-    for candidate in pngs:
-        if "on" in candidate.stem.lower():
-            return candidate
-    for candidate in pngs:
-        parents = [parent.name.lower() for parent in candidate.parents]
-        if "on" in parents:
-            return candidate
+
+    def _find_preferred(keyword: str) -> Optional[Path]:
+        lowered = keyword.lower()
+        for candidate in pngs:
+            if candidate.stem.lower() == lowered:
+                return candidate
+        for candidate in pngs:
+            if lowered in candidate.stem.lower():
+                return candidate
+        for candidate in pngs:
+            parents = [parent.name.lower() for parent in candidate.parents]
+            if lowered in parents:
+                return candidate
+        return None
+
+    preferred = _find_preferred("off") or _find_preferred("on")
+    if preferred:
+        return preferred
     return pngs[0]
 
 
