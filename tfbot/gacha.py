@@ -185,15 +185,15 @@ class GachaManager:
             "TFBOT_GACHA_FROG_BOOST_ROLLS",
             int(self._config.get("frog_boost_rolls", 2)),
         )
-        boost_targets = self._config.get("frog_boost_targets", ["rare", "ultra"])
+        boost_targets = self._config.get("frog_boost_targets", ["rare", "epic"])
         if isinstance(boost_targets, (list, tuple)):
             self._boost_target_rarities = tuple(str(item).lower() for item in boost_targets if str(item).strip())
         else:
-            self._boost_target_rarities = ("rare", "ultra")
+            self._boost_target_rarities = ("rare", "epic")
         self._gacha_channel: Optional[discord.TextChannel] = None
 
     def _load_rarity_weights(self) -> Dict[str, float]:
-        default_weights = {"common": 70.0, "rare": 25.0, "ultra": 5.0}
+        default_weights = {"common": 70.0, "rare": 25.0, "epic": 5.0}
         config_weights = self._config.get("rarities")
         if isinstance(config_weights, Mapping):
             weights: Dict[str, float] = {}
@@ -1105,42 +1105,6 @@ class GachaManager:
             return base * multiplier
         return base
 
-    # def _weighted_choice(
-    #     self,
-    #     items: Sequence,
-    #     *,
-    #     rarity_getter: Callable[[object], str],
-    #     profile: GachaProfile,
-    # ):
-    #     # If there are no items to choose from, there's nothing to roll.
-    #     if not items:
-    #         return None
-
-    #     # For each item, calculate its weight based on rarity and profile boosts.
-    #     # This uses _rarity_weight(), which applies any active frog boost modifiers.
-    #     weights = [self._rarity_weight(rarity_getter(item), profile) for item in items]
-
-    #     # Sum all weights to determine the total probability range.
-    #     total = sum(weights)
-
-    #     # If total weight is somehow zero or invalid, just pick a random item equally.
-    #     if total <= 0:
-    #         return random.choice(items)
-
-    #     # Pick a random floating-point number between 0 and the total weight.
-    #     # This represents the "position" in the weighted probability range.
-    #     pick = random.uniform(0, total)
-
-    #     cumulative = 0.0
-    #     # Walk through the list, adding each item’s weight to a running total.
-    #     # When the running total passes the random pick point, we’ve found our winner.
-    #     for item, weight in zip(items, weights):
-    #         cumulative += weight
-    #         if pick <= cumulative:
-    #             return item
-
-    #     # Fallback: if rounding errors prevent a match, return the last item.
-    #     return items[-1]
     def _weighted_choice(
         self,
         items: Sequence,
@@ -1149,7 +1113,6 @@ class GachaManager:
         profile: GachaProfile,
     ):
 
-        _roll_logger.info("[GachaRoll] _weighted_choice CALLED with items: %s", items)
     
         # No items, no roll.
         if not items:

@@ -2,7 +2,7 @@
   "rarities": {
     "common": 70,
     "rare": 25,
-    "ultra": 5
+    "epic": 5
   },
   "starter_rarities": ["common"],
   "starter_characters": ["Allison Stein", "Alex Hawkins"],
@@ -12,7 +12,7 @@
   },
   "frog_boost_bonus": 0.15,
   "frog_boost_rolls": 2,
-  "frog_boost_targets": ["rare", "ultra"],
+  "frog_boost_targets": ["rare", "epic"],
   "characters": {
     "allison": {
       "display_name": "Allison Stein",
@@ -40,7 +40,7 @@
               "rarity": "rare"
             },
             "dress": {
-              "rarity": "ultra"
+              "rarity": "epic"
             }
           }
         }

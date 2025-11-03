@@ -25,13 +25,13 @@ logger = logging.getLogger("update_gacha_config")
 
 COMMON_RARITY = "common"
 DEFAULT_STRUCTURE = {
-    "rarities": {"common": 70, "rare": 25, "ultra": 5},
+    "rarities": {"common": 70, "rare": 25, "epic": 5},
     "starter_rarities": ["common"],
     "starter_characters": [],
     "starter_outfits": {},
     "frog_boost_bonus": 0.15,
     "frog_boost_rolls": 2,
-    "frog_boost_targets": ["rare", "ultra"],
+    "frog_boost_targets": ["rare", "epic"],
     "characters": {},
 }
 
