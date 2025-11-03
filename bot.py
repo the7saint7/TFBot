@@ -1782,14 +1782,24 @@ async def on_message(message: discord.Message):
         return None
 
     profile: Optional["GachaProfile"] = None
+    gacha_equipped = False
+    gacha_handled = False
     if GACHA_MANAGER is not None and message.guild:
         profile = await GACHA_MANAGER.ensure_profile(message.guild.id, message.author.id)
         allowed = await GACHA_MANAGER.enforce_spam_policy(message, profile=profile)
         if not allowed:
             return None
         await GACHA_MANAGER.award_message_reward(message, profile=profile)
+        gacha_equipped = bool(profile.equipped_character)
+        if gacha_equipped:
+            gacha_handled = await GACHA_MANAGER.relay_classic_message(
+                message,
+                profile=profile,
+            )
+            if gacha_handled:
+                return None
 
-    if message.guild:
+    if message.guild and not gacha_equipped:
         key = state_key(message.guild.id, message.author.id)
         state = active_transformations.get(key)
         if state:
@@ -1799,14 +1809,13 @@ async def on_message(message: discord.Message):
             await relay_transformed_message(message, state, reference=reply_reference)
             return None
 
-    if message.guild and GACHA_MANAGER is not None:
-        if await GACHA_MANAGER.user_has_equipped_character(message.guild.id, message.author.id):
-            logger.debug(
-                "Skipping TF roll for user %s in guild %s: gacha character equipped.",
-                message.author.id,
-                message.guild.id,
-            )
-            return None
+    if message.guild and GACHA_MANAGER is not None and gacha_equipped:
+        logger.debug(
+            "Skipping TF roll for user %s in guild %s: gacha character equipped.",
+            message.author.id,
+            message.guild.id,
+        )
+        return None
 
     logger.info(
         "Message intercepted (dev=%s, admin=%s): user %s in channel %s",

@@ -55,7 +55,7 @@ RARITY_STAR_FLOOR: Dict[str, int] = {
 }
 
 RARITY_BORDER_MAP: Dict[str, Optional[str]] = {
-    "common": None,
+    "common": "common",
     "uncommon": None,
     "rare": "gold",
     "epic": "epic",
@@ -866,44 +866,19 @@ class GachaManager:
         if not await self.enforce_spam_policy(message, profile=profile):
             return False
 
-        if not profile.equipped_character:
+        resolved = await self._resolve_equipped_character(profile, message.guild.id, message.author.id)
+        if resolved is None:
             logger.debug("User %s has no equipped character.", message.author.id)
             return False
+        character_def, selected_combo, owned_for_character = resolved
 
         await self._maybe_award_message_reward(profile, message.content)
 
-        character_def = self._lookup_character(profile.equipped_character)
         if character_def is None:
-            logger.warning("Equipped character %s no longer available.", profile.equipped_character)
             return False
 
-        owned_map = await self._list_owned_outfits(
-            message.guild.id,
-            message.author.id,
-            character_def.display_name,
-        )
-        owned_for_character = owned_map.get(character_def.display_name, {})
-
-        selected_combo = None
-        if profile.equipped_outfit:
-            selected_combo = self._lookup_outfit(character_def, profile.equipped_outfit)
-        if (selected_combo is None or (selected_combo.key not in character_def.outfits)) and character_def.outfits:
-            selected_combo = next(iter(character_def.outfits.values()))
-            profile.equipped_outfit = selected_combo.key
-            await self._update_profile(profile)
-        if owned_for_character and selected_combo and selected_combo.key not in owned_for_character:
-            # Snap to a combo the user actually owns.
-            def _sort_key(candidate: str) -> str:
-                combo = character_def.outfits.get(candidate)
-                return combo.label.lower() if combo else candidate.lower()
-
-            replacement_key = sorted(owned_for_character.keys(), key=_sort_key)[0]
-            selected_combo = character_def.outfits.get(replacement_key, selected_combo)
-            profile.equipped_outfit = replacement_key
-            await self._update_profile(profile)
-
         star_count = self._calculate_star_rating_from_owned(character_def, owned_for_character)
-        border_style = RARITY_BORDER_MAP.get((character_def.rarity or "common").lower())
+        border_style = self._rarity_border(character_def, allow_common_fallback=False)
 
         has_links_or_media = bool(message.attachments or message.embeds)
         if not has_links_or_media:
@@ -1043,6 +1018,66 @@ class GachaManager:
             )
         return rewarded
 
+    async def relay_classic_message(
+        self,
+        message: discord.Message,
+        *,
+        profile: Optional[GachaProfile] = None,
+    ) -> bool:
+        """Relay a message in the classic channel using the equipped gacha form."""
+        if message.guild is None or not isinstance(message.channel, discord.TextChannel):
+            return False
+        if message.author.bot or not self._is_authorized_guild(message.guild):
+            return False
+        if profile is None:
+            profile = await self._fetch_profile(message.guild.id, message.author.id)
+
+        resolved = await self._resolve_equipped_character(profile, message.guild.id, message.author.id)
+        if resolved is None:
+            return False
+        character_def, selected_combo, _owned_for_character = resolved
+
+        has_links_or_media = bool(message.attachments or message.embeds)
+        if not has_links_or_media:
+            content_lower = (message.content or "").lower()
+            if "http://" in content_lower or "https://" in content_lower:
+                has_links_or_media = True
+        if has_links_or_media:
+            return False
+
+        pose_override = selected_combo.pose if selected_combo else None
+        outfit_override = selected_combo.outfit if selected_combo else None
+        border_style = self._rarity_border(character_def, allow_common_fallback=True)
+
+        now = utc_now()
+        state = TransformationState(
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            character_name=character_def.display_name,
+            character_avatar_path=character_def.avatar_path,
+            character_message=character_def.message,
+            original_nick=None,
+            started_at=now,
+            expires_at=now,
+            duration_label="gacha",
+            avatar_applied=True,
+            original_display_name=message.author.display_name,
+            is_inanimate=False,
+            inanimate_responses=(),
+        )
+
+        result = await self._relay(
+            message,
+            state,
+            gacha_stars=None,
+            gacha_outfit=outfit_override,
+            gacha_pose=pose_override,
+            gacha_rudy=None,
+            gacha_frog=None,
+            gacha_border=border_style,
+        )
+        return bool(result)
+
     async def enforce_spam_policy(
         self,
         message: discord.Message,
@@ -1128,6 +1163,54 @@ class GachaManager:
             return False
         profile = await self._fetch_profile(guild_id, user_id)
         return bool(profile.equipped_character)
+
+    async def _resolve_equipped_character(
+        self,
+        profile: GachaProfile,
+        guild_id: int,
+        user_id: int,
+    ) -> Optional[Tuple[GachaCharacterDef, Optional[GachaOutfitDef], Mapping[str, str]]]:
+        if not profile.equipped_character:
+            return None
+
+        character_def = self._lookup_character(profile.equipped_character)
+        if character_def is None:
+            logger.warning("Equipped character %s no longer available.", profile.equipped_character)
+            profile.equipped_character = None
+            profile.equipped_outfit = None
+            await self._update_profile(profile)
+            return None
+
+        owned_map = await self._list_owned_outfits(guild_id, user_id, character_def.display_name)
+        owned_for_character = owned_map.get(character_def.display_name, {})
+
+        selected_combo = None
+        if profile.equipped_outfit:
+            selected_combo = self._lookup_outfit(character_def, profile.equipped_outfit)
+
+        if (selected_combo is None or (selected_combo.key not in character_def.outfits)) and character_def.outfits:
+            selected_combo = next(iter(character_def.outfits.values()))
+            profile.equipped_outfit = selected_combo.key
+            await self._update_profile(profile)
+
+        if owned_for_character and selected_combo and selected_combo.key not in owned_for_character:
+            def _sort_key(candidate: str) -> str:
+                combo = character_def.outfits.get(candidate)
+                return combo.label.lower() if combo else candidate.lower()
+
+            replacement_key = sorted(owned_for_character.keys(), key=_sort_key)[0]
+            selected_combo = character_def.outfits.get(replacement_key, selected_combo)
+            profile.equipped_outfit = replacement_key
+            await self._update_profile(profile)
+
+        return character_def, selected_combo, owned_for_character
+
+    def _rarity_border(self, character: GachaCharacterDef, *, allow_common_fallback: bool) -> Optional[str]:
+        rarity = (character.rarity or "common").lower()
+        border = RARITY_BORDER_MAP.get(rarity)
+        if allow_common_fallback and not border:
+            return "common"
+        return border
 
     async def _maybe_award_message_reward(self, profile: GachaProfile, content: str) -> bool:
         text = content.strip()

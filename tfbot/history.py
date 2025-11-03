@@ -226,7 +226,7 @@ def _render_history_card(
 
     card = Image.new("RGBA", (card_width, card_height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(card)
-    radius = 28
+    radius = 8
     draw.rounded_rectangle(
         (0, 0, card_width, card_height),
         radius=radius,
