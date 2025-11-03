@@ -626,19 +626,6 @@
       },
       "rarity": "common"
     },
-    "clausgb": {
-      "display_name": "Clausoko",
-      "poses": {
-        "a": {
-          "outfits": {
-            "skirt": {
-              "rarity": "common"
-            }
-          }
-        }
-      },
-      "rarity": "rare"
-    },
     "connie": {
       "display_name": "Connie Williams",
       "poses": {
@@ -1490,6 +1477,15 @@
             },
             "uniform": {
               "rarity": "common"
+            },
+            "genie": {
+              "rarity": "rare"
+            },
+            "pigtail_sexy": {
+              "rarity": "rare"
+            },
+            "pregnant": {
+              "rarity": "rare"
             }
           }
         },
@@ -1503,6 +1499,15 @@
             },
             "uniform": {
               "rarity": "common"
+            },
+            "genie": {
+              "rarity": "rare"
+            },
+            "pigtail_sexy": {
+              "rarity": "rare"
+            },
+            "pregnant": {
+              "rarity": "rare"
             }
           }
         }
@@ -3211,6 +3216,71 @@
         }
       },
       "rarity": "rare"
+    },
+    "catrina": {
+      "display_name": "Catrina",
+      "poses": {
+        "a": {
+          "outfits": {
+            "leotard": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "common"
+            }
+        }
+      },
+        "b": {
+          "outfits": {
+            "leotard": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "frogyaka": {
+      "display_name": "Frogyaka",
+      "poses": {
+        "a": {
+          "outfits": {
+            "base": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "clausgb": {
+      "display_name": "ClausGB",
+      "poses": {
+        "a": {
+          "outfits": {
+            "skirt": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "yuigyaru": {
+      "display_name": "Yui Gyaru",
+      "poses": {
+        "a": {
+          "outfits": {
+            "zoomed": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
     }
   },
   "frog_boost_bonus": 0.15,
@@ -3230,3 +3300,4 @@
     "common"
   ]
 }
+
