@@ -25,7 +25,22 @@ from tfbot.panels import compose_game_avatar, list_pose_outfits, render_vn_panel
 from tfbot.utils import float_from_env, int_from_env, path_from_env, utc_now
 
 logger = logging.getLogger("tfbot.gacha")
-logger("tfbot.gacha").setLevel(logging.info)
+
+# put this near the top of gacha.py (after the existing logger)
+logger = logging.getLogger("tfbot.gacha")
+
+# 👇 add this helper
+_roll_logger = logging.getLogger("tfbot.gacha.rolls")
+if not _roll_logger.handlers:
+    _roll_logger.setLevel(logging.DEBUG)          # lowest we care about
+    _roll_logger.propagate = False                # don't let the app mute us
+
+    _roll_handler = logging.StreamHandler()       # print to stdout
+    _roll_handler.setLevel(logging.DEBUG)
+    _roll_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    ))
+    _roll_logger.addHandler(_roll_handler)
 
 # Type aliases
 RelayCallback = Callable[[discord.Message, TransformationState], asyncio.Future]
@@ -1133,6 +1148,9 @@ class GachaManager:
         rarity_getter: Callable[[object], str],
         profile: GachaProfile,
     ):
+
+        _roll_logger.info("[GachaRoll] _weighted_choice CALLED with items: %s", items)
+    
         # No items, no roll.
         if not items:
             return None
@@ -1196,7 +1214,7 @@ class GachaManager:
         total = sum(weights)
 
         # 🪶 Debug log: show all computed weights per rarity and per item
-        logger.info(
+        _roll_logger.info(
             "[Gacha] Final boosted_rarities: %s | Per-item weights: %s | Total weight: %.2f",
             boosted_rarities,
             dict(zip([getattr(i, 'display_name', str(i)) for i in items], weights)),
@@ -1211,7 +1229,7 @@ class GachaManager:
         pick = random.uniform(0, total)
 
         # 🧭 Debug log: display the random number selected and its range
-        logger.info(
+        _roll_logger.info(
             "[Gacha] Random pick: %.3f (range: 0–%.3f)", pick, total
         )
         
@@ -1220,7 +1238,7 @@ class GachaManager:
             cumulative += weight
             if pick <= cumulative:
                 # 🧩 Debug log: display which item was chosen and its stats
-                logger.info(
+                _roll_logger.info(
                     "[Gacha] Selected item: %s | Rarity: %s | Weight: %.2f | "
                     "Cumulative: %.2f / %.2f | Pick: %.2f",
                     getattr(item, 'display_name', str(item)),
