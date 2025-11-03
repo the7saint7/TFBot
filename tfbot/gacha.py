@@ -73,6 +73,10 @@ RARITY_EMBED_COLORS: Dict[str, int] = {
 }
 DEFAULT_EMBED_COLOR = 0x5865F2
 
+EMBED_TOTAL_CHAR_LIMIT = 6000
+EMBED_MAX_FIELDS = 25
+EMBED_FIELD_VALUE_LIMIT = 1024
+
 
 @dataclass(frozen=True)
 class GachaOutfitDef:
@@ -1389,6 +1393,67 @@ class GachaManager:
             buckets.append("\n".join(current))
         return buckets
 
+    def _clone_embed(self, embed: discord.Embed) -> discord.Embed:
+        """Create a shallow copy of an embed with shared metadata."""
+        clone = discord.Embed(
+            title=embed.title,
+            description=embed.description,
+            colour=embed.colour,
+            timestamp=embed.timestamp,
+        )
+        if embed.author:
+            clone.set_author(name=embed.author.name, url=embed.author.url, icon_url=embed.author.icon_url)
+        if embed.footer:
+            clone.set_footer(text=embed.footer.text, icon_url=embed.footer.icon_url)
+        if embed.thumbnail:
+            clone.set_thumbnail(url=embed.thumbnail.url)
+        if embed.image:
+            clone.set_image(url=embed.image.url)
+        return clone
+
+    def _iter_field_chunks(
+        self,
+        name: str,
+        value: str,
+        inline: bool,
+    ) -> Iterable[Tuple[str, str, bool]]:
+        if len(value) <= EMBED_FIELD_VALUE_LIMIT:
+            yield name, value, inline
+            return
+        start = 0
+        part = 0
+        total = len(value)
+        while start < total:
+            end = start + EMBED_FIELD_VALUE_LIMIT
+            chunk_value = value[start:end]
+            chunk_name = name if part == 0 else f"{name} (cont. {part + 1})"
+            yield chunk_name, chunk_value, inline
+            start = end
+            part += 1
+
+    def _paginate_embed_fields(
+        self,
+        base_embed: discord.Embed,
+        fields: Sequence[Tuple[str, str, bool]],
+    ) -> List[discord.Embed]:
+        pages: List[discord.Embed] = []
+        current = self._clone_embed(base_embed)
+        current_length = len(current)
+        for name, value, inline in fields:
+            for chunk_name, chunk_value, chunk_inline in self._iter_field_chunks(name, value, inline):
+                chunk_len = len(chunk_name) + len(chunk_value)
+                if current.fields and (
+                    len(current.fields) >= EMBED_MAX_FIELDS or current_length + chunk_len > EMBED_TOTAL_CHAR_LIMIT
+                ):
+                    pages.append(current)
+                    current = self._clone_embed(base_embed)
+                    current_length = len(current)
+                current.add_field(name=chunk_name, value=chunk_value, inline=chunk_inline)
+                current_length += chunk_len
+        if current.fields or not pages:
+            pages.append(current)
+        return pages
+
     # Starter pack & rolls ---------------------------------------------
 
     async def _grant_starter_pack(self, message: discord.Message, profile: GachaProfile) -> None:
@@ -1725,14 +1790,17 @@ class GachaManager:
             color=0x2980B9,
             timestamp=utc_now(),
         )
+        fields: List[Tuple[str, str, bool]] = []
 
         for index, chunk in enumerate(self._chunk_lines(owned_lines), start=1):
             title = "Owned Characters" if index == 1 else f"Owned Characters (cont. {index})"
-            embed.add_field(name=title, value=chunk, inline=False)
+            fields.append((title, chunk, False))
 
         for index, chunk in enumerate(self._chunk_lines(unowned_lines), start=1):
             title = "Unowned Characters" if index == 1 else f"Unowned Characters (cont. {index})"
-            embed.add_field(name=title, value=chunk, inline=False)
+            fields.append((title, chunk, False))
+
+        pages = self._paginate_embed_fields(embed, fields)
 
         try:
             await ctx.message.delete()
@@ -1740,10 +1808,9 @@ class GachaManager:
             pass
 
         try:
-            if in_dm:
-                await ctx.send(embed=embed)
-            else:
-                await ctx.author.send(embed=embed)
+            send_fn = ctx.send if in_dm else ctx.author.send
+            for page in pages:
+                await send_fn(embed=page)
         except discord.Forbidden:
             if ctx.guild:
                 await ctx.reply(
@@ -1770,14 +1837,17 @@ class GachaManager:
             color=0x9B59B6,
             timestamp=utc_now(),
         )
-        embed.add_field(
-            name="Balances",
-            value=(
-                f"Rudy Coins: **{profile.rudy_coins}**\n"
-                f"Frog Coins: **{profile.frog_coins}**\n"
-                f"Boost Rolls Remaining: **{profile.boost_rolls_remaining}**"
-            ),
-            inline=False,
+        fields: List[Tuple[str, str, bool]] = []
+        fields.append(
+            (
+                "Balances",
+                (
+                    f"Rudy Coins: **{profile.rudy_coins}**\n"
+                    f"Frog Coins: **{profile.frog_coins}**\n"
+                    f"Boost Rolls Remaining: **{profile.boost_rolls_remaining}**"
+                ),
+                False,
+            )
         )
         equipped_label = "None"
         if profile.equipped_character:
@@ -1788,22 +1858,26 @@ class GachaManager:
                     equipped_label = combo.label
                 else:
                     equipped_label = profile.equipped_outfit
-        embed.add_field(
-            name="Equipped",
-            value=f"{profile.equipped_character or 'None'} — {equipped_label}",
-            inline=False,
+        fields.append(
+            (
+                "Equipped",
+                f"{profile.equipped_character or 'None'} — {equipped_label}",
+                False,
+            )
         )
-        embed.add_field(
-            name="How to Play",
-            value=(
-                f"• Use `!gacha` here in <#{self.channel_id}> to refresh this DM.\n"
-                f"• Equip a form with `!changeto <character> [pose/outfit]` (run it in <#{self.channel_id}>).\n"
-                "• Use `!unequip` any time (here or via DM) to return to your normal appearance.\n"
-                "• Equipped forms protect you from random TF rolls in the normal channel until you `!unequip`.\n"
-                "• Try `!roll character` or `!roll outfit` in this channel or DM me; DM rolls will be announced back in the gacha channel.\n"
-                f"• Chat as your equipped character in <#{self.channel_id}> with 3+ word sentences to earn {self.coin_earn_per_message} Rudy coins each time."
-            ),
-            inline=False,
+        fields.append(
+            (
+                "How to Play",
+                (
+                    f"• Use `!gacha` here in <#{self.channel_id}> to refresh this DM.\n"
+                    f"• Equip a form with `!changeto <character> [pose/outfit]` (run it in <#{self.channel_id}>).\n"
+                    "• Use `!unequip` any time (here or via DM) to return to your normal appearance.\n"
+                    "• Equipped forms protect you from random TF rolls in the normal channel until you `!unequip`.\n"
+                    "• Try `!roll character` or `!roll outfit` in this channel or DM me; DM rolls will be announced back in the gacha channel.\n"
+                    f"• Chat as your equipped character in <#{self.channel_id}> with 3+ word sentences to earn {self.coin_earn_per_message} Rudy coins each time."
+                ),
+                False,
+            )
         )
 
         lines: List[str] = []
@@ -1823,7 +1897,9 @@ class GachaManager:
 
         for index, chunk in enumerate(self._chunk_lines(lines), start=1):
             title = "Characters" if index == 1 else f"Characters (cont. {index})"
-            embed.add_field(name=title, value=chunk, inline=False)
+            fields.append((title, chunk, False))
+
+        pages = self._paginate_embed_fields(embed, fields)
 
         try:
             await ctx.message.delete()
@@ -1831,10 +1907,9 @@ class GachaManager:
             pass
 
         try:
-            if in_dm:
-                await ctx.send(embed=embed)
-            else:
-                await ctx.author.send(embed=embed)
+            send_fn = ctx.send if in_dm else ctx.author.send
+            for page in pages:
+                await send_fn(embed=page)
         except discord.Forbidden:
             await ctx.reply(
                 "I couldn't send you a DM. Please enable DMs from server members to receive your inventory.",
