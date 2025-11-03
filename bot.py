@@ -1,5 +1,4 @@
-﻿import argparse
-import asyncio
+﻿import asyncio
 import importlib.util
 import io
 import json
@@ -121,7 +120,6 @@ TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("1 hour", timedelta(hours=1)),
     ("10 hours", timedelta(hours=10)),
 ]
-DEV_TRANSFORM_DURATION = ("2 minutes", timedelta(minutes=2))
 INANIMATE_DURATION = timedelta(minutes=10)
 REQUIRED_GUILD_PERMISSIONS = {
     "send_messages": "Send Messages (needed to respond in channels)",
@@ -903,10 +901,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         character_avatar_path = character.avatar_path
         character_message = character.message
         inanimate_responses = tuple()
-        if DEV_MODE:
-            duration_label, duration_delta = DEV_TRANSFORM_DURATION
-        else:
-            duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
+        duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
     now = utc_now()
     expires_at = now + duration_delta
     original_nick = member.nick
@@ -1030,18 +1025,6 @@ async def log_channel_access() -> None:
                     perms.send_messages,
                     perms.mention_everyone,
                 )
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TF Discord Bot launcher")
-    parser.add_argument(
-        "-dev",
-        "--dev",
-        dest="dev_mode",
-        action="store_true",
-        help="Run the bot in dev mode (higher TF chance, shorter durations).",
-    )
-    return parser.parse_args()
-
 
 def current_history_channel_id() -> int:
     return TF_HISTORY_CHANNEL_ID
@@ -1816,7 +1799,6 @@ async def on_message(message: discord.Message):
 
 
 def main():
-    args = parse_args()
     bot.run(DISCORD_TOKEN)
 
 
