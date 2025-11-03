@@ -25,6 +25,7 @@ from tfbot.panels import compose_game_avatar, list_pose_outfits, render_vn_panel
 from tfbot.utils import float_from_env, int_from_env, path_from_env, utc_now
 
 logger = logging.getLogger("tfbot.gacha")
+logger("tfbot.gacha").setLevel(logging.info)
 
 # Type aliases
 RelayCallback = Callable[[discord.Message, TransformationState], asyncio.Future]
