@@ -109,9 +109,7 @@ if BOT_MODE == "gacha" and not GACHA_ENABLED:
     raise RuntimeError("TFBOT_GACHA_CHANNEL_ID is required when running in gacha mode.")
 if not CLASSIC_ENABLED and not GACHA_ENABLED:
     raise RuntimeError("Configure at least TFBOT_CHANNEL_ID or TFBOT_GACHA_CHANNEL_ID.")
-DEV_TF_CHANCE = 0.75
 TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
-TF_HISTORY_DEV_CHANNEL_ID = int_from_env("TFBOT_HISTORY_DEV_CHANNEL_ID", 1433105932392595609)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
 MESSAGE_STYLE = os.getenv(
@@ -1045,21 +1043,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-DEV_MODE = False
-
-
-def enable_dev_mode() -> None:
-    global DEV_MODE, TF_CHANCE
-    DEV_MODE = True
-    TF_CHANCE = DEV_TF_CHANCE
-    logger.warning(
-        "Dev mode ENABLED: TF chance now %.0f%% with accelerated revert timers.",
-        TF_CHANCE * 100,
-    )
-
-
 def current_history_channel_id() -> int:
-    return TF_HISTORY_DEV_CHANNEL_ID if DEV_MODE else TF_HISTORY_CHANNEL_ID
+    return TF_HISTORY_CHANNEL_ID
 
 
 @bot.event
@@ -1068,7 +1053,6 @@ async def on_ready():
     logger.info("Logged in as %s (id=%s)", bot.user, bot.user.id if bot.user else "unknown")
     logger.info("TF chance set to %.0f%%", TF_CHANCE * 100)
     logger.info("Message style: %s", MESSAGE_STYLE.upper())
-    logger.info("Dev mode: %s", "ON" if DEV_MODE else "OFF")
     if TF_CHANNEL_ID > 0:
         status = "enabled" if CLASSIC_ENABLED else "disabled"
         logger.info("Primary channel (%s): %s", status, TF_CHANNEL_ID)
@@ -1738,11 +1722,10 @@ async def on_message(message: discord.Message):
         return None
 
     logger.info(
-        "Message %s from %s in channel %s (dev=%s)",
+        "Message %s from %s in channel %s",
         message.id,
         message.author.id,
         getattr(message.channel, "id", "dm"),
-        DEV_MODE,
     )
 
     command_invoked = False
@@ -1818,8 +1801,7 @@ async def on_message(message: discord.Message):
         return None
 
     logger.info(
-        "Message intercepted (dev=%s, admin=%s): user %s in channel %s",
-        DEV_MODE,
+        "Message intercepted (admin=%s): user %s in channel %s",
         is_admin_user,
         message.author.id,
         channel_id,
@@ -1835,8 +1817,6 @@ async def on_message(message: discord.Message):
 
 def main():
     args = parse_args()
-    if args.dev_mode:
-        enable_dev_mode()
     bot.run(DISCORD_TOKEN)
 
 
