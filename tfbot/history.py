@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import discord
 
@@ -50,7 +50,6 @@ HISTORY_SEPARATOR_COLOR = (54, 57, 63, 255)
 HISTORY_TITLE_FONT_SIZE = 32
 HISTORY_BODY_FONT_SIZE = 24
 HISTORY_ACTIVE_EMBED_COLOR = (152, 118, 255)
-HISTORY_ROSTER_EMBED_COLOR = (92, 186, 198)
 
 _FONT_REGULAR_CACHE: Optional["ImageFont.FreeTypeFont"] = None
 _FONT_BOLD_CACHE: Optional["ImageFont.FreeTypeFont"] = None
@@ -507,45 +506,6 @@ def _build_active_entries(
     return sections, cards
 
 
-def _build_available_entries(
-    characters: Sequence[TFCharacter],
-    active_names: Iterable[str],
-    usage_counts: Mapping[str, int],
-    color_lookup: Mapping[str, Tuple[int, int, int]],
-) -> Tuple[List[str], List[HistoryCardData]]:
-    active_set = {name.lower() for name in active_names}
-    available = [character for character in characters if character.name.lower() not in active_set]
-    if not available:
-        return ["*All characters are currently TFed.*"], []
-
-    sections: List[str] = []
-    cards: List[HistoryCardData] = []
-    available.sort(key=lambda c: (-usage_counts.get(c.name, 0), c.name.lower()))
-    for character in available:
-        usage = usage_counts.get(character.name, 0)
-        first_name = _first_given_name(character.name)
-        first_name_display = first_name or character.name or "this character"
-        section_lines = [
-            f"**{character.name}**",
-            f"- Times someone TFed into {first_name_display}:  `{usage}`",
-        ]
-        card_lines = [
-            f"Times someone TFed into {first_name_display}:  {usage}",
-        ]
-
-        sections.append("\n".join(section_lines))
-        cards.append(
-            HistoryCardData(
-                character_name=character.name,
-                title=character.name,
-                lines=card_lines,
-                accent_color=color_lookup.get(character.name.lower()),
-                avatar_path=getattr(character, "avatar_path", None),
-            )
-        )
-    return sections, cards
-
-
 async def publish_history_snapshot(
     bot: discord.Client,
     active_states: Mapping[Tuple[int, int], TransformationState],
@@ -616,13 +576,6 @@ async def publish_history_snapshot(
         member_lookup,
         color_lookup,
     )
-    available_sections, _ = _build_available_entries(
-        character_pool,
-        (state.character_name for state in active_sorted),
-        usage_counts,
-        color_lookup,
-    )
-
     regular_font, bold_font = _ensure_history_fonts()
     can_render_cards = (
         Image is not None
@@ -636,10 +589,7 @@ async def publish_history_snapshot(
     active_files: List[discord.File] = []
     if active_cards and can_render_cards and len(active_cards) <= 10:
         success = True
-        for index, (section, card) in enumerate(
-            zip(active_sections, active_cards),
-            start=1,
-        ):
+        for index, card in enumerate(active_cards, start=1):
             file = _render_card_file(
                 card,
                 "history-active",
@@ -672,15 +622,6 @@ async def publish_history_snapshot(
                 )
             )
 
-    roster_chunks = _chunk_sections(available_sections) or ["*All characters are currently TFed.*"]
-    roster_embeds: List[discord.Embed] = [
-        discord.Embed(
-            description=chunk,
-            color=discord.Color.from_rgb(*HISTORY_ROSTER_EMBED_COLOR),
-        )
-        for chunk in roster_chunks
-    ]
-
     try:
         active_kwargs: Dict[str, object] = {
             "embeds": active_embeds,
@@ -689,12 +630,6 @@ async def publish_history_snapshot(
         if active_files:
             active_kwargs["files"] = active_files
         await channel.send(**active_kwargs)
-
-        roster_kwargs: Dict[str, object] = {
-            "embeds": roster_embeds,
-            "allowed_mentions": discord.AllowedMentions.none(),
-        }
-        await channel.send(**roster_kwargs)
     except discord.HTTPException as exc:
         logger.warning("Failed to update history channel: %s", exc)
 

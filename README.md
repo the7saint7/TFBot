@@ -18,7 +18,7 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | --- | --- | --- |
 | `DISCORD_TOKEN` | Bot token from the Discord developer portal | _(required)_ |
 | `TFBOT_CHANCE` | Decimal probability that a message triggers a TF | `0.10` |
-| `TFBOT_IGNORE_CHANNELS` | Comma-separated channel IDs that should never trigger TFs | _(empty)_ |
+| `TFBOT_CHANNEL_ID` | Channel ID where classic TF rolls are allowed | _(required in classic mode)_ |
 | `TFBOT_PREFIX` | Command prefix for future bot commands | `!` |
 | `TFBOT_LOG_LEVEL` | Python logging level | `INFO` |
 | `TFBOT_HISTORY_CHANNEL_ID` | Channel that receives TF audit logs | `1432196317722972262` |
@@ -54,6 +54,8 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 python bot.py
 ```
 The bot requires the `MESSAGE CONTENT INTENT` to be enabled in the Discord developer portal.
+Configure `TFBOT_CHANNEL_ID` with the numeric channel ID you want the bot to monitor; all other channels are ignored in classic mode.
+Set `TFBOT_MODE=gacha` to run only the collection game. If you keep the default `classic` mode and also configure `TFBOT_GACHA_CHANNEL_ID`, the bot runs both: classic TF rolls in `TFBOT_CHANNEL_ID` and gacha relay panels in the gacha channel.
 
 - Messages from members with the Discord Administrator permission (or a role literally named `Admin`) are ignored automatically.
 
@@ -66,7 +68,7 @@ The bot requires the `MESSAGE CONTENT INTENT` to be enabled in the Discord devel
   - Sends an entry to the history channel defined by `TFBOT_HISTORY_CHANNEL_ID` without pinging the user or naming the guild.
 - When the timer expires, the nickname and avatar revert and the history channel receives a 'TF Reverted' entry that references the member's username (not display name) and the character that expired.
 - While a user is transformed, every message they send is mirrored by the bot; use `TFBOT_MESSAGE_STYLE=classic` for embeds with thumbnails or `vn` for generated visual-novel panels (requires **Manage Messages**). In `vn` mode the bot composites character sprites from the Student Transfer assets if `TFBOT_VN_GAME_ROOT` is provided. In VN mode, transformed users can switch sprites by running `!outfit <name>` after the bot DM shares available outfits.
-- Members with the Discord Administrator permission (or a role literally named `Admin`) and ignored channels never trigger TFs.
+- Members with the Discord Administrator permission (or a role literally named `Admin`) never trigger TFs. Messages outside the configured `TFBOT_CHANNEL_ID` channel are ignored.
 - Server admins can run the hidden `!synreset` command to immediately revert all active TFs in the current server and log the action to the history channel.
 - Any member can type `!tf` to see how many times they've transformed and how often each character has appeared.
 - Set `TFBOT_MAGIC_EMOJI_NAME` to the custom emoji name you want prefixed on TF narration; the bot looks it up per guild and falls back to plain text if missing.
@@ -80,8 +82,8 @@ Development servers can launch with:
 python bot.py -dev
 ```
 - TF chance is forced to 75%.
-- Only channel `1432191400983662766` will receive responses; all others are ignored.
-- The regular ignore-list is bypassed while dev mode is active.
+- Transformations use a shortened two-minute duration.
+- All other runtime settings remain the same, including the configured `TFBOT_CHANNEL_ID`.
 
 ## Next Steps
 - Flesh out `tf_characters.py` with real art assets and narration.

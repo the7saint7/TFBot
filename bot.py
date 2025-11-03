@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import aiohttp
 import discord
@@ -84,10 +84,12 @@ from tfbot.utils import (
     is_admin,
     member_profile_name,
     normalize_pose_name,
-    parse_channel_ids,
     path_from_env,
     utc_now,
 )
+
+if TYPE_CHECKING:
+    from tfbot.gacha import GachaProfile
 
 
 logging.basicConfig(
@@ -98,14 +100,24 @@ logger = logging.getLogger("tfbot")
 
 
 BOT_MODE = os.getenv("TFBOT_MODE", "classic").lower()
-GACHA_MODE = BOT_MODE == "gacha"
-DEV_CHANNEL_ID = 1432191400983662766
+TF_CHANNEL_ID = int_from_env("TFBOT_CHANNEL_ID", 0)
+GACHA_CHANNEL_ID = int_from_env("TFBOT_GACHA_CHANNEL_ID", 0)
+GACHA_ENABLED = GACHA_CHANNEL_ID > 0
+CLASSIC_ENABLED = BOT_MODE != "gacha" and TF_CHANNEL_ID > 0
+
+if BOT_MODE == "gacha" and not GACHA_ENABLED:
+    raise RuntimeError("TFBOT_GACHA_CHANNEL_ID is required when running in gacha mode.")
+if not CLASSIC_ENABLED and not GACHA_ENABLED:
+    raise RuntimeError("Configure at least TFBOT_CHANNEL_ID or TFBOT_GACHA_CHANNEL_ID.")
 DEV_TF_CHANCE = 0.75
 TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
 TF_HISTORY_DEV_CHANNEL_ID = int_from_env("TFBOT_HISTORY_DEV_CHANNEL_ID", 1433105932392595609)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
-MESSAGE_STYLE = os.getenv("TFBOT_MESSAGE_STYLE", "vn" if GACHA_MODE else "classic").lower()
+MESSAGE_STYLE = os.getenv(
+    "TFBOT_MESSAGE_STYLE",
+    "vn" if GACHA_ENABLED else "classic",
+).lower()
 TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 minutes", timedelta(minutes=10)),
     ("1 hour", timedelta(hours=1)),
@@ -218,7 +230,7 @@ _history_refresh_seq = 0
 
 def schedule_history_refresh(delay: float = 0.2) -> None:
     """Debounce history snapshot updates."""
-    if GACHA_MODE:
+    if not CLASSIC_ENABLED:
         return
     global _history_refresh_task, _history_refresh_seq  # pylint: disable=global-statement
 
@@ -359,9 +371,6 @@ if not DISCORD_TOKEN:
 TF_CHANCE = float(os.getenv("TFBOT_CHANCE", "0.10"))
 TF_CHANCE = max(0.0, min(1.0, TF_CHANCE))
 
-IGNORED_CHANNEL_IDS = parse_channel_ids(os.getenv("TFBOT_IGNORE_CHANNELS", ""))
-ALLOWED_CHANNEL_IDS: Optional[Set[int]] = None
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -415,15 +424,13 @@ class GuardedHelpCommand(commands.DefaultHelpCommand):
         await super().send_error_message(error)
 
 
-if not GACHA_MODE:
-    blocked_help_channels: set[int] = set()
-    _blocked_channel_id = int_from_env("TFBOT_GACHA_CHANNEL_ID", 0)
-    if _blocked_channel_id:
-        blocked_help_channels.add(_blocked_channel_id)
-    if blocked_help_channels:
-        bot.help_command = GuardedHelpCommand(blocked_help_channels, verify_checks=False)
-    else:
-        bot.help_command = commands.DefaultHelpCommand()
+blocked_help_channels: set[int] = set()
+if GACHA_ENABLED:
+    blocked_help_channels.add(GACHA_CHANNEL_ID)
+if blocked_help_channels:
+    bot.help_command = GuardedHelpCommand(blocked_help_channels, verify_checks=False)
+else:
+    bot.help_command = commands.DefaultHelpCommand()
 
 
 async def ensure_state_restored() -> None:
@@ -785,7 +792,7 @@ async def relay_transformed_message(
     return True
 
 
-if GACHA_MODE:
+if GACHA_ENABLED:
     from tfbot.gacha import setup_gacha_mode
 
     GACHA_MANAGER = setup_gacha_mode(
@@ -996,11 +1003,14 @@ async def log_channel_access() -> None:
         if me is None:
             continue
         channel_ids = set()
-        if DEV_MODE:
-            channel_ids |= ALLOWED_CHANNEL_IDS or set()
-        else:
-            channel_ids |= IGNORED_CHANNEL_IDS
-        channel_ids.add(DEV_CHANNEL_ID)
+        if CLASSIC_ENABLED:
+            channel_ids.add(TF_CHANNEL_ID)
+        history_channel_id = current_history_channel_id()
+        if history_channel_id:
+            channel_ids.add(history_channel_id)
+        if GACHA_MANAGER is not None:
+            channel_ids.add(GACHA_MANAGER.channel_id)
+        channel_ids.discard(0)
         for channel_id in channel_ids:
             channel = guild.get_channel(channel_id)
             if channel is None:
@@ -1030,7 +1040,7 @@ def parse_args() -> argparse.Namespace:
         "--dev",
         dest="dev_mode",
         action="store_true",
-        help="Run the bot in dev mode (restricted channel, 75%% TF chance).",
+        help="Run the bot in dev mode (higher TF chance, shorter durations).",
     )
     return parser.parse_args()
 
@@ -1039,13 +1049,11 @@ DEV_MODE = False
 
 
 def enable_dev_mode() -> None:
-    global DEV_MODE, TF_CHANCE, ALLOWED_CHANNEL_IDS
+    global DEV_MODE, TF_CHANCE
     DEV_MODE = True
     TF_CHANCE = DEV_TF_CHANCE
-    ALLOWED_CHANNEL_IDS = {DEV_CHANNEL_ID}
     logger.warning(
-        "Dev mode ENABLED: restricting activity to channel %s with TF chance %.0f%%",
-        DEV_CHANNEL_ID,
+        "Dev mode ENABLED: TF chance now %.0f%% with accelerated revert timers.",
         TF_CHANCE * 100,
     )
 
@@ -1061,15 +1069,13 @@ async def on_ready():
     logger.info("TF chance set to %.0f%%", TF_CHANCE * 100)
     logger.info("Message style: %s", MESSAGE_STYLE.upper())
     logger.info("Dev mode: %s", "ON" if DEV_MODE else "OFF")
-    if DEV_MODE:
-        logger.info("Allowed channel: %s", DEV_CHANNEL_ID)
-    else:
-        logger.info("Dev channel %s is excluded while dev mode is OFF.", DEV_CHANNEL_ID)
-        if IGNORED_CHANNEL_IDS:
-            logger.info(
-                "Ignoring additional channels: %s",
-                ", ".join(str(cid) for cid in IGNORED_CHANNEL_IDS),
-            )
+    if TF_CHANNEL_ID > 0:
+        status = "enabled" if CLASSIC_ENABLED else "disabled"
+        logger.info("Primary channel (%s): %s", status, TF_CHANNEL_ID)
+    elif CLASSIC_ENABLED:
+        logger.warning("No primary channel configured.")
+    if GACHA_MANAGER is not None:
+        logger.info("Gacha channel: %s", GACHA_MANAGER.channel_id)
     await log_guild_permissions()
     await log_channel_access()
     schedule_history_refresh()
@@ -1748,9 +1754,17 @@ async def on_message(message: discord.Message):
     if command_invoked:
         return None
 
-    if GACHA_MODE:
-        if GACHA_MANAGER is not None:
-            await GACHA_MANAGER.handle_message(message, command_invoked=command_invoked)
+    is_gacha_channel = (
+        GACHA_MANAGER is not None
+        and isinstance(message.channel, discord.TextChannel)
+        and message.guild is not None
+        and message.channel.id == GACHA_MANAGER.channel_id
+    )
+    if is_gacha_channel:
+        await GACHA_MANAGER.handle_message(message, command_invoked=command_invoked)
+        return None
+
+    if not CLASSIC_ENABLED:
         return None
 
     is_admin_user = is_admin(message.author)
@@ -1758,31 +1772,22 @@ async def on_message(message: discord.Message):
         logger.debug("Ignoring message %s from server owner %s", message.id, message.author.id)
         return None
     channel_id = getattr(message.channel, "id", None)
-    if DEV_MODE and ALLOWED_CHANNEL_IDS and channel_id not in ALLOWED_CHANNEL_IDS:
+    if message.guild and TF_CHANNEL_ID > 0 and channel_id != TF_CHANNEL_ID:
         logger.info(
-            "Skipping message %s: channel %s not in dev allow list (%s)",
+            "Skipping message %s: channel %s is not the configured TF channel (%s).",
             message.id,
             channel_id,
-            ", ".join(str(c) for c in ALLOWED_CHANNEL_IDS),
+            TF_CHANNEL_ID,
         )
         return None
 
-    if not DEV_MODE and channel_id == DEV_CHANNEL_ID:
-        logger.info(
-            "Skipping message %s: dev channel %s is disabled while dev mode is off.",
-            message.id,
-            channel_id,
-        )
-        return None
-
-    if not DEV_MODE and channel_id in IGNORED_CHANNEL_IDS:
-        logger.info(
-            "Skipping message %s: channel %s is in the ignore list (%s)",
-            message.id,
-            channel_id,
-            ", ".join(str(c) for c in IGNORED_CHANNEL_IDS),
-        )
-        return None
+    profile: Optional["GachaProfile"] = None
+    if GACHA_MANAGER is not None and message.guild:
+        profile = await GACHA_MANAGER.ensure_profile(message.guild.id, message.author.id)
+        allowed = await GACHA_MANAGER.enforce_spam_policy(message, profile=profile)
+        if not allowed:
+            return None
+        await GACHA_MANAGER.award_message_reward(message, profile=profile)
 
     if message.guild:
         key = state_key(message.guild.id, message.author.id)
@@ -1792,6 +1797,15 @@ async def on_message(message: discord.Message):
                 message.to_reference(fail_if_not_exists=False) if message.reference else None
             )
             await relay_transformed_message(message, state, reference=reply_reference)
+            return None
+
+    if message.guild and GACHA_MANAGER is not None:
+        if await GACHA_MANAGER.user_has_equipped_character(message.guild.id, message.author.id):
+            logger.debug(
+                "Skipping TF roll for user %s in guild %s: gacha character equipped.",
+                message.author.id,
+                message.guild.id,
+            )
             return None
 
     logger.info(

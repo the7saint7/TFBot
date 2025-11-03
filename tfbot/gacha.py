@@ -863,69 +863,14 @@ class GachaManager:
             await self._grant_starter_pack(message, profile)
             profile = await self._fetch_profile(message.guild.id, message.author.id)
 
-        now = utc_now()
-        spam_key = (message.guild.id, message.author.id)
-        record = self._spam_tracker.get(spam_key)
-        if record is None:
-            record = {
-                "messages": deque(maxlen=3),
-                "offenses": 0,
-                "cooldown_until": now - timedelta(seconds=1),
-            }
-            self._spam_tracker[spam_key] = record
-
-        if now < record["cooldown_until"]:
-            remaining = max(0, int((record["cooldown_until"] - now).total_seconds()))
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                pass
-            await message.channel.send(
-                f"{message.author.mention}, you're still on cooldown for {remaining}s. Slow down!"
-            )
+        if not await self.enforce_spam_policy(message, profile=profile):
             return False
-
-        normalized_content = re.sub(r"\s+", " ", message.content).strip().lower()
-        if normalized_content:
-            record["messages"].append(normalized_content)
-            if len(record["messages"]) == record["messages"].maxlen and len(set(record["messages"])) == 1:
-                record["messages"].clear()
-                record["offenses"] += 1
-                offense = record["offenses"]
-                if offense == 1:
-                    cooldown = timedelta(seconds=10)
-                    penalty = 0
-                    penalty_text = "That's a warning."
-                elif offense == 2:
-                    cooldown = timedelta(minutes=1)
-                    penalty = 10
-                    penalty_text = "Penalty: -10 Rudy coins."
-                else:
-                    cooldown = timedelta(minutes=10)
-                    penalty = 100
-                    penalty_text = "Penalty: -100 Rudy coins."
-                record["cooldown_until"] = now + cooldown
-                if penalty > 0:
-                    profile.rudy_coins = max(0, profile.rudy_coins - penalty)
-                await self._update_profile(profile)
-                try:
-                    await message.delete()
-                except discord.HTTPException:
-                    pass
-                await message.channel.send(
-                    f"🚨 {message.author.mention}, you've been caught speeding! {penalty_text} "
-                    f"Please wait {int(cooldown.total_seconds())}s before chatting again."
-                )
-                return False
 
         if not profile.equipped_character:
             logger.debug("User %s has no equipped character.", message.author.id)
             return False
 
-        # Award coins for qualifying text.
-        if self._qualifies_for_reward(message.content):
-            profile.rudy_coins += self.coin_earn_per_message
-            await self._update_profile(profile)
+        await self._maybe_award_message_reward(profile, message.content)
 
         character_def = self._lookup_character(profile.equipped_character)
         if character_def is None:
@@ -1068,6 +1013,128 @@ class GachaManager:
         finally:
             panel_file.close()
 
+        return True
+
+    async def ensure_profile(self, guild_id: int, user_id: int) -> GachaProfile:
+        """Ensure a gacha profile exists; create it if missing."""
+        return await self._fetch_profile(guild_id, user_id)
+
+    async def award_message_reward(
+        self,
+        message: discord.Message,
+        *,
+        profile: Optional[GachaProfile] = None,
+    ) -> bool:
+        """Grant Rudy coins for a qualifying message outside the gacha channel."""
+        if message.guild is None or message.author.bot:
+            return False
+        if not self._is_authorized_guild(message.guild):
+            return False
+        if profile is None:
+            profile = await self._fetch_profile(message.guild.id, message.author.id)
+        rewarded = await self._maybe_award_message_reward(profile, message.content or "")
+        if rewarded:
+            logger.debug(
+                "Awarded %s Rudy coins to %s in guild %s (channel %s)",
+                self.coin_earn_per_message,
+                message.author.id,
+                message.guild.id,
+                getattr(message.channel, "id", "dm"),
+            )
+        return rewarded
+
+    async def enforce_spam_policy(
+        self,
+        message: discord.Message,
+        *,
+        profile: Optional[GachaProfile] = None,
+    ) -> bool:
+        """Apply spam cooldown and penalties. Returns True if the message is allowed."""
+        if message.guild is None or message.author.bot:
+            return True
+        if not isinstance(message.channel, discord.TextChannel):
+            return True
+        if not self._is_authorized_guild(message.guild):
+            return True
+
+        now = utc_now()
+        spam_key = (message.guild.id, message.author.id)
+        record = self._spam_tracker.get(spam_key)
+        if record is None:
+            record = {
+                "messages": deque(maxlen=3),
+                "offenses": 0,
+                "cooldown_until": now - timedelta(seconds=1),
+            }
+            self._spam_tracker[spam_key] = record
+
+        if now < record["cooldown_until"]:
+            remaining = max(0, int((record["cooldown_until"] - now).total_seconds()))
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            await message.channel.send(
+                f"{message.author.mention}, you're still on cooldown for {remaining}s. Slow down!"
+            )
+            return False
+
+        normalized_content = re.sub(r"\s+", " ", message.content).strip().lower()
+        if not normalized_content:
+            return True
+
+        record["messages"].append(normalized_content)
+        if len(record["messages"]) < record["messages"].maxlen:
+            return True
+
+        if len(set(record["messages"])) != 1:
+            return True
+
+        record["messages"].clear()
+        record["offenses"] += 1
+        offense = record["offenses"]
+        if offense == 1:
+            cooldown = timedelta(seconds=10)
+            penalty = 0
+            penalty_text = "That's a warning."
+        elif offense == 2:
+            cooldown = timedelta(minutes=1)
+            penalty = 10
+            penalty_text = "Penalty: -10 Rudy coins."
+        else:
+            cooldown = timedelta(minutes=10)
+            penalty = 100
+            penalty_text = "Penalty: -100 Rudy coins."
+        record["cooldown_until"] = now + cooldown
+
+        if penalty > 0:
+            if profile is None:
+                profile = await self._fetch_profile(message.guild.id, message.author.id)
+            profile.rudy_coins = max(0, profile.rudy_coins - penalty)
+            await self._update_profile(profile)
+
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        await message.channel.send(
+            f"🚨 {message.author.mention}, you've been caught speeding! {penalty_text} "
+            f"Please wait {int(cooldown.total_seconds())}s before chatting again."
+        )
+        return False
+
+    async def user_has_equipped_character(self, guild_id: int, user_id: int) -> bool:
+        if self._allowed_guild_id and guild_id != self._allowed_guild_id:
+            return False
+        profile = await self._fetch_profile(guild_id, user_id)
+        return bool(profile.equipped_character)
+
+    async def _maybe_award_message_reward(self, profile: GachaProfile, content: str) -> bool:
+        text = content.strip()
+        if not text or not self._qualifies_for_reward(text):
+            return False
+        profile.rudy_coins += self.coin_earn_per_message
+        await self._update_profile(profile)
         return True
 
     def _qualifies_for_reward(self, content: str) -> bool:
@@ -1649,6 +1716,7 @@ class GachaManager:
                 f"• Use `!gacha` here in <#{self.channel_id}> to refresh this DM.\n"
                 f"• Equip a form with `!changeto <character> [pose/outfit]` (run it in <#{self.channel_id}>).\n"
                 "• Use `!unequip` any time (here or via DM) to return to your normal appearance.\n"
+                "• Equipped forms protect you from random TF rolls in the normal channel until you `!unequip`.\n"
                 "• Try `!roll character` or `!roll outfit` in this channel or DM me; DM rolls will be announced back in the gacha channel.\n"
                 f"• Chat as your equipped character in <#{self.channel_id}> with 3+ word sentences to earn {self.coin_earn_per_message} Rudy coins each time."
             ),
