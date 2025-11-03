@@ -626,19 +626,6 @@
       },
       "rarity": "common"
     },
-    "clausgb": {
-      "display_name": "Clausoko",
-      "poses": {
-        "a": {
-          "outfits": {
-            "skirt": {
-              "rarity": "common"
-            }
-          }
-        }
-      },
-      "rarity": "rare"
-    },
     "connie": {
       "display_name": "Connie Williams",
       "poses": {
@@ -1490,6 +1477,15 @@
             },
             "uniform": {
               "rarity": "common"
+            },
+            "genie": {
+              "rarity": "rare"
+            },
+            "pigtail_sexy": {
+              "rarity": "rare"
+            },
+            "pregnant": {
+              "rarity": "rare"
             }
           }
         },
@@ -1503,6 +1499,15 @@
             },
             "uniform": {
               "rarity": "common"
+            },
+            "genie": {
+              "rarity": "rare"
+            },
+            "pigtail_sexy": {
+              "rarity": "rare"
+            },
+            "pregnant": {
+              "rarity": "rare"
             }
           }
         }
@@ -3223,7 +3228,8 @@
             "nude": {
               "rarity": "common"
             }
-        },
+        }
+      },
         "b": {
           "outfits": {
             "leotard": {
@@ -3245,6 +3251,7 @@
             "base": {
               "rarity": "common"
             }
+          }
         }
       },
       "rarity": "epic"
@@ -3257,6 +3264,7 @@
             "skirt": {
               "rarity": "common"
             }
+          }
         }
       },
       "rarity": "epic"
@@ -3269,6 +3277,7 @@
             "zoomed": {
               "rarity": "common"
             }
+          }
         }
       },
       "rarity": "epic"
