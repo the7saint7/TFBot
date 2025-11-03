@@ -1195,7 +1195,7 @@ class GachaManager:
         total = sum(weights)
 
         # 🪶 Debug log: show all computed weights per rarity and per item
-        logger.debug(
+        logger.info(
             "[Gacha] Final boosted_rarities: %s | Per-item weights: %s | Total weight: %.2f",
             boosted_rarities,
             dict(zip([getattr(i, 'display_name', str(i)) for i in items], weights)),
@@ -1210,7 +1210,7 @@ class GachaManager:
         pick = random.uniform(0, total)
 
         # 🧭 Debug log: display the random number selected and its range
-        logger.debug(
+        logger.info(
             "[Gacha] Random pick: %.3f (range: 0–%.3f)", pick, total
         )
         
@@ -1219,7 +1219,7 @@ class GachaManager:
             cumulative += weight
             if pick <= cumulative:
                 # 🧩 Debug log: display which item was chosen and its stats
-                logger.debug(
+                logger.info(
                     "[Gacha] Selected item: %s | Rarity: %s | Weight: %.2f | "
                     "Cumulative: %.2f / %.2f | Pick: %.2f",
                     getattr(item, 'display_name', str(item)),
