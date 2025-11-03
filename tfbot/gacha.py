@@ -26,6 +26,22 @@ from tfbot.utils import float_from_env, int_from_env, path_from_env, utc_now
 
 logger = logging.getLogger("tfbot.gacha")
 
+# put this near the top of gacha.py (after the existing logger)
+logger = logging.getLogger("tfbot.gacha")
+
+# 👇 add this helper
+_roll_logger = logging.getLogger("tfbot.gacha.rolls")
+if not _roll_logger.handlers:
+    _roll_logger.setLevel(logging.DEBUG)          # lowest we care about
+    _roll_logger.propagate = False                # don't let the app mute us
+
+    _roll_handler = logging.StreamHandler()       # print to stdout
+    _roll_handler.setLevel(logging.DEBUG)
+    _roll_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    ))
+    _roll_logger.addHandler(_roll_handler)
+
 # Type aliases
 RelayCallback = Callable[[discord.Message, TransformationState], asyncio.Future]
 
@@ -169,15 +185,15 @@ class GachaManager:
             "TFBOT_GACHA_FROG_BOOST_ROLLS",
             int(self._config.get("frog_boost_rolls", 2)),
         )
-        boost_targets = self._config.get("frog_boost_targets", ["rare", "ultra"])
+        boost_targets = self._config.get("frog_boost_targets", ["rare", "epic"])
         if isinstance(boost_targets, (list, tuple)):
             self._boost_target_rarities = tuple(str(item).lower() for item in boost_targets if str(item).strip())
         else:
-            self._boost_target_rarities = ("rare", "ultra")
+            self._boost_target_rarities = ("rare", "epic")
         self._gacha_channel: Optional[discord.TextChannel] = None
 
     def _load_rarity_weights(self) -> Dict[str, float]:
-        default_weights = {"common": 70.0, "rare": 25.0, "ultra": 5.0}
+        default_weights = {"common": 70.0, "rare": 25.0, "epic": 5.0}
         config_weights = self._config.get("rarities")
         if isinstance(config_weights, Mapping):
             weights: Dict[str, float] = {}
@@ -1096,19 +1112,110 @@ class GachaManager:
         rarity_getter: Callable[[object], str],
         profile: GachaProfile,
     ):
+
+    
+        # No items, no roll.
         if not items:
             return None
-        weights = [self._rarity_weight(rarity_getter(item), profile) for item in items]
+
+        # 1) Figure out which rarities are actually present in THIS roll
+        #    (because the pool might not have every rarity every time).
+        #    For each rarity, start from the base config weight (e.g. 70/25/5).
+        rarities_in_pool: dict[str, float] = {}
+        for item in items:
+            rarity = (rarity_getter(item) or "common").lower()
+            base_weight = float(self._rarity_weights.get(rarity, 1.0))
+            rarities_in_pool[rarity] = base_weight
+
+        # Keep a copy to compare against later.
+        base_total = sum(rarities_in_pool.values())
+
+        # Start with boosted = base
+        boosted_rarities = dict(rarities_in_pool)
+
+        # 2) Apply a flat boost to target rarities, if the player has boosted rolls.
+        #    We treat profile.boost_bonus as "add this many points to each boosted rarity".
+        if profile.boost_rolls_remaining > 0:
+            flat_boost = max(float(profile.boost_bonus), 0.0)  # e.g. 25.0, not 0.25
+            if flat_boost > 0.0:
+                for rarity in boosted_rarities:
+                    if rarity in self._boost_target_rarities:
+                        boosted_rarities[rarity] = boosted_rarities[rarity] + flat_boost
+
+                # 3) If adding boosts made the total bigger than the original base total,
+                #    we need to *pull that excess out of common first* (your requirement).
+                boosted_total = sum(boosted_rarities.values())
+                overflow = boosted_total - base_total
+                if overflow > 0:
+                    # Drain "common" first, if we have it.
+                    if "common" in boosted_rarities:
+                        drain = min(overflow, boosted_rarities["common"])
+                        boosted_rarities["common"] -= drain
+                        overflow -= drain
+
+                    # If there's STILL overflow, drain it evenly from NON-boosted rarities.
+                    if overflow > 0:
+                        non_boosted = [
+                            r for r in boosted_rarities
+                            if r not in self._boost_target_rarities
+                        ]
+                        # (common might already be 0 here)
+                        if non_boosted:
+                            share = overflow / len(non_boosted)
+                            for r in non_boosted:
+                                boosted_rarities[r] = max(0.0, boosted_rarities[r] - share)
+                        # If we still somehow have overflow, we just live with small drift.
+
+        # 4) Now convert the per-rarity numbers back into per-item weights.
+        #    Every item of the same rarity gets the same final weight.
+        weights: list[float] = []
+        for item in items:
+            rarity = (rarity_getter(item) or "common").lower()
+            weight = boosted_rarities.get(rarity, 1.0)
+            weights.append(weight)
+
         total = sum(weights)
+
+        # 🪶 Debug log: show all computed weights per rarity and per item
+        _roll_logger.info(
+            "[Gacha] Final boosted_rarities: %s | Per-item weights: %s | Total weight: %.2f",
+            boosted_rarities,
+            dict(zip([getattr(i, 'display_name', str(i)) for i in items], weights)),
+            total,
+        )
+
+        # Safety: if something went sideways, fall back to uniform.
         if total <= 0:
             return random.choice(items)
+
+        # 5) Standard roulette-wheel selection with the (now redistributed) weights.
         pick = random.uniform(0, total)
+
+        # 🧭 Debug log: display the random number selected and its range
+        _roll_logger.info(
+            "[Gacha] Random pick: %.3f (range: 0–%.3f)", pick, total
+        )
+        
         cumulative = 0.0
         for item, weight in zip(items, weights):
             cumulative += weight
             if pick <= cumulative:
+                # 🧩 Debug log: display which item was chosen and its stats
+                _roll_logger.info(
+                    "[Gacha] Selected item: %s | Rarity: %s | Weight: %.2f | "
+                    "Cumulative: %.2f / %.2f | Pick: %.2f",
+                    getattr(item, 'display_name', str(item)),
+                    (rarity_getter(item) or 'common').lower(),
+                    weight,
+                    cumulative,
+                    total,
+                    pick,
+                )
                 return item
+
+        # Fallback for floating point edge cases.
         return items[-1]
+
 
     def _consume_boost(self, profile: GachaProfile) -> None:
         if profile.boost_rolls_remaining > 0:
@@ -1240,21 +1347,34 @@ class GachaManager:
         user_id: int,
         profile: GachaProfile,
     ) -> Tuple[GachaCharacterDef, Optional[GachaOutfitDef], bool, bool]:
+        # Get the list of all characters available in the gacha catalog.
         catalog = self._available_characters()
+
+        # Choose one character at random, weighted by rarity probabilities.
+        # Rarer characters have lower base odds unless boosted by the user's profile.
         choice = self._weighted_choice(catalog, rarity_getter=lambda item: item.rarity, profile=profile)
         if choice is None:
             raise RuntimeError("No characters available for gacha roll.")
 
+        # Get all outfits the player currently owns for this chosen character.
         owned_map = await self._list_owned_outfits(guild_id, user_id, choice.display_name)
         owned_for_character = owned_map.get(choice.display_name, {})
+
+        # Select one outfit to award with this character roll.
+        # Prefers unowned outfits and defaults to a “common” one if available.
         awarded_outfit = self._select_awarded_outfit(choice, owned_for_character)
 
+        # Try adding the character to the player’s collection.
+        # Returns True if it’s new, False if the player already had it.
         is_new_character = await self._add_character(guild_id, user_id, choice.display_name, choice.rarity)
         if not is_new_character:
+            # Duplicate character → reward frog coins as compensation.
             profile.frog_coins += self.duplicate_character_frog
 
         outfit_new = False
         if awarded_outfit is not None:
+            # Try adding the outfit to the player’s inventory.
+            # Returns True if it’s new, False if it’s a duplicate.
             outfit_new = await self._add_outfit(
                 guild_id,
                 user_id,
@@ -1263,8 +1383,17 @@ class GachaManager:
                 awarded_outfit.rarity,
             )
 
+        # Consume a “boosted roll” if the player had an active frog boost.
         self._consume_boost(profile)
+
+        # Update the player’s profile in the database with new coins/boosts etc.
         await self._update_profile(profile)
+
+        # Return:
+        #   - the character rolled
+        #   - the outfit awarded
+        #   - whether the character was new
+        #   - whether the outfit was new
         return choice, awarded_outfit, is_new_character, outfit_new
 
     async def _perform_outfit_roll(

@@ -3287,12 +3287,12 @@
   "frog_boost_rolls": 2,
   "frog_boost_targets": [
     "rare",
-    "ultra"
+    "epic"
   ],
   "rarities": {
     "common": 70,
     "rare": 25,
-    "ultra": 5
+    "epic": 5
   },
   "starter_characters": [],
   "starter_outfits": {},
