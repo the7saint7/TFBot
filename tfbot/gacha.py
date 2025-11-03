@@ -1194,16 +1194,41 @@ class GachaManager:
 
         total = sum(weights)
 
+        # 🪶 Debug log: show all computed weights per rarity and per item
+        logger.debug(
+            "[Gacha] Final boosted_rarities: %s | Per-item weights: %s | Total weight: %.2f",
+            boosted_rarities,
+            dict(zip([getattr(i, 'display_name', str(i)) for i in items], weights)),
+            total,
+        )
+
         # Safety: if something went sideways, fall back to uniform.
         if total <= 0:
             return random.choice(items)
 
         # 5) Standard roulette-wheel selection with the (now redistributed) weights.
         pick = random.uniform(0, total)
+
+        # 🧭 Debug log: display the random number selected and its range
+        logger.debug(
+            "[Gacha] Random pick: %.3f (range: 0–%.3f)", pick, total
+        )
+        
         cumulative = 0.0
         for item, weight in zip(items, weights):
             cumulative += weight
             if pick <= cumulative:
+                # 🧩 Debug log: display which item was chosen and its stats
+                logger.debug(
+                    "[Gacha] Selected item: %s | Rarity: %s | Weight: %.2f | "
+                    "Cumulative: %.2f / %.2f | Pick: %.2f",
+                    getattr(item, 'display_name', str(item)),
+                    (rarity_getter(item) or 'common').lower(),
+                    weight,
+                    cumulative,
+                    total,
+                    pick,
+                )
                 return item
 
         # Fallback for floating point edge cases.
