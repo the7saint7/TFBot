@@ -109,6 +109,7 @@ if BOT_MODE == "gacha" and not GACHA_ENABLED:
 if not CLASSIC_ENABLED and not GACHA_ENABLED:
     raise RuntimeError("Configure at least TFBOT_CHANNEL_ID or TFBOT_GACHA_CHANNEL_ID.")
 TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
+TF_ARCHIVE_CHANNEL_ID = int_from_env("TFBOT_ARCHIVE_CHANNEL_ID", 0)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
 MESSAGE_STYLE = os.getenv(
@@ -742,6 +743,10 @@ async def relay_transformed_message(
     if not preserve_original:
         deleted = True
         try:
+            await archive_original_message(message)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to archive message %s: %s", message.id, exc)
+        try:
             await message.delete()
         except discord.Forbidden:
             deleted = False
@@ -815,6 +820,64 @@ async def send_history_message(title: str, description: str) -> None:
     except discord.HTTPException as exc:
         logger.warning("Failed to send history message: %s", exc)
     schedule_history_refresh()
+
+
+async def archive_original_message(message: discord.Message) -> None:
+    if TF_ARCHIVE_CHANNEL_ID <= 0:
+        return
+
+    archive_channel = None
+    if message.guild is not None:
+        archive_channel = message.guild.get_channel(TF_ARCHIVE_CHANNEL_ID)
+    if archive_channel is None:
+        archive_channel = bot.get_channel(TF_ARCHIVE_CHANNEL_ID)
+    if archive_channel is None:
+        try:
+            archive_channel = await bot.fetch_channel(TF_ARCHIVE_CHANNEL_ID)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("Cannot access archive channel %s: %s", TF_ARCHIVE_CHANNEL_ID, exc)
+            return
+
+    if archive_channel is None or not hasattr(archive_channel, "send"):
+        logger.debug("Archive channel %s unavailable or not messageable.", TF_ARCHIVE_CHANNEL_ID)
+        return
+
+    created_at = message.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+
+    author_name = getattr(message.author, "display_name", str(message.author))
+    author_id = getattr(message.author, "id", "unknown")
+    channel_value = getattr(message.channel, "mention", f"#{getattr(message.channel, 'id', 'unknown')}")
+    jump_link = getattr(message, "jump_url", None)
+
+    embed = discord.Embed(
+        title="Archived TF Message",
+        description=message.content or "*no message content*",
+        color=0x546E7A,
+        timestamp=created_at,
+    )
+    embed.add_field(name="Author", value=f"{author_name} (`{author_id}`)", inline=False)
+    embed.add_field(name="Channel", value=str(channel_value), inline=False)
+    embed.add_field(name="Message ID", value=str(message.id), inline=False)
+    if jump_link:
+        embed.add_field(name="Jump Link", value=jump_link, inline=False)
+
+    avatar_asset = getattr(message.author, "display_avatar", None)
+    avatar_url = getattr(avatar_asset, "url", None)
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
+    attachments = [attachment.url for attachment in message.attachments]
+    if attachments:
+        embed.add_field(name="Attachments", value="\n".join(attachments), inline=False)
+
+    try:
+        await archive_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden as exc:
+        logger.warning("Forbidden to send archive message for %s: %s", message.id, exc)
+    except discord.HTTPException as exc:
+        logger.warning("Failed to send archive message for %s: %s", message.id, exc)
 
 
 def _format_character_message(
