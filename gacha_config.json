@@ -3269,6 +3269,11 @@
       },
       "rarity": "epic"
     },
+    "narrator": {
+      "display_name": "Narrator",
+      "poses": {},
+      "rarity": "epic"
+    },
     "yuigyaru": {
       "display_name": "Yui Gyaru",
       "poses": {

@@ -107,6 +107,45 @@ else:
     VN_CACHE_DIR = None
 
 VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
+_VN_LAYOUT_FILE_SETTING = os.getenv("TFBOT_VN_LAYOUTS", "vn_layouts.json").strip()
+VN_LAYOUT_FILE = Path(_VN_LAYOUT_FILE_SETTING) if _VN_LAYOUT_FILE_SETTING else None
+
+
+def _normalize_layout_key(value: str) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _load_panel_layout_overrides() -> Dict[str, Dict]:
+    if VN_LAYOUT_FILE is None or not VN_LAYOUT_FILE.exists():
+        return {}
+    try:
+        data = json.loads(VN_LAYOUT_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        logger.warning("VN panel: failed to parse %s: %s", VN_LAYOUT_FILE, exc)
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("VN panel: layout file %s must contain an object.", VN_LAYOUT_FILE)
+        return {}
+    normalized: Dict[str, Dict] = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        normalized_key = _normalize_layout_key(str(key))
+        if normalized_key:
+            normalized[normalized_key] = value
+    return normalized
+
+
+_PANEL_LAYOUT_OVERRIDES: Dict[str, Dict] = _load_panel_layout_overrides()
+
+
+def resolve_panel_layout(character_name: str) -> Optional[Dict]:
+    key = _normalize_layout_key(character_name)
+    if not key:
+        return None
+    return _PANEL_LAYOUT_OVERRIDES.get(key)
 
 vn_outfit_selection: Dict[str, Dict[str, str]] = {}
 background_selections: Dict[str, str] = {}
@@ -652,6 +691,9 @@ def compose_game_avatar(
     pose_override: Optional[str] = None,
     outfit_override: Optional[str] = None,
 ) -> Optional["Image.Image"]:
+    layout = resolve_panel_layout(character_name)
+    if layout and layout.get("disable_avatar"):
+        return None
     if VN_ASSET_ROOT is None:
         return None
     try:
@@ -1566,19 +1608,37 @@ def render_vn_panel(
     except ImportError:
         return None
 
-    if not VN_BASE_IMAGE.exists():
-        logger.warning("VN panel: base image missing at %s", VN_BASE_IMAGE)
+    layout = resolve_panel_layout(state.character_name) or {}
+
+    base_image_path = VN_BASE_IMAGE
+    base_override = layout.get("base_image")
+    if isinstance(base_override, str) and base_override.strip():
+        candidate = Path(base_override.strip())
+        if not candidate.is_absolute():
+            from_base = (BASE_DIR / candidate).resolve()
+            from_assets = (VN_BASE_IMAGE.parent / candidate).resolve()
+            candidate = from_base if from_base.exists() else from_assets
+        if candidate.exists():
+            base_image_path = candidate
+        else:
+            logger.warning(
+                "VN panel: custom base image %s missing for %s",
+                candidate,
+                state.character_name,
+            )
+
+    if not base_image_path.exists():
+        logger.warning("VN panel: base image missing at %s", base_image_path)
         return None
 
     try:
-        with Image.open(VN_BASE_IMAGE) as base_image:
+        with Image.open(base_image_path) as base_image:
             base = base_image.convert("RGBA")
     except OSError as exc:
-        logger.warning("VN panel: failed to open base image %s: %s", VN_BASE_IMAGE, exc)
+        logger.warning("VN panel: failed to open base image %s: %s", base_image_path, exc)
         return None
 
     assets = _get_overlay_assets()
-
     border_img = None
     if gacha_border:
         border_key = f"border_{gacha_border.lower()}"
@@ -1586,22 +1646,50 @@ def render_vn_panel(
         if border_src is not None:
             border_img = border_src.resize(base.size, Image.LANCZOS)
 
-    name_box = (180, 10, 193, 26)
-    text_box = (188, 80, 765, 250)
-    name_padding = 10
-    text_padding = 12
-    avatar_box = (0, 4, 220, 250)
-    avatar_width = avatar_box[2] - avatar_box[0]
-    avatar_height = avatar_box[3] - avatar_box[1]
+    def _resolve_box(setting: Optional[Sequence[int]], fallback: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        if isinstance(setting, (list, tuple)) and len(setting) == 4:
+            try:
+                return tuple(int(value) for value in setting)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
+        return fallback
+
+    def _resolve_int(setting: Optional[object], fallback: int) -> int:
+        try:
+            return int(setting)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return fallback
+
+    name_box = _resolve_box(layout.get("name_box"), (180, 10, 193, 26))
+    text_box = _resolve_box(layout.get("text_box"), (188, 80, 765, 250))
+    name_padding = _resolve_int(layout.get("name_padding"), 10)
+    text_padding = _resolve_int(layout.get("text_padding"), 12)
+
+    avatar_box: Optional[Tuple[int, int, int, int]] = (0, 4, 220, 250)
+    if layout.get("disable_avatar"):
+        avatar_box = None
+    elif "avatar_box" in layout:
+        value = layout.get("avatar_box")
+        if value is None:
+            avatar_box = None
+        else:
+            avatar_box = _resolve_box(value, (0, 4, 220, 250))
+
+    avatar_width = avatar_height = 0
+    if avatar_box:
+        avatar_width = avatar_box[2] - avatar_box[0]
+        avatar_height = avatar_box[3] - avatar_box[1]
 
     draw = ImageDraw.Draw(base)
 
-    avatar_image = compose_game_avatar(
-        state.character_name,
-        pose_override=gacha_pose_override,
-        outfit_override=gacha_outfit_override,
-    )
-    if avatar_image is not None:
+    avatar_image = None
+    if avatar_box:
+        avatar_image = compose_game_avatar(
+            state.character_name,
+            pose_override=gacha_pose_override,
+            outfit_override=gacha_outfit_override,
+        )
+    if avatar_image is not None and avatar_box:
         cropped = _crop_transparent_vertical(avatar_image)
         base_scale = max(VN_AVATAR_SCALE, 0.01)
         if base_scale != 1.0:
@@ -1636,7 +1724,7 @@ def render_vn_panel(
             base_scale,
             fit_scale,
         )
-    else:
+    elif avatar_box:
         logger.warning(
             "VN sprite: no avatar rendered for %s (mode=%s)",
             state.character_name,
@@ -2005,6 +2093,7 @@ __all__ = [
     "get_selected_background_path",
     "set_selected_background",
     "compose_background_layer",
+    "resolve_panel_layout",
     "compose_game_avatar",
     "resolve_character_directory",
     "resolve_character_name_color",
@@ -2024,5 +2113,3 @@ __all__ = [
     "fetch_avatar_bytes",
     "prepare_custom_emoji_images",
 ]
-
-
