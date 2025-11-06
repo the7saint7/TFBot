@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -13,17 +14,20 @@ logger = logging.getLogger("tfbot.state")
 
 TF_STATE_FILE: Optional[Path] = None
 TF_STATS_FILE: Optional[Path] = None
+TF_REROLL_FILE: Optional[Path] = None
 
 active_transformations: Dict[TransformKey, TransformationState] = {}
 revert_tasks: Dict[TransformKey, asyncio.Task] = {}
 tf_stats: Dict[str, Dict[str, Dict[str, object]]] = {}
+reroll_cooldowns: Dict[str, Dict[str, str]] = {}
 STATE_RESTORED = False
 
 
-def configure_state(*, state_file: Path, stats_file: Path) -> None:
-    global TF_STATE_FILE, TF_STATS_FILE
+def configure_state(*, state_file: Path, stats_file: Path, reroll_file: Optional[Path] = None) -> None:
+    global TF_STATE_FILE, TF_STATS_FILE, TF_REROLL_FILE
     TF_STATE_FILE = state_file
     TF_STATS_FILE = stats_file
+    TF_REROLL_FILE = reroll_file
 
 
 def state_key(guild_id: int, user_id: int) -> TransformKey:
@@ -138,6 +142,44 @@ def increment_tf_stats(guild_id: int, user_id: int, character_name: str) -> None
     persist_stats()
 
 
+def load_reroll_cooldowns_from_disk() -> Dict[str, Dict[str, str]]:
+    if TF_REROLL_FILE is None or not TF_REROLL_FILE.exists():
+        return {}
+    try:
+        data = json.loads(TF_REROLL_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse %s: %s", TF_REROLL_FILE, exc)
+    return {}
+
+
+def persist_reroll_cooldowns() -> None:
+    if TF_REROLL_FILE is None:
+        raise RuntimeError("Reroll file not configured. Call configure_state first.")
+    TF_REROLL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TF_REROLL_FILE.write_text(json.dumps(reroll_cooldowns, indent=2), encoding="utf-8")
+
+
+def get_last_reroll_timestamp(guild_id: int, user_id: int) -> Optional[datetime]:
+    guild_data = reroll_cooldowns.get(str(guild_id))
+    if not isinstance(guild_data, dict):
+        return None
+    raw_value = guild_data.get(str(user_id))
+    if not raw_value:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw_value))
+    except ValueError:
+        return None
+
+
+def record_reroll_timestamp(guild_id: int, user_id: int, when: datetime) -> None:
+    guild_data = reroll_cooldowns.setdefault(str(guild_id), {})
+    guild_data[str(user_id)] = when.isoformat()
+    persist_reroll_cooldowns()
+
+
 __all__ = [
     "STATE_RESTORED",
     "active_transformations",
@@ -145,12 +187,17 @@ __all__ = [
     "deserialize_state",
     "find_active_transformation",
     "increment_tf_stats",
+    "load_reroll_cooldowns_from_disk",
     "load_states_from_disk",
     "load_stats_from_disk",
     "persist_states",
     "persist_stats",
+    "persist_reroll_cooldowns",
+    "record_reroll_timestamp",
+    "get_last_reroll_timestamp",
     "revert_tasks",
     "serialize_state",
     "state_key",
     "tf_stats",
+    "reroll_cooldowns",
 ]

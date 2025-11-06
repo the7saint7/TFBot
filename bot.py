@@ -40,11 +40,15 @@ from tfbot.state import (
     active_transformations,
     configure_state,
     find_active_transformation,
+    get_last_reroll_timestamp,
     increment_tf_stats,
+    load_reroll_cooldowns_from_disk,
     load_states_from_disk,
     load_stats_from_disk,
     persist_states,
     persist_stats,
+    record_reroll_timestamp,
+    reroll_cooldowns,
     tf_stats,
     revert_tasks,
     state_key,
@@ -112,6 +116,7 @@ TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 143219631772297
 TF_ARCHIVE_CHANNEL_ID = int_from_env("TFBOT_ARCHIVE_CHANNEL_ID", 0)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
+TF_REROLL_FILE = Path(os.getenv("TFBOT_REROLL_FILE", "tf_reroll.json"))
 MESSAGE_STYLE = os.getenv(
     "TFBOT_MESSAGE_STYLE",
     "vn" if GACHA_ENABLED else "classic",
@@ -129,8 +134,9 @@ REQUIRED_GUILD_PERMISSIONS = {
 MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 
-configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE)
+configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE, reroll_file=TF_REROLL_FILE)
 tf_stats.update(load_stats_from_disk())
+reroll_cooldowns.update(load_reroll_cooldowns_from_disk())
 
 INANIMATE_DATA_FILE = Path(os.getenv("TFBOT_INANIMATE_FILE", "tf_inanimate.json")).expanduser()
 INANIMATE_TF_CHANCE = float(os.getenv("TFBOT_INANIMATE_CHANCE", "0"))
@@ -1154,11 +1160,13 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
-    if not is_admin(author):
-        await ctx.reply("You lack permission to run this command.", mention_author=False)
-        return None
+    author_is_admin = is_admin(author)
 
     guild = ctx.guild
+    if guild is None:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return None
+    now = utc_now()
     target_member: Optional[discord.Member] = None
     state: Optional[TransformationState] = None
 
@@ -1166,10 +1174,18 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     forced_inanimate: Optional[Dict[str, object]] = None
 
     query = args.strip()
+    forced_token: Optional[str] = None
     if query:
         parts = query.split()
         first_token = parts[0].lower()
-        forced_token = parts[1].lower() if len(parts) > 1 else None
+        if len(parts) > 1:
+            if not author_is_admin:
+                await ctx.reply(
+                    "Only admins can force a reroll into a specific form.",
+                    mention_author=False,
+                )
+                return None
+            forced_token = parts[1].lower()
 
         matching_states = [
             s
@@ -1223,6 +1239,13 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
             return None
 
+        if not author_is_admin and target_member.id == author.id:
+            await ctx.reply(
+                "You can't use your reroll on yourself. Ask another player to reroll you instead.",
+                mention_author=False,
+            )
+            return None
+
         if forced_token:
             forced_character = next(
                 (
@@ -1250,6 +1273,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 )
                 return None
     else:
+        if not author_is_admin:
+            await ctx.reply(
+                "You need to specify someone to reroll, e.g. `!reroll charname`.",
+                mention_author=False,
+            )
+            return None
         target_member = author
         key = state_key(guild.id, target_member.id)
         state = active_transformations.get(key)
@@ -1274,6 +1303,29 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         for current_key, current_state in active_transformations.items()
         if current_key != key
     }
+
+    if not author_is_admin:
+        last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
+        if last_reroll_at is not None:
+            cooldown_end = last_reroll_at + timedelta(hours=24)
+            if cooldown_end > now:
+                remaining = cooldown_end - now
+                remaining_seconds = max(int(remaining.total_seconds()), 0)
+                hours, remainder = divmod(remaining_seconds, 3600)
+                minutes = remainder // 60
+                if hours and minutes:
+                    when_text = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+                elif hours:
+                    when_text = f"{hours} hour{'s' if hours != 1 else ''}"
+                elif minutes:
+                    when_text = f"{minutes} minute{'s' if minutes != 1 else ''}"
+                else:
+                    when_text = "less than a minute"
+                await ctx.reply(
+                    f"You've already used your reroll. You can reroll again in {when_text}.",
+                    mention_author=False,
+                )
+                return None
 
     forced_mode = forced_character is not None or forced_inanimate is not None
 
@@ -1340,10 +1392,25 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     state.avatar_applied = False
     state.is_inanimate = new_is_inanimate
     state.inanimate_responses = new_responses
+
+    if not author_is_admin:
+        guaranteed_duration = timedelta(hours=10)
+        state.started_at = now
+        state.expires_at = now + guaranteed_duration
+        state.duration_label = "10 hours"
+        existing_task = revert_tasks.get(key)
+        if existing_task:
+            existing_task.cancel()
+        revert_tasks[key] = asyncio.create_task(
+            _schedule_revert(state, guaranteed_duration.total_seconds())
+        )
+
     persist_states()
 
     if not new_is_inanimate:
         increment_tf_stats(guild.id, target_member.id, new_name)
+    if not author_is_admin:
+        record_reroll_timestamp(guild.id, author.id, now)
 
     history_details = (
         f"Triggered by: **{author.display_name}**\n"
@@ -1371,13 +1438,19 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             new_name,
         )
     else:
-        response_text = _format_character_message(
+        base_message = _format_character_message(
             new_message,
             original_name,
             target_member.mention,
             state.duration_label,
             new_name,
         )
+        if author_is_admin:
+            response_text = base_message
+        else:
+            response_text = (
+                f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
+            )
     emoji_prefix = _get_magic_emoji(guild)
     try:
         await ctx.channel.send(
