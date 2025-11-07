@@ -1828,6 +1828,15 @@ class GachaManager:
         ) -> None:
             await self.command_give_coins(ctx, member, amount)
 
+        @commands.command(name="givecharacter")
+        async def gacha_givecharacter(
+            ctx: commands.Context,
+            member: Optional[discord.Member] = None,
+            *,  # allow multi-word names
+            character_name: str = "",
+        ) -> None:
+            await self.command_give_character(ctx, member, character_name)
+
         @commands.command(name="frogboost")
         async def gacha_frogboost(ctx: commands.Context) -> None:
             await self.command_frogboost(ctx)
@@ -1847,6 +1856,7 @@ class GachaManager:
         self._register_command(gacha_roll)
         self._register_command(gacha_frogtrade)
         self._register_command(gacha_givecoins)
+        self._register_command(gacha_givecharacter)
         self._register_command(gacha_frogboost)
         self._register_command(gacha_roster)
         self._register_command(gacha_reset)
@@ -1866,6 +1876,7 @@ class GachaManager:
             "- `!frogtrade <amount>` - Convert frog coins into Rudy coins.",
             "- `!frogboost` - Spend frog coins to boost rare pull odds for a few rolls.",
             "- `!givecoins @user [amount]` - (Admins) Grant Rudy coins to a player.",
+            "- `!givecharacter @user <name>` - (Admins) Grant a character plus a common outfit if available.",
         ]
         message = "\n".join(lines)
         try:
@@ -2373,6 +2384,88 @@ class GachaManager:
             try:
                 await member.send(
                     f"You received {qty} Rudy coins from a server admin in {ctx.guild.name}."
+                )
+            except discord.Forbidden:
+                pass
+
+    async def command_give_character(
+        self,
+        ctx: commands.Context,
+        member: Optional[discord.Member],
+        character_query: str,
+    ) -> None:
+        if ctx.guild is None:
+            await ctx.reply("Run this command inside the server.", mention_author=False)
+            return
+        if member is None or not character_query.strip():
+            await ctx.reply("Usage: `!givecharacter @user <character name>`", mention_author=False)
+            return
+        invoker = ctx.author if isinstance(ctx.author, discord.Member) else None
+        if invoker is None or not is_admin(invoker):
+            await ctx.reply("Only a server administrator can grant characters manually.", mention_author=False)
+            return
+        if member.bot:
+            await ctx.reply("Bots don't need gacha characters.", mention_author=False)
+            return
+
+        character = self._lookup_character(character_query.strip())
+        if character is None:
+            await ctx.reply(f"I couldn't find a character matching `{character_query}`.", mention_author=False)
+            return
+
+        added_character = await self._add_character(
+            ctx.guild.id,
+            member.id,
+            character.display_name,
+            character.rarity,
+        )
+
+        awarded_outfit: Optional[GachaOutfitDef] = None
+        common_outfits = [
+            outfit
+            for outfit in character.outfits.values()
+            if (outfit.rarity or "common").lower() == "common"
+        ]
+        if common_outfits:
+            owned_map = await self._list_owned_outfits(ctx.guild.id, member.id, character.display_name)
+            owned_for_character = owned_map.get(character.display_name, {})
+            common_outfits.sort(key=lambda combo: combo.label.lower())
+            for outfit in common_outfits:
+                if outfit.key in owned_for_character:
+                    continue
+                outfit_added = await self._add_outfit(
+                    ctx.guild.id,
+                    member.id,
+                    character.display_name,
+                    outfit.key,
+                    outfit.rarity,
+                )
+                if outfit_added:
+                    awarded_outfit = outfit
+                    break
+
+        lines = []
+        rarity_label = (character.rarity or "common").title()
+        if added_character:
+            lines.append(
+                f"Granted **{character.display_name}** ({rarity_label}) to {member.mention}."
+            )
+        else:
+            lines.append(
+                f"{member.mention} already owns **{character.display_name}**, but the request was processed."
+            )
+        if awarded_outfit:
+            lines.append(f"Also granted outfit **{awarded_outfit.label}**.")
+        elif common_outfits:
+            lines.append("They already own all common outfits for that character.")
+        else:
+            lines.append("That character has no common outfits to grant.")
+
+        await ctx.reply("\n".join(lines), mention_author=False)
+        if member.id != ctx.author.id:
+            try:
+                await member.send(
+                    f"You received **{character.display_name}** from an admin in {ctx.guild.name}."
                 )
             except discord.Forbidden:
                 pass
