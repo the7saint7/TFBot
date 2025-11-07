@@ -340,5 +340,37 @@ TF_CHARACTERS = [
         "avatar_path": "",
         "message": " found a microphone on the ground. A flash of light, a trapped glyph on the side and soon the air rippled like the start of a dream, and their body faded into sound. No hands. No face. Just a smooth, commanding voice echoing through the air. Every word they spoke bent reality a little, made people move, talk, blush—just because they said so. They weren’t part of the story anymore. They were the one telling it."
     },
+
+    {
+        "name": "Youko (SpringBreak)",
+        "avatar_path": "avatars/youko.webp",
+        "message": "thumbs the rhinestone phone charm Syn hexed, and a warm buzz pours through them. Hair falls glossy, jewelry seems to gleam hotter, and their mood tilts queen-bee—casual, flirty, and absolutely sure the room will orbit."
+    },
+    {
+        "name": "Ririsa (SpringBreak)",
+        "avatar_path": "avatars/ririsa.webp",
+        "message": "snaps a stubborn hairclip that Syn primed, and a tiny spark runs along their scalp. Lines go crisp, posture precise, and their voice sharpens into cool, organized bite—half sass, half ‘don’t waste my time.’"
+    },
+    {
+        "name": "Nikki (SpringBreak)",
+        "avatar_path": "avatars/nikki.png",
+        "message": "tightens a hand-wrap inked with Syn’s rune, and heat spikes up their arms. Their stance squares, muscles wake, and a reckless, competitive grin settles in like they were born to throw the first punch and win the last word."
+    },
+    {
+        "name": "HollyBimbo (SpringBreak)",
+        "avatar_path": "avatars/hollyBimbo.png",
+        "message": "dabs a gloss from a tube Syn ‘enchanted,’ and a fizzy warmth blooms behind their smile. Thoughts go bubbly, body language turns luxe and inviting, and suddenly everything feels like a spotlight flirting back."
+    },
+    {
+        "name": "YuiBimbo (SpringBreak)",
+        "avatar_path": "avatars/yuiBimbo.png",
+        "message": "pops open a compact with a pink kiss-rune, and a sweet shimmer rolls down their cheeks. Their giggle hangs bright, their pose goes playful, and they can’t help batting lashes like teasing is a love language."
+    },
+    {
+        "name": "JanePunk (SpringBreak)",
+        "avatar_path": "avatars/janePunk.png",
+        "message": "buckles a studded cuff that hums with Syn’s mischief, and a bassline thrums under their skin. Their smirk sharpens, rules feel optional, and a delicious urge to start trouble (and finish it) takes the lead."
+    }
+
 ]
 

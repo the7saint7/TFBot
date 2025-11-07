@@ -177,7 +177,49 @@ def _default_inanimate_forms() -> Tuple[Dict[str, object], ...]:
     )
 
 
+def _load_inanimate_forms_from_gacha() -> Tuple[Dict[str, object], ...]:
+    config_path = path_from_env("TFBOT_GACHA_CONFIG") or Path("gacha_config.json")
+    if not config_path.exists():
+        return ()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        logger.warning("Failed to parse gacha config %s (%s); skipping inanimate import.", config_path, exc)
+        return ()
+    characters = payload.get("characters")
+    if not isinstance(characters, dict):
+        return ()
+    forms: list[Dict[str, object]] = []
+    for entry in characters.values():
+        if not isinstance(entry, dict) or not entry.get("inanimate"):
+            continue
+        name = str(entry.get("display_name") or entry.get("name") or "").strip()
+        message = str(entry.get("message") or "").strip()
+        avatar_path = str(entry.get("avatar_path") or "").strip()
+        if not name or not message:
+            continue
+        responses_field = entry.get("responses") or []
+        if isinstance(responses_field, list):
+            responses = [str(item).strip() for item in responses_field if str(item).strip()]
+        else:
+            responses = []
+        if not responses:
+            responses = [message]
+        forms.append(
+            {
+                "name": name,
+                "avatar_path": avatar_path,
+                "message": message,
+                "responses": responses,
+            }
+        )
+    return tuple(forms)
+
+
 def _load_inanimate_forms() -> Tuple[Dict[str, object], ...]:
+    from_gacha = _load_inanimate_forms_from_gacha()
+    if from_gacha:
+        return from_gacha
     if not INANIMATE_DATA_FILE.exists():
         logger.info("Inanimate TF file %s not found; using defaults.", INANIMATE_DATA_FILE)
         return _default_inanimate_forms()

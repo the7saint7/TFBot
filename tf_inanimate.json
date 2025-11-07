@@ -46,5 +46,29 @@
       "The chair tilts ever so slightly, as if sighing in quiet defeat.",
       "A muffled groan seems to come from somewhere deep inside the upholstery."
     ]
-  }
+  },
+  {
+    "name": "Dress",
+    "avatar_path": "avatars/dress.png",
+    "message": "A flash of glittering light wraps around them, soft fabric swallowing their body until they’re gone. When the sparkles fade, all that’s left is a short, tight pink minidress draped over a chair—smooth, silky, and still faintly warm. They can feel every brush of air, every curious hand testing the fabric, helpless to move or speak as giggles echo around the room.",
+    "responses": [
+      "The dress flutters faintly, as if breathing.",
+      "A ripple runs through the fabric—soft, quick, almost like a shiver.",
+      "For a second, the dress tightens, clinging to invisible curves before going still again.",
+      "The silky hem twitches, a tiny motion no one seems to notice.",
+      "A faint, embarrassed warmth radiates from the smooth pink fabric."
+    ]
+  },
+  {
+    "name": "Panties",
+    "avatar_path": "avatars/panties.png",
+    "message": "A teasing giggle and a flash of pink magic—and suddenly they’re shrinking fast. Their body folds and twists, soft cotton replacing skin until there’s nothing left but a delicate pair of pink panties lying on the floor. They can’t move, can’t cry out, only sense warmth and motion when someone picks them up, stretching them between their fingers with a curious smile.",
+    "responses": [
+      "The panties twitch faintly, like they just took a tiny breath.",
+      "A soft ripple moves through the waistband, then fades.",
+      "The fabric quivers in someone’s hand, warm to the touch.",
+      "A faint, invisible sigh escapes as the panties settle back into place.",
+      "The delicate cloth trembles briefly, as if trying to wriggle free."
+    ]
+  }  
 ]

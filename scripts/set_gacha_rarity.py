@@ -5,6 +5,7 @@ RATING_MAP = {
     "1": "common",
     "2": "rare",
     "3": "epic",
+    "4": "ultra",
 }
 
 
@@ -16,7 +17,7 @@ def prompt_choice(display_name: str, current: str) -> str:
         rarity = RATING_MAP.get(choice)
         if rarity:
             return rarity
-        print("Please enter 1 (common), 2 (rare), 3 (epic), or press Enter to keep current.")
+        print("Please enter 1 (common), 2 (rare), 3 (epic), 4 (ultra), or press Enter to keep current.")
 
 
 def main() -> None:
@@ -29,7 +30,7 @@ def main() -> None:
     if not isinstance(characters, dict):
         raise SystemExit("Invalid config: 'characters' must be an object.")
 
-    print("Assign rarity for each character: 1=common, 2=rare, 3=epic (Enter to keep current).")
+    print("Assign rarity for each character: 1=common, 2=rare, 3=epic, 4=ultra (Enter to keep current).")
 
     for slug, entry in sorted(characters.items()):
         if not isinstance(entry, dict):

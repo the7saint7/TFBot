@@ -2,7 +2,8 @@
   "rarities": {
     "common": 70,
     "rare": 25,
-    "epic": 5
+    "epic": 4,
+    "ultra": 1
   },
   "starter_rarities": ["common"],
   "starter_characters": ["Allison Stein", "Alex Hawkins"],
@@ -12,7 +13,7 @@
   },
   "frog_boost_bonus": 0.15,
   "frog_boost_rolls": 2,
-  "frog_boost_targets": ["rare", "epic"],
+  "frog_boost_targets": ["rare", "epic", "ultra"],
   "characters": {
     "allison": {
       "display_name": "Allison Stein",
@@ -25,6 +26,9 @@
             },
             "party": {
               "rarity": "rare"
+            },
+            "gala": {
+              "rarity": "ultra"
             }
           }
         }
@@ -41,6 +45,9 @@
             },
             "dress": {
               "rarity": "epic"
+            },
+            "wedding": {
+              "rarity": "ultra"
             }
           }
         }

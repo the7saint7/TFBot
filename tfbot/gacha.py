@@ -22,7 +22,7 @@ from discord.ext import commands
 
 from tfbot.models import TFCharacter, TransformationState
 from tfbot.panels import compose_game_avatar, list_pose_outfits, render_vn_panel
-from tfbot.utils import float_from_env, int_from_env, path_from_env, utc_now
+from tfbot.utils import float_from_env, int_from_env, is_admin, path_from_env, utc_now
 
 logger = logging.getLogger("tfbot.gacha")
 
@@ -59,7 +59,7 @@ RARITY_BORDER_MAP: Dict[str, Optional[str]] = {
     "uncommon": None,
     "rare": "gold",
     "epic": "epic",
-    "ultra": "epic",
+    "ultra": "ultra",
     "legendary": "epic",
 }
 
@@ -68,7 +68,7 @@ RARITY_EMBED_COLORS: Dict[str, int] = {
     "uncommon": 0x1ABC9C,
     "rare": 0xF1C40F,
     "epic": 0x9B59B6,
-    "ultra": 0xE67E22,
+    "ultra": 0xA22424,
     "legendary": 0xF1C40F,
 }
 DEFAULT_EMBED_COLOR = 0x5865F2
@@ -96,6 +96,8 @@ class GachaCharacterDef:
     message: str = ""
     avatar_path: str = ""
     outfits: Mapping[str, GachaOutfitDef] = field(default_factory=dict)
+    is_inanimate: bool = False
+    inanimate_responses: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -189,15 +191,15 @@ class GachaManager:
             "TFBOT_GACHA_FROG_BOOST_ROLLS",
             int(self._config.get("frog_boost_rolls", 2)),
         )
-        boost_targets = self._config.get("frog_boost_targets", ["rare", "epic"])
+        boost_targets = self._config.get("frog_boost_targets", ["rare", "epic", "ultra"])
         if isinstance(boost_targets, (list, tuple)):
             self._boost_target_rarities = tuple(str(item).lower() for item in boost_targets if str(item).strip())
         else:
-            self._boost_target_rarities = ("rare", "epic")
+            self._boost_target_rarities = ("rare", "epic", "ultra")
         self._gacha_channel: Optional[discord.TextChannel] = None
 
     def _load_rarity_weights(self) -> Dict[str, float]:
-        default_weights = {"common": 70.0, "rare": 25.0, "epic": 5.0}
+        default_weights = {"common": 70.0, "rare": 25.0, "epic": 4.0, "ultra": 1.0}
         config_weights = self._config.get("rarities")
         if isinstance(config_weights, Mapping):
             weights: Dict[str, float] = {}
@@ -283,8 +285,98 @@ class GachaManager:
                 message=character.message,
                 avatar_path=character.avatar_path,
                 outfits=outfits,
+                is_inanimate=False,
+                inanimate_responses=(),
             )
+        if isinstance(config_characters, Mapping):
+            for slug, entry in config_characters.items():
+                char_def = self._build_config_only_character(slug, entry)
+                if char_def is None:
+                    continue
+                if char_def.slug in catalog:
+                    continue
+                catalog[char_def.slug] = char_def
         return catalog
+
+    def _build_config_only_character(
+        self,
+        slug: str,
+        entry: object,
+    ) -> Optional[GachaCharacterDef]:
+        if not isinstance(entry, Mapping):
+            return None
+        inanimate_flag = bool(entry.get("inanimate"))
+        if not inanimate_flag:
+            return None
+        normalized_slug = _normalize_key(slug) or _normalize_key(str(entry.get("display_name") or ""))
+        if not normalized_slug:
+            return None
+        display_name = str(entry.get("display_name") or entry.get("name") or slug).strip()
+        if not display_name:
+            display_name = normalized_slug
+        message = str(entry.get("message") or "").strip()
+        avatar_path = self._resolve_avatar_path(str(entry.get("avatar_path") or ""))
+        responses = self._extract_inanimate_responses(entry, message)
+        rarity = "epic"
+        return GachaCharacterDef(
+            slug=normalized_slug,
+            display_name=display_name,
+            source_name=display_name,
+            rarity=rarity,
+            message=message,
+            avatar_path=avatar_path,
+            outfits={},
+            is_inanimate=True,
+            inanimate_responses=responses,
+        )
+
+    @staticmethod
+    def _resolve_avatar_path(raw_path: str) -> str:
+        path = raw_path.strip()
+        if not path:
+            return ""
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        return str(candidate)
+
+    @staticmethod
+    def _extract_inanimate_responses(entry: Mapping[str, object], fallback: str) -> Tuple[str, ...]:
+        responses: List[str] = []
+        raw_responses = entry.get("responses")
+        if isinstance(raw_responses, Sequence) and not isinstance(raw_responses, (str, bytes)):
+            for item in raw_responses:
+                if isinstance(item, str):
+                    cleaned = item.strip()
+                    if cleaned:
+                        responses.append(cleaned)
+        if not responses and fallback:
+            responses.append(fallback)
+        return tuple(responses)
+
+    @staticmethod
+    def _load_static_avatar_image(avatar_path: str) -> Optional["Image.Image"]:
+        if not avatar_path:
+            return None
+        try:
+            from PIL import Image
+        except ImportError:
+            return None
+
+        path = Path(avatar_path)
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        if not path.exists():
+            logger.warning("Gacha embed: avatar path %s missing", path)
+            return None
+        try:
+            with Image.open(path) as img:
+                return img.convert("RGBA")
+        except OSError as exc:
+            logger.warning("Gacha embed: failed to load avatar %s: %s", path, exc)
+            return None
 
     def _build_outfits(
         self,
@@ -758,11 +850,15 @@ class GachaManager:
         pose = pose_override or (combo.pose if combo else None)
         outfit = outfit_override or (combo.outfit if combo else None)
         avatar_file: Optional[discord.File] = None
-        avatar_image = compose_game_avatar(
-            character.display_name,
-            pose_override=pose,
-            outfit_override=outfit,
-        )
+        avatar_image = None
+        if not character.is_inanimate:
+            avatar_image = compose_game_avatar(
+                character.display_name,
+                pose_override=pose,
+                outfit_override=outfit,
+            )
+        if avatar_image is None:
+            avatar_image = self._load_static_avatar_image(character.avatar_path)
         if avatar_image is not None:
             buffer = BytesIO()
             avatar_image.save(buffer, format="PNG")
@@ -828,8 +924,8 @@ class GachaManager:
             duration_label="gacha",
             avatar_applied=True,
             original_display_name=author_name,
-            is_inanimate=False,
-            inanimate_responses=(),
+            is_inanimate=character.is_inanimate,
+            inanimate_responses=character.inanimate_responses,
         )
         return render_vn_panel(
             state=state,
@@ -894,6 +990,7 @@ class GachaManager:
             return True
 
         # Compose transformation state for fallback relay.
+        now = utc_now()
         state = TransformationState(
             user_id=message.author.id,
             guild_id=message.guild.id,
@@ -901,14 +998,27 @@ class GachaManager:
             character_avatar_path=character_def.avatar_path,
             character_message=character_def.message,
             original_nick=None,
-            started_at=utc_now(),
-            expires_at=utc_now(),
+            started_at=now,
+            expires_at=now,
             duration_label="gacha",
             avatar_applied=True,
             original_display_name=message.author.display_name,
-            is_inanimate=False,
-            inanimate_responses=(),
+            is_inanimate=character_def.is_inanimate,
+            inanimate_responses=character_def.inanimate_responses,
         )
+
+        if character_def.is_inanimate:
+            await self._relay(
+                message,
+                state,
+                gacha_stars=star_count,
+                gacha_outfit=None,
+                gacha_pose=None,
+                gacha_rudy=profile.rudy_coins,
+                gacha_frog=profile.frog_coins,
+                gacha_border=border_style,
+            )
+            return True
 
         panel_kwargs = dict(
             guild_id=message.guild.id,
@@ -1066,8 +1176,8 @@ class GachaManager:
             duration_label="gacha",
             avatar_applied=True,
             original_display_name=message.author.display_name,
-            is_inanimate=False,
-            inanimate_responses=(),
+            is_inanimate=character_def.is_inanimate,
+            inanimate_responses=character_def.inanimate_responses,
         )
 
         result = await self._relay(
@@ -1690,7 +1800,7 @@ class GachaManager:
         @commands.command(name="givecoins")
         async def gacha_givecoins(
             ctx: commands.Context,
-            member: discord.Member,
+            member: Optional[discord.Member] = None,
             amount: Optional[int] = None,
         ) -> None:
             await self.command_give_coins(ctx, member, amount)
@@ -1732,7 +1842,7 @@ class GachaManager:
             "- `!roll outfit` - Roll a new outfit (any character).",
             "- `!frogtrade <amount>` - Convert frog coins into Rudy coins.",
             "- `!frogboost` - Spend frog coins to boost rare pull odds for a few rolls.",
-            "- `!givecoins @user [amount]` - (Owner only) Grant Rudy coins to a player.",
+            "- `!givecoins @user [amount]` - (Admins) Grant Rudy coins to a player.",
         ]
         message = "\n".join(lines)
         try:
@@ -2206,14 +2316,18 @@ class GachaManager:
     async def command_give_coins(
         self,
         ctx: commands.Context,
-        member: discord.Member,
+        member: Optional[discord.Member],
         amount: Optional[int],
     ) -> None:
         if ctx.guild is None:
             await ctx.reply("Run this command inside the server.", mention_author=False)
             return
-        if ctx.author.id != ctx.guild.owner_id:
-            await ctx.reply("Only the server owner can give Rudy coins manually.", mention_author=False)
+        if member is None:
+            await ctx.reply("Usage: `!givecoins @user [amount]`", mention_author=False)
+            return
+        invoker = ctx.author if isinstance(ctx.author, discord.Member) else None
+        if invoker is None or not is_admin(invoker):
+            await ctx.reply("Only a server administrator can give Rudy coins manually.", mention_author=False)
             return
         if member.bot:
             await ctx.reply("Bots don't need Rudy coins.", mention_author=False)
@@ -2235,7 +2349,7 @@ class GachaManager:
         if member.id != ctx.author.id:
             try:
                 await member.send(
-                    f"You received {qty} Rudy coins from the server owner in {ctx.guild.name}."
+                    f"You received {qty} Rudy coins from a server admin in {ctx.guild.name}."
                 )
             except discord.Forbidden:
                 pass

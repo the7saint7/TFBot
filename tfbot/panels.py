@@ -110,6 +110,64 @@ VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
 _VN_LAYOUT_FILE_SETTING = os.getenv("TFBOT_VN_LAYOUTS", "vn_layouts.json").strip()
 VN_LAYOUT_FILE = Path(_VN_LAYOUT_FILE_SETTING) if _VN_LAYOUT_FILE_SETTING else None
 
+SPRITE_IMAGE_SUFFIXES: Tuple[str, ...] = (".png", ".webp")
+
+
+def _is_supported_sprite(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SPRITE_IMAGE_SUFFIXES
+
+
+def _strip_sprite_suffix(value: str) -> str:
+    lower = value.lower()
+    for suffix in SPRITE_IMAGE_SUFFIXES:
+        if lower.endswith(suffix):
+            return lower[: -len(suffix)]
+    return lower
+
+
+def _iter_sprite_files(directory: Path, recursive: bool = False):
+    iterator = directory.rglob("*") if recursive else directory.iterdir()
+    for path in iterator:
+        if _is_supported_sprite(path):
+            yield path
+
+
+def _gather_sprite_files(directory: Path, recursive: bool = False) -> list[Path]:
+    return sorted(_iter_sprite_files(directory, recursive=recursive), key=lambda p: p.as_posix().lower())
+
+
+def _find_named_sprite_file(directory: Path, stem: str) -> Optional[Path]:
+    for suffix in SPRITE_IMAGE_SUFFIXES:
+        candidate = directory / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _find_any_sprite_file(directory: Path, recursive: bool = False) -> Optional[Path]:
+    files = _gather_sprite_files(directory, recursive=recursive)
+    if files:
+        return files[0]
+    return None
+
+
+def _match_outfit_asset(
+    assets: Mapping[str, OutfitAsset],
+    target_name: str,
+) -> Optional[OutfitAsset]:
+    normalized = target_name.strip().lower()
+    if not normalized:
+        return None
+    lookup_keys = [normalized]
+    stripped = _strip_sprite_suffix(normalized)
+    if stripped and stripped not in lookup_keys:
+        lookup_keys.append(stripped)
+    for key in lookup_keys:
+        asset = assets.get(key)
+        if asset:
+            return asset
+    return None
+
 
 def _normalize_layout_key(value: str) -> str:
     if not value:
@@ -358,19 +416,19 @@ def compose_background_layer(
 def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
     if not accessory_dir.is_dir():
         return None
-    pngs = sorted(p for p in accessory_dir.rglob("*.png") if p.is_file())
-    if not pngs:
+    sprite_files = _gather_sprite_files(accessory_dir, recursive=True)
+    if not sprite_files:
         return None
 
     def _find_preferred(keyword: str) -> Optional[Path]:
         lowered = keyword.lower()
-        for candidate in pngs:
+        for candidate in sprite_files:
             if candidate.stem.lower() == lowered:
                 return candidate
-        for candidate in pngs:
+        for candidate in sprite_files:
             if lowered in candidate.stem.lower():
                 return candidate
-        for candidate in pngs:
+        for candidate in sprite_files:
             parents = [parent.name.lower() for parent in candidate.parents]
             if lowered in parents:
                 return candidate
@@ -379,7 +437,7 @@ def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
     preferred = _find_preferred("off") or _find_preferred("on")
     if preferred:
         return preferred
-    return pngs[0]
+    return sprite_files[0]
 
 
 def _collect_accessory_layers(entry: Path, include_all: bool = False) -> list[Tuple[int, Path]]:
@@ -412,7 +470,7 @@ def _collect_accessory_layers(entry: Path, include_all: bool = False) -> list[Tu
             layer = _default_accessory_layer(child)
             if layer:
                 _add_layer(layer, child.name)
-        elif child.is_file() and child.suffix.lower() == ".png":
+        elif _is_supported_sprite(child):
             _add_layer(child, child.stem)
 
     if not accessories and entry.is_dir() and (include_all or entry.name.lower().startswith("acc")):
@@ -432,17 +490,17 @@ def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
     entries = sorted(outfits_dir.iterdir(), key=lambda p: p.name.lower())
 
     for entry in entries:
-        if entry.is_file() and entry.suffix.lower() == ".png":
+        if _is_supported_sprite(entry):
             name = entry.stem
             assets[name.lower()] = OutfitAsset(name=name, base_path=entry, accessory_layers=())
 
     for entry in entries:
         if entry.is_dir() and not entry.name.lower().startswith("acc"):
-            primary = entry / f"{entry.name}.png"
-            if not primary.exists():
-                primary = next((p for p in entry.glob("*.png")), None)
+            primary = _find_named_sprite_file(entry, entry.name)
             if not primary:
-                primary = next((p for p in entry.rglob("*.png")), None)
+                primary = _find_any_sprite_file(entry)
+            if not primary:
+                primary = _find_any_sprite_file(entry, recursive=True)
             if not primary:
                 continue
             accessories = []
@@ -866,22 +924,14 @@ def _select_outfit_path(
 
     normalized_targets: list[str] = []
     for name in candidates:
-        name = name.strip()
-        if not name:
-            continue
-        lower = name.lower()
-        if lower.endswith(".png"):
-            normalized_targets.append(lower)
-            normalized_targets.append(lower.rstrip(".png"))
-        else:
-            normalized_targets.append(lower)
+        cleaned = name.strip().lower()
+        if cleaned and cleaned not in normalized_targets:
+            normalized_targets.append(cleaned)
 
     for target in normalized_targets:
         for variant_dir in search_variants:
             assets = variant_outfits.get(variant_dir, {})
-            asset = assets.get(target)
-            if asset is None:
-                asset = assets.get(target.rstrip(".png"))
+            asset = _match_outfit_asset(assets, target)
             if asset:
                 logger.debug(
                     "VN sprite: using outfit %s for variant %s",
@@ -927,16 +977,21 @@ def _select_face_path(variant_dir: Path) -> Optional[Path]:
         selected_group = groups[0]
 
     faces = sorted(
-        (face_path for face_path in selected_group.glob("*.png") if face_path.is_file()),
+        (face_path for face_path in selected_group.iterdir() if _is_supported_sprite(face_path)),
         key=lambda p: p.name.lower(),
     )
     if not faces:
         logger.warning("VN sprite: no faces found in group %s", selected_group)
         return None
-    preferred_face = VN_DEFAULT_FACE.lower()
+    preferred_face = (VN_DEFAULT_FACE or "").strip().lower()
+    preferred_face_stem = _strip_sprite_suffix(preferred_face) if preferred_face else ""
     for face in faces:
         if face.name.lower() == preferred_face:
             return face
+    if preferred_face_stem:
+        for face in faces:
+            if face.stem.lower() == preferred_face_stem:
+                return face
     return faces[0]
 
 
