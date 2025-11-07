@@ -3352,6 +3352,9 @@
           "outfits": {
             "punk": {
               "rarity": "common"
+            },
+            "punk_zoomed": {
+              "rarity": "common"
             }
           }
         }
