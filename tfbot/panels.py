@@ -240,6 +240,22 @@ def _get_overlay_assets() -> Dict[str, "Image.Image"]:
     return assets
 
 
+@lru_cache(maxsize=2)
+def _character_directory_index(root: str) -> Dict[str, Path]:
+    base = Path(root)
+    if not base.exists():
+        return {}
+    try:
+        return {
+            child.name.lower(): child
+            for child in base.iterdir()
+            if child.is_dir()
+        }
+    except OSError as exc:
+        logger.warning("VN sprite: failed to index character directories under %s: %s", base, exc)
+        return {}
+
+
 def load_outfit_selections() -> Dict[str, Dict[str, str]]:
     if not VN_SELECTION_FILE.exists():
         return {}
@@ -601,11 +617,18 @@ def resolve_character_directory(character_name: str) -> Tuple[Optional[Path], Se
     if VN_ASSET_ROOT is None:
         return None, []
     attempted: list[str] = []
+    directory_index: Optional[Dict[str, Path]] = None
     for key in _candidate_character_keys(character_name):
         candidate = VN_ASSET_ROOT / key
         attempted.append(candidate.name)
         if candidate.exists():
             return candidate, attempted
+        if directory_index is None:
+            directory_index = _character_directory_index(str(VN_ASSET_ROOT))
+        alternate = directory_index.get(key.lower()) if directory_index else None
+        if alternate is not None and alternate.exists():
+            attempted.append(alternate.name)
+            return alternate, attempted
     return None, attempted
 
 

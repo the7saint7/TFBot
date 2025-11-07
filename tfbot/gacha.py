@@ -241,7 +241,7 @@ class GachaManager:
 
     def _build_catalog(self, character_pool: Sequence[TFCharacter]) -> Dict[str, GachaCharacterDef]:
         catalog: Dict[str, GachaCharacterDef] = {}
-        config_characters = self._config.get("characters") if isinstance(self._config.get("characters"), Mapping) else {}
+        config_characters = self._normalize_character_config()
 
         for character in character_pool:
             first_token = (character.name.split()[0]) if character.name else ""
@@ -253,16 +253,15 @@ class GachaManager:
                     slug_candidates.append(normalized)
             slug = None
             entry = None
-            if isinstance(config_characters, Mapping):
-                for candidate in slug_candidates:
-                    candidate_entry = config_characters.get(candidate)
-                    if isinstance(candidate_entry, Mapping):
-                        slug = candidate
-                        entry = candidate_entry
-                        break
+            for candidate in slug_candidates:
+                candidate_entry = config_characters.get(candidate)
+                if isinstance(candidate_entry, Mapping):
+                    slug = candidate
+                    entry = candidate_entry
+                    break
             if slug is None:
                 slug = slug_candidates[0] or _normalize_key(character.name)
-                entry = config_characters.get(slug) if isinstance(config_characters, Mapping) else None
+                entry = config_characters.get(slug)
 
             display_name = character.display_name or character.name
             if isinstance(entry, Mapping):
@@ -288,15 +287,39 @@ class GachaManager:
                 is_inanimate=False,
                 inanimate_responses=(),
             )
-        if isinstance(config_characters, Mapping):
-            for slug, entry in config_characters.items():
-                char_def = self._build_config_only_character(slug, entry)
-                if char_def is None:
-                    continue
-                if char_def.slug in catalog:
-                    continue
-                catalog[char_def.slug] = char_def
+        for slug, entry in config_characters.items():
+            char_def = self._build_config_only_character(slug, entry)
+            if char_def is None:
+                continue
+            if char_def.slug in catalog:
+                continue
+            catalog[char_def.slug] = char_def
         return catalog
+
+    def _normalize_character_config(self) -> Dict[str, Mapping[str, object]]:
+        raw_characters = self._config.get("characters")
+        if not isinstance(raw_characters, Mapping):
+            return {}
+        normalized: Dict[str, Mapping[str, object]] = {}
+        for raw_key, raw_entry in raw_characters.items():
+            if not isinstance(raw_entry, Mapping):
+                continue
+            normalized_key = _normalize_key(str(raw_key))
+            if not normalized_key:
+                display_value = raw_entry.get("display_name") or raw_entry.get("name")
+                if isinstance(display_value, str):
+                    normalized_key = _normalize_key(display_value)
+            if not normalized_key:
+                logger.warning("Gacha config: skipping character entry %s (cannot normalize key)", raw_key)
+                continue
+            if normalized_key in normalized:
+                logger.warning(
+                    "Gacha config: duplicate character entry for %s; keeping first occurrence.",
+                    normalized_key,
+                )
+                continue
+            normalized[normalized_key] = raw_entry
+        return normalized
 
     def _build_config_only_character(
         self,
