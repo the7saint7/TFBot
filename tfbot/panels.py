@@ -226,6 +226,7 @@ def _get_overlay_assets() -> Dict[str, "Image.Image"]:
         "border_gold": "border_gold.png",
         "border_epic": "border_epic.png",
         "border_common": "border_common.png",
+        "border_ultra": "border_ultra.png",
     }
     assets: Dict[str, "Image.Image"] = {}
     for key, filename in asset_files.items():
