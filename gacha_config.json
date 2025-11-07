@@ -3269,6 +3269,31 @@
       },
       "rarity": "epic"
     },
+    "narrator": {
+      "display_name": "Narrator",
+      "poses": {},
+      "rarity": "epic"
+    },
+    "yuigyaru": {
+      "display_name": "Yui Gyaru",
+      "poses": {
+        "a": {
+          "outfits": {
+            "zoomed": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+
+
+
+
+
+
 
 
     "yuiBimbo": {
@@ -3477,30 +3502,20 @@
         }
       },
       "rarity": "ultra"
-    }
-
-
-
-
-
-    "narrator": {
-      "display_name": "Narrator",
-      "poses": {},
-      "rarity": "epic"
     },
-    "yuigyaru": {
-      "display_name": "Yui Gyaru",
-      "poses": {
-        "a": {
-          "outfits": {
-            "zoomed": {
-              "rarity": "common"
-            }
-          }
-        }
-      },
-      "rarity": "epic"
-    },
+
+
+
+
+
+
+
+
+
+
+
+
+    
     "dildo": {
       "display_name": "Dildo",
       "rarity": "epic",
