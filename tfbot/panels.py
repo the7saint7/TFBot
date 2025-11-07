@@ -8,7 +8,7 @@ import logging
 import os
 import random
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence, Tuple
@@ -767,8 +767,30 @@ def set_selected_pose_outfit(
     return True
 
 
-@lru_cache(maxsize=512)
+_COMPOSE_AVATAR_CACHE: "OrderedDict[Tuple[str, Optional[str], Optional[str]], 'Image.Image']" = OrderedDict()
+_COMPOSE_AVATAR_CACHE_LIMIT = 512
+
+
 def compose_game_avatar(
+    character_name: str,
+    pose_override: Optional[str] = None,
+    outfit_override: Optional[str] = None,
+) -> Optional["Image.Image"]:
+    cache_key = (character_name, pose_override, outfit_override)
+    cached = _COMPOSE_AVATAR_CACHE.get(cache_key)
+    if cached is not None:
+        _COMPOSE_AVATAR_CACHE.move_to_end(cache_key)
+        return cached
+    image = _compose_game_avatar_uncached(character_name, pose_override, outfit_override)
+    if image is not None:
+        _COMPOSE_AVATAR_CACHE[cache_key] = image
+        _COMPOSE_AVATAR_CACHE.move_to_end(cache_key)
+        if len(_COMPOSE_AVATAR_CACHE) > _COMPOSE_AVATAR_CACHE_LIMIT:
+            _COMPOSE_AVATAR_CACHE.popitem(last=False)
+    return image
+
+
+def _compose_game_avatar_uncached(
     character_name: str,
     pose_override: Optional[str] = None,
     outfit_override: Optional[str] = None,
@@ -895,6 +917,13 @@ def compose_game_avatar(
             logger.warning("VN sprite: unable to cache avatar %s: %s", cache_file, exc)
 
     return outfit_image
+
+
+def _clear_compose_game_avatar_cache() -> None:
+    _COMPOSE_AVATAR_CACHE.clear()
+
+
+compose_game_avatar.cache_clear = _clear_compose_game_avatar_cache  # type: ignore[attr-defined]
 
 
 def _get_pose_metadata(config: Dict, pose_name: str) -> Dict:
