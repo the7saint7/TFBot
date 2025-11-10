@@ -1255,15 +1255,20 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 return None
             forced_token = parts[1].lower()
 
-        matching_states = [
-            s
-            for s in active_transformations.values()
-            if s.guild_id == guild.id
-            and (
-                s.character_name.split(" ", 1)[0].lower() == first_token
-                or s.character_name.lower() == first_token
-            )
-        ]
+        def _state_matches(state: TransformationState) -> bool:
+            if state.guild_id != guild.id:
+                return False
+            normalized = state.character_name.lower()
+            if normalized == first_token or normalized.split(" ", 1)[0] == first_token:
+                return True
+            member_obj = guild.get_member(state.user_id)
+            if member_obj:
+                profile = member_profile_name(member_obj).lower()
+                if profile == first_token or profile.split(" ", 1)[0] == first_token:
+                    return True
+            return False
+
+        matching_states = [s for s in active_transformations.values() if _state_matches(s)]
         target_member = None
         if matching_states:
             state = matching_states[0]
