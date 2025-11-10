@@ -154,7 +154,7 @@ def _format_special_reroll_hint(character_name: str) -> Optional[str]:
         return None
     return (
         "```diff\n"
-        f"- {character_name} perk unlocked! You can use `!reroll character character` to mess with the other users.\n"
+        f"- {character_name} perk unlocked! Use `!reroll character` for a random swap or `!reroll character character` to force a form.\n"
         "```"
     )
 
@@ -715,7 +715,10 @@ async def relay_transformed_message(
     original_content = cleaned_content
     generated_inanimate_response = False
     has_links = False
-    if state.is_inanimate:
+    character_name_normalized = (state.character_name or "").strip().lower()
+    is_ball_override = state.is_inanimate and character_name_normalized == "ball"
+    behaves_like_character = not state.is_inanimate or is_ball_override
+    if state.is_inanimate and not is_ball_override:
         options = state.inanimate_responses or (
             "You emit a faint, spooky rattle.",
         )
@@ -735,7 +738,7 @@ async def relay_transformed_message(
         AI_REWRITE_ENABLED
         and cleaned_content
         and not cleaned_content.startswith(str(bot.command_prefix))
-        and not state.is_inanimate
+        and behaves_like_character
     ):
         context_snippet = CHARACTER_CONTEXT.get(state.character_name) or state.character_message
         rewritten = await rewrite_message_for_character(
@@ -752,7 +755,7 @@ async def relay_transformed_message(
                 rewritten[:120],
             )
             cleaned_content = rewritten.strip()
-    if cleaned_content and not state.is_inanimate:
+    if cleaned_content and behaves_like_character:
         cleaned_content, has_links = strip_urls(cleaned_content)
         cleaned_content = cleaned_content.strip()
 
@@ -1230,7 +1233,8 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         return None
     now = utc_now()
     author_state = find_active_transformation(author.id, guild.id)
-    can_force_reroll = author_is_admin or _has_special_reroll_access(author_state)
+    author_has_special_reroll = _has_special_reroll_access(author_state)
+    can_force_reroll = author_is_admin or author_has_special_reroll
     target_member: Optional[discord.Member] = None
     state: Optional[TransformationState] = None
 
@@ -1303,7 +1307,11 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
             return None
 
-        if not author_is_admin and target_member.id == author.id:
+        if (
+            not author_is_admin
+            and target_member.id == author.id
+            and not author_has_special_reroll
+        ):
             await ctx.reply(
                 "You can't use your reroll on yourself. Ask another player to reroll you instead.",
                 mention_author=False,

@@ -18,9 +18,14 @@ async def build_legacy_embed(
     description: str,
 ) -> Tuple[discord.Embed, Optional[discord.File]]:
     """Return the classic embed representation and optional avatar attachment."""
+    embed_color = 0x9B59B6
+    character_name_normalized = (state.character_name or "").strip().lower()
+    if state.is_inanimate and character_name_normalized == "ball":
+        embed_color = 0x3498DB  # Match the ball's blue hue.
+
     embed = discord.Embed(
         description=description,
-        color=0x9B59B6,
+        color=embed_color,
         timestamp=utc_now(),
     )
     embed.set_author(name=state.character_name)
@@ -37,4 +42,3 @@ async def build_legacy_embed(
 
 
 __all__ = ["build_legacy_embed"]
-
