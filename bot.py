@@ -133,7 +133,7 @@ REQUIRED_GUILD_PERMISSIONS = {
 }
 MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
-SPECIAL_REROLL_FORMS = frozenset({"ball", "narrator"})
+SPECIAL_REROLL_FORMS = ("ball", "narrator")
 
 configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE, reroll_file=TF_REROLL_FILE)
 tf_stats.update(load_stats_from_disk())
@@ -143,14 +143,31 @@ INANIMATE_DATA_FILE = Path(os.getenv("TFBOT_INANIMATE_FILE", "tf_inanimate.json"
 INANIMATE_TF_CHANCE = float(os.getenv("TFBOT_INANIMATE_CHANCE", "0"))
 
 
+def _is_special_reroll_name(name: str) -> bool:
+    normalized = (name or "").strip().lower()
+    if not normalized:
+        return False
+    for token in SPECIAL_REROLL_FORMS:
+        if normalized == token:
+            return True
+        if normalized.startswith(f"{token} "):
+            return True
+        if normalized.endswith(f" ({token})"):
+            return True
+    return False
+
+
 def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
     if state is None:
         return False
-    return state.character_name.lower() in SPECIAL_REROLL_FORMS
+    name = (state.character_name or "").strip()
+    if not name:
+        return False
+    return _is_special_reroll_name(name)
 
 
 def _format_special_reroll_hint(character_name: str) -> Optional[str]:
-    if character_name.lower() not in SPECIAL_REROLL_FORMS:
+    if not _is_special_reroll_name(character_name):
         return None
     return (
         "```diff\n"
