@@ -1266,6 +1266,23 @@ def _is_emoji_char(ch: str) -> bool:
     return code >= 0x1F000 or 0x2600 <= code <= 0x27BF or 0x1F300 <= code <= 0x1FAFF
 
 
+def _is_single_emoji_message(segments: Sequence[dict]) -> bool:
+    """Return True if the formatted segments equate to a lone emoji/custom emoji."""
+    emoji_segment_found = False
+    for segment in segments:
+        if segment.get("newline"):
+            continue
+        is_emoji = bool(segment.get("emoji") or segment.get("custom_emoji"))
+        text = (segment.get("text") or "").strip()
+        if not text and not is_emoji:
+            continue
+        if is_emoji and not emoji_segment_found:
+            emoji_segment_found = True
+            continue
+        return False
+    return emoji_segment_found
+
+
 def parse_discord_formatting(text: str) -> Sequence[dict]:
     segments: list[dict] = []
     bold = italic = strike = False
@@ -1967,7 +1984,7 @@ def render_vn_panel(
                 gap = segment.get("gap_after", 0)
                 if segment["type"] == "icon":
                     icon_img = segment["image"]
-                    offset_y = cursor_y + max(0, (row["height"] - icon_img.height) // 2)
+                    offset_y = cursor_y + max(0, (row["height"] - icon_img.height) // 2.2)
                     base.paste(icon_img, (int(row_x), int(offset_y)), icon_img)
                     row_x += icon_img.width + gap
                 else:
@@ -2022,8 +2039,21 @@ def render_vn_panel(
     segments = list(formatted_segments) if formatted_segments else []
     if not segments:
         segments = list(parse_discord_formatting(working_content))
+    big_emoji_mode = _is_single_emoji_message(segments)
+    emoji_target_size: Optional[int] = None
+    if big_emoji_mode:
+        target_size = int(min(max_width, available_height) * 0.9)
+        if target_size < VN_TEXT_FONT_SIZE:
+            target_size = VN_TEXT_FONT_SIZE
+        emoji_target_size = target_size
+        base_text_font = _load_vn_font(target_size)
     lines, text_font = _fit_text_segments(draw, segments, base_text_font, max_width, available_height)
-    text_y = text_box[1] + text_padding
+
+    vertical_offset = 0
+    if big_emoji_mode:
+        block_height = emoji_target_size or getattr(text_font, "size", VN_TEXT_FONT_SIZE)
+        vertical_offset = max(0, (available_height - block_height) // 2)
+    text_y = text_box[1] + text_padding + vertical_offset
 
     if reply_font and reply_line:
         reply_fill = (190, 190, 190, 255)
@@ -2032,12 +2062,29 @@ def render_vn_panel(
         text_y += _font_line_height(reply_font) + 6
 
     base_line_height = getattr(text_font, "size", VN_TEXT_FONT_SIZE)
+    line_spacing = 6
     for line in lines:
         if not line:
-            text_y += base_line_height + 6
+            text_y += base_line_height + line_spacing
             continue
-        text_x = text_box[0] + text_padding
-        max_height = 0
+        line_height = base_line_height
+        line_width = 0
+        for segment in line:
+            seg_height = segment.get("height")
+            if big_emoji_mode and emoji_target_size and segment.get("custom_emoji"):
+                seg_height = emoji_target_size
+            if seg_height:
+                line_height = max(line_height, seg_height)
+            segment_width = segment.get("width", 0)
+            if big_emoji_mode and emoji_target_size and segment.get("custom_emoji"):
+                segment_width = emoji_target_size
+            line_width += segment_width
+
+        if big_emoji_mode:
+            text_x = text_box[0] + text_padding + max(0, (max_width - line_width) // 2)
+        else:
+            text_x = text_box[0] + text_padding
+
         for segment in line:
             fill = segment.get("color", (240, 240, 240, 255))
             font_segment = segment["font"]
@@ -2050,32 +2097,44 @@ def render_vn_panel(
                 emoji_img = None
                 if custom_emoji_images and key:
                     emoji_img = custom_emoji_images.get(key)
+                target_w = int(width) or base_line_height
+                target_h = int(height) or base_line_height
+                if big_emoji_mode and emoji_target_size:
+                    target_w = target_h = emoji_target_size
+                advance = width or target_w
+                if big_emoji_mode and emoji_target_size:
+                    advance = emoji_target_size
                 if emoji_img is not None:
-                    emoji_render = emoji_img.copy()
-                    target_w = int(width) or base_line_height
-                    target_h = int(height) or base_line_height
-                    emoji_render.thumbnail((target_w, target_h), Image.LANCZOS)
-                    offset_y = text_y + max(0, base_line_height - emoji_render.height)
+                    emoji_render = emoji_img.copy().resize((target_w, target_h), Image.LANCZOS)
+                    if big_emoji_mode:
+                        offset_y = text_y + max(0, (line_height - emoji_render.height) // 2)
+                    else:
+                        offset_y = text_y + max(0, base_line_height - emoji_render.height)
                     base.paste(emoji_render, (int(text_x), int(offset_y)), emoji_render)
                 else:
                     fallback = segment.get("fallback_text") or text_segment or custom_meta.get("name") or ""
                     if fallback:
-                        draw.text((text_x, text_y), fallback, fill=fill, font=text_font)
-                max_height = max(max_height, height)
-                text_x += width
+                        draw_y = text_y
+                        if big_emoji_mode:
+                            draw_y = text_y + max(0, (line_height - height) // 2)
+                        draw.text((text_x, draw_y), fallback, fill=fill, font=text_font)
+                height = max(height, target_h)
+                text_x += advance
                 continue
             if text_segment:
-                draw.text((text_x, text_y), text_segment, fill=fill, font=font_segment)
+                draw_y = text_y
+                if big_emoji_mode:
+                    draw_y = text_y + max(0, (line_height - height) // 2)
+                draw.text((text_x, draw_y), text_segment, fill=fill, font=font_segment)
                 if segment.get("strike"):
-                    strike_y = text_y + height / 2
+                    strike_y = draw_y + height / 2
                     draw.line(
                         (text_x, strike_y, text_x + width, strike_y),
                         fill=fill,
                         width=max(1, int(height / 10)),
                     )
-            max_height = max(max_height, height)
             text_x += width
-        text_y += max_height + 6
+        text_y += line_height + line_spacing
     if border_img is not None:
         base = Image.alpha_composite(base, border_img)
 
