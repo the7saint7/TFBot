@@ -1376,7 +1376,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         if current_key != key
     }
 
-    if not author_is_admin:
+    if not author_is_admin and not author_has_special_reroll:
         last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
         if last_reroll_at is not None:
             cooldown_end = last_reroll_at + timedelta(hours=24)
@@ -1481,7 +1481,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
     if not new_is_inanimate:
         increment_tf_stats(guild.id, target_member.id, new_name)
-    if not author_is_admin:
+    if not author_is_admin and not author_has_special_reroll:
         record_reroll_timestamp(guild.id, author.id, now)
 
     history_details = (
