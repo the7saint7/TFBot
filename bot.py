@@ -133,6 +133,7 @@ REQUIRED_GUILD_PERMISSIONS = {
 }
 MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
+SPECIAL_REROLL_FORMS = frozenset({"ball", "narrator"})
 
 configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE, reroll_file=TF_REROLL_FILE)
 tf_stats.update(load_stats_from_disk())
@@ -140,6 +141,22 @@ reroll_cooldowns.update(load_reroll_cooldowns_from_disk())
 
 INANIMATE_DATA_FILE = Path(os.getenv("TFBOT_INANIMATE_FILE", "tf_inanimate.json")).expanduser()
 INANIMATE_TF_CHANCE = float(os.getenv("TFBOT_INANIMATE_CHANCE", "0"))
+
+
+def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
+    if state is None:
+        return False
+    return state.character_name.lower() in SPECIAL_REROLL_FORMS
+
+
+def _format_special_reroll_hint(character_name: str) -> Optional[str]:
+    if character_name.lower() not in SPECIAL_REROLL_FORMS:
+        return None
+    return (
+        "```diff\n"
+        f"- {character_name} perk unlocked! You can use `!reroll character character` to mess with the other users.\n"
+        "```"
+    )
 
 
 def _default_inanimate_forms() -> Tuple[Dict[str, object], ...]:
@@ -1063,6 +1080,9 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         duration_label,
         selected_name,
     )
+    special_hint = _format_special_reroll_hint(selected_name)
+    if special_hint:
+        response_text = f"{response_text}\n{special_hint}"
     emoji_prefix = _get_magic_emoji(message.guild)
     response_text = f"{emoji_prefix} {response_text}"
     await message.reply(response_text, mention_author=False)
@@ -1209,6 +1229,8 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
     now = utc_now()
+    author_state = find_active_transformation(author.id, guild.id)
+    can_force_reroll = author_is_admin or _has_special_reroll_access(author_state)
     target_member: Optional[discord.Member] = None
     state: Optional[TransformationState] = None
 
@@ -1221,9 +1243,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         parts = query.split()
         first_token = parts[0].lower()
         if len(parts) > 1:
-            if not author_is_admin:
+            if not can_force_reroll:
                 await ctx.reply(
-                    "Only admins can force a reroll into a specific form.",
+                    "Only admins or Syn's Ball/Narrator TFs can force a reroll into a specific form.",
                     mention_author=False,
                 )
                 return None
@@ -1244,7 +1266,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             _, target_member = await fetch_member(state.guild_id, state.user_id)
         else:
             # Fallback: caller's own transformation
-            caller_state = find_active_transformation(author.id, guild.id)
+            caller_state = author_state
             if caller_state and (
                 caller_state.character_name.split(" ", 1)[0].lower() == first_token
                 or caller_state.character_name.lower() == first_token
@@ -1323,7 +1345,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             return None
         target_member = author
         key = state_key(guild.id, target_member.id)
-        state = active_transformations.get(key)
+        state = author_state
         if state is None:
             await ctx.reply(
                 "You are not currently transformed; nothing to reroll.",
@@ -1493,6 +1515,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             response_text = (
                 f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
             )
+    special_hint = _format_special_reroll_hint(new_name)
+    if special_hint:
+        response_text = f"{response_text}\n{special_hint}"
     emoji_prefix = _get_magic_emoji(guild)
     try:
         await ctx.channel.send(
