@@ -74,6 +74,7 @@ from tfbot.panels import (
     prepare_panel_mentions,
     prepare_reply_snippet,
     render_vn_panel,
+    set_character_directory_overrides,
     set_selected_background,
     set_selected_outfit_name,
     set_selected_pose_outfit,
@@ -134,6 +135,7 @@ REQUIRED_GUILD_PERMISSIONS = {
 MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 SPECIAL_REROLL_FORMS = ("ball", "narrator")
+ADMIN_ONLY_RANDOM_FORMS = ("syn", "circe")
 
 configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE, reroll_file=TF_REROLL_FILE)
 tf_stats.update(load_stats_from_disk())
@@ -164,6 +166,77 @@ def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
     if not name:
         return False
     return _is_special_reroll_name(name)
+
+
+def _token_variants(token: str) -> set[str]:
+    normalized_token = (token or "").strip().lower()
+    if not normalized_token:
+        return set()
+    variants = {normalized_token}
+
+    def _add(value: str) -> None:
+        cleaned = value.strip()
+        if cleaned:
+            variants.add(cleaned)
+
+    if "_" in normalized_token:
+        _add(normalized_token.replace("_", " "))
+        _add(normalized_token.replace("_", ""))
+        _add(normalized_token.split("_", 1)[0])
+    if "-" in normalized_token:
+        _add(normalized_token.replace("-", " "))
+        _add(normalized_token.replace("-", ""))
+        _add(normalized_token.split("-", 1)[0])
+    return variants
+
+
+def _name_matches_token(name: str, token: str) -> bool:
+    name_normalized = (name or "").strip().lower()
+    if not name_normalized:
+        return False
+    first_token = name_normalized.split(" ", 1)[0]
+    variants = _token_variants(token)
+    if not variants:
+        return False
+    for variant in variants:
+        if variant == name_normalized or variant == first_token:
+            return True
+    return False
+
+
+def _character_matches_token(character: TFCharacter, token: str) -> bool:
+    variants = _token_variants(token)
+    if not variants:
+        return False
+    name_normalized = character.name.lower()
+    first_token = name_normalized.split(" ", 1)[0]
+    for variant in variants:
+        if variant == name_normalized or variant == first_token:
+            return True
+    folder_name_raw = (character.folder or "").strip()
+    if folder_name_raw:
+        folder_normalized = folder_name_raw.replace("\\", "/").strip("/").lower()
+        folder_candidates = {folder_normalized}
+        last_segment = folder_normalized.rsplit("/", 1)[-1]
+        folder_candidates.add(last_segment)
+        for folder_candidate in folder_candidates:
+            if folder_candidate in variants:
+                return True
+    return False
+
+
+def _is_admin_only_random_name(name: str) -> bool:
+    normalized = (name or "").strip().lower()
+    if not normalized:
+        return False
+    for token in ADMIN_ONLY_RANDOM_FORMS:
+        if normalized == token:
+            return True
+        if normalized.startswith(f"{token} "):
+            return True
+        if normalized.endswith(f" ({token})"):
+            return True
+    return False
 
 
 def _format_special_reroll_hint(character_name: str) -> Optional[str]:
@@ -426,11 +499,13 @@ def _build_character_pool(
                     avatar_path = str((avatar_root / candidate).resolve())
                 else:
                     avatar_path = str(candidate)
+            folder_name = str(entry.get("folder", "")).strip() or None
             pool.append(
                 TFCharacter(
                     name=entry["name"],
                     avatar_path=avatar_path,
                     message=str(entry.get("message", "")),
+                    folder=folder_name,
                 )
             )
         except KeyError as exc:
@@ -440,7 +515,19 @@ def _build_character_pool(
     return pool
 
 
-CHARACTER_POOL = _build_character_pool(_load_character_dataset(), CHARACTER_AVATAR_ROOT)
+_CHARACTER_DATASET = _load_character_dataset()
+_CHARACTER_FOLDER_OVERRIDES = {
+    str(entry.get("name", "")).strip().lower(): str(entry.get("folder", "")).strip()
+    for entry in _CHARACTER_DATASET
+    if isinstance(entry, dict)
+    and str(entry.get("name", "")).strip()
+    and str(entry.get("folder", "")).strip()
+}
+CHARACTER_POOL = _build_character_pool(_CHARACTER_DATASET, CHARACTER_AVATAR_ROOT)
+CHARACTER_BY_NAME: Dict[str, TFCharacter] = {
+    character.name.strip().lower(): character for character in CHARACTER_POOL
+}
+set_character_directory_overrides(_CHARACTER_FOLDER_OVERRIDES)
 GACHA_MANAGER = None
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -1015,7 +1102,15 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         return None
 
     used_characters = {state.character_name for state in active_transformations.values()}
-    available_characters = [character for character in CHARACTER_POOL if character.name not in used_characters]
+    available_characters = [
+        character for character in CHARACTER_POOL if character.name not in used_characters
+    ]
+    if not is_admin(member):
+        available_characters = [
+            character
+            for character in available_characters
+            if not _is_admin_only_random_name(character.name)
+        ]
     character: Optional[TFCharacter] = None
 
     inanimate_form = None
@@ -1253,6 +1348,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     author_has_special_reroll = _has_special_reroll_access(author_state)
     can_force_reroll = author_is_admin or author_has_special_reroll
     target_member: Optional[discord.Member] = None
+    target_is_admin = False
     state: Optional[TransformationState] = None
 
     forced_character: Optional[TFCharacter] = None
@@ -1262,7 +1358,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     forced_token: Optional[str] = None
     if query:
         parts = query.split()
-        first_token = parts[0].lower()
+        first_token_input = parts[0]
+        first_token = first_token_input.lower()
+        first_token_variants = _token_variants(first_token_input)
         if len(parts) > 1:
             if not can_force_reroll:
                 await ctx.reply(
@@ -1275,13 +1373,16 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         def _state_matches(state: TransformationState) -> bool:
             if state.guild_id != guild.id:
                 return False
-            normalized = state.character_name.lower()
-            if normalized == first_token or normalized.split(" ", 1)[0] == first_token:
+            if _name_matches_token(state.character_name, first_token_input):
+                return True
+            character_entry = CHARACTER_BY_NAME.get(state.character_name.strip().lower())
+            if character_entry and _character_matches_token(character_entry, first_token_input):
                 return True
             member_obj = guild.get_member(state.user_id)
             if member_obj:
                 profile = member_profile_name(member_obj).lower()
-                if profile == first_token or profile.split(" ", 1)[0] == first_token:
+                profile_first = profile.split(" ", 1)[0]
+                if profile in first_token_variants or profile_first in first_token_variants:
                     return True
             return False
 
@@ -1293,19 +1394,22 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         else:
             # Fallback: caller's own transformation
             caller_state = author_state
-            if caller_state and (
-                caller_state.character_name.split(" ", 1)[0].lower() == first_token
-                or caller_state.character_name.lower() == first_token
-            ):
-                state = caller_state
-                target_member = author
-            else:
+            if caller_state:
+                if _name_matches_token(caller_state.character_name, first_token_input):
+                    state = caller_state
+                    target_member = author
+                else:
+                    entry = CHARACTER_BY_NAME.get(caller_state.character_name.strip().lower())
+                    if entry and _character_matches_token(entry, first_token_input):
+                        state = caller_state
+                        target_member = author
+            if state is None:
                 member_candidate = discord.utils.find(
                     lambda m: (
-                        m.display_name.lower() == first_token
-                        or m.display_name.split(" ", 1)[0].lower() == first_token
-                        or m.name.lower() == first_token
-                        or m.name.split(" ", 1)[0].lower() == first_token
+                        m.display_name.lower() in first_token_variants
+                        or m.display_name.split(" ", 1)[0].lower() in first_token_variants
+                        or m.name.lower() in first_token_variants
+                        or m.name.split(" ", 1)[0].lower() in first_token_variants
                     ),
                     guild.members if guild else [],
                 )
@@ -1316,7 +1420,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     state = None
             if state is None:
                 await ctx.reply(
-                    f"No active transformation found for `{first_token}`.",
+                    f"No active transformation found for `{first_token_input}`.",
                     mention_author=False,
                 )
                 return None
@@ -1328,6 +1432,8 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 mention_author=False,
             )
             return None
+
+        target_is_admin = isinstance(target_member, discord.Member) and is_admin(target_member)
 
         if (
             not author_is_admin
@@ -1342,12 +1448,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
         if forced_token:
             forced_character = next(
-                (
-                    character
-                    for character in CHARACTER_POOL
-                    if character.name.split(" ", 1)[0].lower() == forced_token
-                    or character.name.lower() == forced_token
-                ),
+                (character for character in CHARACTER_POOL if _character_matches_token(character, forced_token)),
                 None,
             )
             if forced_character is None:
@@ -1363,6 +1464,30 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             if forced_character is None and forced_inanimate is None:
                 await ctx.reply(
                     f"Unknown target `{forced_token}`. Provide a valid first name.",
+                    mention_author=False,
+                )
+                return None
+            forced_special_name = None
+            if forced_character is not None and _is_special_reroll_name(forced_character.name):
+                forced_special_name = forced_character.name
+            elif forced_inanimate is not None and _is_special_reroll_name(
+                str(forced_inanimate.get("name", ""))
+            ):
+                forced_special_name = str(forced_inanimate.get("name", ""))
+            if (
+                forced_character is not None
+                and _is_admin_only_random_name(forced_character.name)
+                and not author_is_admin
+                and not target_is_admin
+            ):
+                await ctx.reply(
+                    "You can only force Syn or Circe onto admins unless you're an admin yourself.",
+                    mention_author=False,
+                )
+                return None
+            if forced_special_name and author_has_special_reroll and not author_is_admin:
+                await ctx.reply(
+                    "Ball/Narrator TFs can't force others into Ball or Narrator. Ask an admin or owner.",
                     mention_author=False,
                 )
                 return None
@@ -1382,6 +1507,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 mention_author=False,
             )
             return None
+        target_is_admin = isinstance(target_member, discord.Member) and is_admin(target_member)
 
     key = state_key(guild.id, target_member.id)
     current_state = active_transformations.get(key)
@@ -1453,6 +1579,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             for character in CHARACTER_POOL
             if character.name not in used_names and character.name != state.character_name
         ]
+        if not target_is_admin:
+            available_characters = [
+                character
+                for character in available_characters
+                if not _is_admin_only_random_name(character.name)
+            ]
         if not available_characters:
             await ctx.reply(
                 "No alternative characters are available to reroll right now.",

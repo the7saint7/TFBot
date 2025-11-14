@@ -18,6 +18,7 @@ class TFCharacter:
     message: str
     speech_color: Optional[str] = None
     display_name: Optional[str] = None
+    folder: Optional[str] = None
 
 
 @dataclass(frozen=True)

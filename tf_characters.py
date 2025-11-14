@@ -380,7 +380,65 @@ TF_CHARACTERS = [
         "name": "JanePunk (SpringBreak)",
         "avatar_path": "avatars/janePunk.png",
         "message": "buckles a studded cuff that hums with Syn’s mischief, and a bassline thrums under their skin. Their smirk sharpens, rules feel optional, and a delicious urge to start trouble (and finish it) takes the lead."
-    }
+    },
 
+
+
+
+
+    {
+        "name": "Syn",
+        "avatar_path": "avatars/syn.png",
+        "message": " bumps into Syn and switches bodies with them!"
+    },
+    {
+        "name": "Circe",
+        "avatar_path": "avatars/circe.png",
+        "message": " bet with Circe they could do a better job granting wish and so Circe obliged, swapping their lives. For a time..."
+    },    
+    {
+        "name": "Johngb3",
+        "avatar_path": "avatars/johngb3.png",
+        "message": " stepped on a trap left by Syn and were transported in an alternate universe where they became a different version of John."
+    },    
+    {
+        "name": "Jori (Fusion)",
+        "avatar_path": "avatars/john_tori_fusion.png",
+        "folder": "john_tori_fusion",
+        "message": " picked up a strange ring. After putting it on, their bodies began to change. It was another prank by Syn. Quickly they become a sort of fusion of John and Tori Vegas."
+    },
+    {
+        "name": "Jori2 (Fusion)",
+        "avatar_path": "avatars/john_tori_headswap.png",
+        "folder": "john_tori_headswap",
+        "message": " accidentally sat on a magic trap! Soon, their bodies began to change. their bodies developed into the lustful form of Tori Vegas, but to everyone's shock, they have John's head!"
+    },    
+    {
+        "name": "Yuvia (Fusion)",
+        "avatar_path": "avatars/flavia_yui.png",
+        "folder": "flavia_yui",
+        "message": " bumps into Flavia and Yui augmenting and accidentally trigger one of Syn's trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!"
+    },        
+    {
+        "name": "Zoel (Fusion)",
+        "avatar_path": "avatars/flavia_yui.png",
+        "message": " saw Mel and Zoey high-five as they stepped on one of Syn's magical trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!"
+    },
+    {
+        "name": "Allene (Fusion)",
+        "avatar_path": "avatars/irene_allison.png",
+        "message": " saw Mel and Zoey high-five as they stepped on one of Syn's magical trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!"
+    },     
+    {
+        "name": "Riyaka (Fusion)",
+        "avatar_path": "avatars/riyaka.png",
+        "message": " intervened in an argument between Sayaka and Rita and accidentally activated on one of Syn's magical trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!"
+    }, 
+    {
+        "name": "Joey (Fusion)",
+        "avatar_path": "avatars/joey.png",
+        "message": " dropped their notebook as John and Zoey crossed their path and accidentally activated on one of Syn's magical trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!"
+    }          
+    
 ]
 

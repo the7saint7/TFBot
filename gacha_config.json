@@ -3605,6 +3605,152 @@
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+    "johngb3": {
+      "display_name": "JohnGB3 (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },    
+    "jori": {
+      "display_name": "Jori (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "jori2": {
+      "display_name": "Jori2 (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+    "yuvia": {
+      "display_name": "Yuvia (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "zoel": {
+      "display_name": "Zoel (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "allene": {
+      "display_name": "Allene (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "riyaka": {
+      "display_name": "Riyaka (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "joey": {
+      "display_name": "Joey (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "swimsuit": {
+              "rarity": "ultra"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+
   },
   "frog_boost_bonus": 0.15,
   "frog_boost_rolls": 2,

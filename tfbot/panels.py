@@ -112,6 +112,18 @@ VN_LAYOUT_FILE = Path(_VN_LAYOUT_FILE_SETTING) if _VN_LAYOUT_FILE_SETTING else N
 
 SPRITE_IMAGE_SUFFIXES: Tuple[str, ...] = (".png", ".webp")
 
+_CHARACTER_FOLDER_OVERRIDES: Dict[str, str] = {}
+
+
+def set_character_directory_overrides(mapping: Mapping[str, str]) -> None:
+    _CHARACTER_FOLDER_OVERRIDES.clear()
+    for key, value in mapping.items():
+        normalized_key = (key or "").strip().lower()
+        folder_name = (value or "").strip()
+        if not normalized_key or not folder_name:
+            continue
+        _CHARACTER_FOLDER_OVERRIDES[normalized_key] = folder_name
+
 
 def _is_supported_sprite(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SPRITE_IMAGE_SUFFIXES
@@ -619,6 +631,21 @@ def resolve_character_directory(character_name: str) -> Tuple[Optional[Path], Se
         return None, []
     attempted: list[str] = []
     directory_index: Optional[Dict[str, Path]] = None
+    normalized_name = character_name.strip().lower()
+    override_folder = _CHARACTER_FOLDER_OVERRIDES.get(normalized_name)
+    if override_folder:
+        override_path = Path(override_folder)
+        if not override_path.is_absolute():
+            override_path = VN_ASSET_ROOT / override_path
+        attempted.append(override_path.name)
+        if override_path.exists():
+            return override_path, attempted
+        if directory_index is None:
+            directory_index = _character_directory_index(str(VN_ASSET_ROOT))
+        alternate = directory_index.get(override_folder.lower()) if directory_index else None
+        if alternate is not None and alternate.exists():
+            attempted.append(alternate.name)
+            return alternate, attempted
     for key in _candidate_character_keys(character_name):
         candidate = VN_ASSET_ROOT / key
         attempted.append(candidate.name)
@@ -2270,6 +2297,7 @@ __all__ = [
     "get_selected_pose_outfit",
     "set_selected_outfit_name",
     "set_selected_pose_outfit",
+    "set_character_directory_overrides",
     "strip_urls",
     "prepare_panel_mentions",
     "apply_mention_placeholders",
