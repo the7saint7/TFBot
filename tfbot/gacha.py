@@ -263,6 +263,14 @@ class GachaManager:
                 slug = slug_candidates[0] or _normalize_key(character.name)
                 entry = config_characters.get(slug)
 
+            if not isinstance(entry, Mapping):
+                logger.debug(
+                    "Skipping gacha character %s (%s); missing gacha_config entry.",
+                    character.display_name or character.name,
+                    slug or "unknown",
+                )
+                continue
+
             display_name = character.display_name or character.name
             if isinstance(entry, Mapping):
                 configured_name = entry.get("display_name")
