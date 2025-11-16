@@ -225,6 +225,71 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
     return False
 
 
+def _actor_has_narrator_power(member: Optional[discord.Member]) -> bool:
+    if member is None or member.guild is None:
+        return False
+    state = find_active_transformation(member.id, member.guild.id)
+    if not state:
+        return False
+    return _name_matches_token(state.character_name, "narrator")
+
+
+def _extract_user_id_from_token(token: str) -> Optional[int]:
+    cleaned = (token or "").strip()
+    if not cleaned:
+        return None
+    mention_match = re.fullmatch(r"<@!?(\d+)>", cleaned)
+    if mention_match:
+        try:
+            return int(mention_match.group(1))
+        except (TypeError, ValueError):
+            return None
+    if cleaned.isdigit():
+        try:
+            return int(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
+def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[TransformationState]:
+    normalized = (token or "").strip()
+    if not normalized:
+        return None
+    user_id = _extract_user_id_from_token(normalized)
+    if user_id is not None:
+        state = active_transformations.get(state_key(guild.id, user_id))
+        if state:
+            return state
+    token_variants = _token_variants(normalized)
+    for state in active_transformations.values():
+        if state.guild_id != guild.id:
+            continue
+        if _name_matches_token(state.character_name, normalized):
+            return state
+        character_entry = CHARACTER_BY_NAME.get(state.character_name.strip().lower())
+        if character_entry and _character_matches_token(character_entry, normalized):
+            return state
+        member_obj = guild.get_member(state.user_id)
+        if member_obj:
+            profile = member_profile_name(member_obj).lower()
+            profile_first = profile.split(" ", 1)[0]
+            display = member_obj.display_name.lower()
+            display_first = display.split(" ", 1)[0]
+            username = member_obj.name.lower()
+            username_first = username.split(" ", 1)[0]
+            if (
+                profile in token_variants
+                or profile_first in token_variants
+                or display in token_variants
+                or display_first in token_variants
+                or username in token_variants
+                or username_first in token_variants
+            ):
+                return state
+    return None
+
+
 def _is_admin_only_random_name(name: str) -> bool:
     normalized = (name or "").strip().lower()
     if not normalized:
@@ -1850,6 +1915,8 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     except discord.HTTPException:
         pass
 
+    await ensure_state_restored()
+
     if VN_BACKGROUND_ROOT is None:
         try:
             await ctx.author.send("Backgrounds are not configured on this bot.")
@@ -1913,6 +1980,19 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
 
         return
 
+    actor_member = ctx.author if isinstance(ctx.author, discord.Member) else None
+    can_target_others = (
+        ctx.guild is not None
+        and actor_member is not None
+        and (is_admin(actor_member) or _actor_has_narrator_power(actor_member))
+    )
+    selection = selection.strip()
+    target_spec: Optional[str] = None
+    if " " in selection:
+        number_part, target_part = selection.split(None, 1)
+        selection = number_part
+        target_spec = target_part.strip() or None
+
     try:
         index = int(selection)
     except ValueError:
@@ -1932,6 +2012,58 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
         return
 
     selected_path = choices[index - 1]
+    try:
+        relative = selected_path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
+        display = relative.as_posix()
+    except ValueError:
+        display = str(selected_path)
+
+    if target_spec:
+        if ctx.guild is None or actor_member is None:
+            await ctx.reply("Targeted background changes can only be used inside a server channel.", mention_author=False)
+            return
+        if not can_target_others:
+            await ctx.reply("Only admins or the Narrator can set backgrounds for other characters.", mention_author=False)
+            return
+        target_lower = target_spec.lower()
+        if target_lower == "all":
+            targets = [
+                state
+                for state in active_transformations.values()
+                if state.guild_id == ctx.guild.id and not state.is_inanimate
+            ]
+            if not targets:
+                await ctx.reply("No active characters are available to update right now.", mention_author=False)
+                return
+            failures = 0
+            for state in targets:
+                if not set_selected_background(state.user_id, selected_path):
+                    failures += 1
+            schedule_history_refresh()
+            updated = len(targets) - failures
+            await ctx.reply(
+                f"Background set to `{display}` for {updated} character{'s' if updated != 1 else ''}.",
+                mention_author=False,
+            )
+            return
+
+        target_state = _find_state_by_token(ctx.guild, target_spec)
+        if target_state is None:
+            await ctx.reply(f"Couldn't find a transformed character matching `{target_spec}`.", mention_author=False)
+            return
+        if target_state.is_inanimate:
+            await ctx.reply(f"{target_state.character_name} is inanimate and can't use VN backgrounds.", mention_author=False)
+            return
+        if not set_selected_background(target_state.user_id, selected_path):
+            await ctx.reply("Unable to update that background right now.", mention_author=False)
+            return
+        schedule_history_refresh()
+        await ctx.reply(
+            f"Background for {target_state.character_name} set to `{display}`.",
+            mention_author=False,
+        )
+        return
+
     if not set_selected_background(ctx.author.id, selected_path):
         try:
             await ctx.author.send("Unable to update your background at this time.")
@@ -1939,12 +2071,6 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
             if ctx.guild:
                 await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
         return
-
-    try:
-        relative = selected_path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
-        display = relative.as_posix()
-    except ValueError:
-        display = str(selected_path)
 
     try:
         await ctx.author.send(f"Background set to `{display}`.")
@@ -1969,7 +2095,28 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
     await ensure_state_restored()
 
     guild_id = ctx.guild.id if ctx.guild else None
-    state = find_active_transformation(ctx.author.id, guild_id)
+    actor_member = ctx.author if isinstance(ctx.author, discord.Member) else None
+    can_target_others = (
+        ctx.guild is not None
+        and actor_member is not None
+        and (is_admin(actor_member) or _actor_has_narrator_power(actor_member))
+    )
+    target_state: Optional[TransformationState] = None
+    if can_target_others and ctx.guild and " " in outfit_name:
+        base_value, candidate = outfit_name.rsplit(" ", 1)
+        candidate = candidate.strip()
+        if candidate:
+            matched_state = _find_state_by_token(ctx.guild, candidate)
+            if matched_state:
+                target_state = matched_state
+                outfit_name = base_value.strip()
+    if target_state and target_state.is_inanimate:
+        if ctx.guild:
+            await ctx.reply(f"{target_state.character_name} is inanimate and can't change outfits.", mention_author=False)
+        else:
+            await ctx.send(f"{target_state.character_name} is inanimate and can't change outfits.")
+        return
+    state = target_state or find_active_transformation(ctx.author.id, guild_id)
     if not state:
         fallback_state = find_active_transformation(ctx.author.id)
         if fallback_state and ctx.guild and fallback_state.guild_id != guild_id:
@@ -2063,6 +2210,116 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
         await ctx.reply(confirmation, mention_author=False)
     else:
         await ctx.send(confirmation)
+
+
+@bot.command(name="say")
+@commands.guild_only()
+async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
+    await ensure_state_restored()
+
+    actor = ctx.author
+    if not isinstance(actor, discord.Member):
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    can_use_command = is_admin(actor) or _actor_has_narrator_power(actor)
+    if not can_use_command:
+        await ctx.reply("Only admins or the Narrator can use `!say`.", mention_author=False)
+        return
+
+    args = args.strip()
+    if not args or " " not in args:
+        await ctx.reply("Usage: `!say <character> <text>`", mention_author=False)
+        return
+
+    target_token, text = args.split(None, 1)
+    target_state = _find_state_by_token(ctx.guild, target_token)
+    if target_state is None:
+        await ctx.reply(f"Couldn't find a transformed character matching `{target_token}`.", mention_author=False)
+        return
+    if target_state.is_inanimate:
+        await ctx.reply(f"{target_state.character_name} can't speak right now.", mention_author=False)
+        return
+
+    cleaned_content = text.strip()
+    if not cleaned_content:
+        await ctx.reply("Please provide what the character should say.", mention_author=False)
+        return
+
+    _, member = await fetch_member(target_state.guild_id, target_state.user_id)
+    original_name = (
+        member.display_name
+        if isinstance(member, discord.Member)
+        else target_state.original_display_name
+        or f"User {target_state.user_id}"
+    )
+
+    reply_context = await _resolve_reply_context(ctx.message)
+
+    if AI_REWRITE_ENABLED and not cleaned_content.startswith(str(bot.command_prefix)):
+        context_snippet = CHARACTER_CONTEXT.get(target_state.character_name) or target_state.character_message
+        rewritten = await rewrite_message_for_character(
+            original_text=cleaned_content,
+            character_name=target_state.character_name,
+            character_context=context_snippet,
+            user_name=original_name,
+        )
+        if rewritten and rewritten.strip():
+            cleaned_content = rewritten.strip()
+
+    cleaned_content, _ = strip_urls(cleaned_content)
+    cleaned_content = cleaned_content.strip()
+    formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else []
+    custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
+
+    files: list[discord.File] = []
+    payload: dict = {}
+    if MESSAGE_STYLE == "vn":
+        vn_file = render_vn_panel(
+            state=target_state,
+            message_content=cleaned_content,
+            character_display_name=target_state.character_name,
+            original_name=original_name,
+            attachment_id=str(ctx.message.id),
+            formatted_segments=formatted_segments,
+            custom_emoji_images=custom_emoji_images,
+            reply_context=reply_context,
+        )
+        if vn_file:
+            files.append(vn_file)
+
+    description = cleaned_content if cleaned_content else "*no message content*"
+    if not files:
+        embed, avatar_file = await build_legacy_embed(target_state, description)
+        if avatar_file:
+            files.append(avatar_file)
+        payload["embed"] = embed
+
+    send_kwargs: Dict[str, object] = {}
+    send_kwargs.update(payload)
+    if files:
+        send_kwargs["files"] = files
+    message_reference = ctx.message.reference
+    if message_reference:
+        if isinstance(message_reference, discord.Message):
+            message_reference = message_reference.to_reference(fail_if_not_exists=False)
+        send_kwargs["reference"] = message_reference
+        send_kwargs["mention_author"] = False
+
+    try:
+        sent_message = await ctx.channel.send(**send_kwargs)
+    except discord.HTTPException as exc:
+        logger.warning("Failed to send narrator say panel: %s", exc)
+        await ctx.reply("Couldn't deliver that panel.", mention_author=False)
+        return
+
+    if sent_message and cleaned_content:
+        _register_relay_message(sent_message.id, target_state.character_name, cleaned_content)
+
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
 
 @bot.event
 async def on_message(message: discord.Message):
