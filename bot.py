@@ -137,6 +137,35 @@ MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 SPECIAL_REROLL_FORMS = ("ball", "narrator")
 ADMIN_ONLY_RANDOM_FORMS = ("syn", "circe")
 
+def _parse_featured_weight_map(raw: str) -> Dict[str, float]:
+    """Parse comma/semicolon separated token=weight entries."""
+    weights: Dict[str, float] = {}
+    if not raw:
+        return weights
+    for chunk in re.split(r"[;,]", raw):
+        if not chunk:
+            continue
+        if "=" in chunk:
+            token, weight_raw = chunk.split("=", 1)
+        elif ":" in chunk:
+            token, weight_raw = chunk.split(":", 1)
+        else:
+            continue
+        normalized_token = token.strip().lower()
+        if not normalized_token:
+            continue
+        try:
+            weight = float(weight_raw.strip())
+        except ValueError:
+            continue
+        if weight > 0:
+            weights[normalized_token] = weight
+    return weights
+
+
+FEATURED_TF_WEIGHTS = _parse_featured_weight_map(os.getenv("TFBOT_FEATURED_TF_WEIGHTS", ""))
+
+
 configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE, reroll_file=TF_REROLL_FILE)
 tf_stats.update(load_stats_from_disk())
 reroll_cooldowns.update(load_reroll_cooldowns_from_disk())
@@ -223,6 +252,44 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
             if folder_candidate in variants:
                 return True
     return False
+
+
+def _token_active(token: str) -> bool:
+    normalized = (token or "").strip()
+    if not normalized:
+        return False
+    for state in active_transformations.values():
+        if _name_matches_token(state.character_name, normalized):
+            return True
+    return False
+
+
+def _character_weight(character: TFCharacter) -> float:
+    if not FEATURED_TF_WEIGHTS:
+        return 1.0
+    weight = 1.0
+    for token, bonus in FEATURED_TF_WEIGHTS.items():
+        if bonus <= 0:
+            continue
+        if _character_matches_token(character, token) and not _token_active(token):
+            weight *= bonus
+    return max(weight, 0.0)
+
+
+def _select_weighted_character(characters: Sequence[TFCharacter]) -> TFCharacter:
+    if not characters:
+        raise ValueError("Character pool is empty.")
+    weights = [_character_weight(character) for character in characters]
+    total = sum(weights)
+    if total <= 0:
+        return random.choice(list(characters))
+    threshold = random.random() * total
+    accumulator = 0.0
+    for character, weight in zip(characters, weights):
+        accumulator += weight
+        if threshold <= accumulator:
+            return character
+    return characters[-1]
 
 
 def _actor_has_narrator_power(member: Optional[discord.Member]) -> bool:
@@ -1204,7 +1271,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         duration_label = "10 minutes"
         duration_delta = INANIMATE_DURATION
     else:
-        character = random.choice(available_characters)
+        character = _select_weighted_character(available_characters)
         selected_name = character.name
         character_avatar_path = character.avatar_path
         character_message = character.message
