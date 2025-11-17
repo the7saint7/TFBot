@@ -438,7 +438,47 @@ TF_CHARACTERS = [
         "name": "Joey (Fusion)",
         "avatar_path": "avatars/joey.png",
         "message": " dropped their notebook as John and Zoey crossed their path and accidentally activated on one of Syn's magical trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!"
-    }          
+    } ,    
+
+
+
+
+
+
+
+
+
+
+    {
+        "name": "EricGB",
+        "avatar_path": "avatars/ericgb.png",
+        "message": " touched the silver crest Syn shouldn’t even have left behind, and the world ripples around them. Their body softens, curves blooming where none were before, their hair grows long as their clothes shift to fit their new body. A teasing echo of Syn’s laughter lingers in their head as a wave of calm obedience settles in. Somehow, serving feels… right—like this was the prank all along.",
+    },
+    {
+        "name": "Frogyaka",
+        "avatar_path": "avatars/sayaka_frog.png",
+        "message": " steps on green paste and a flash of magic surrounds them. A sudden chill runs through their veins as their skin turns slick and green. Their arms and legs shrink, folding tight beneath them, and the world around them grows impossibly huge. Their clothes vanish in a puff of magic, replaced by a single startled croak. Syn’s laughter echoes somewhere above—‘Ribbit for me, cutie.’",
+    },
+    {
+        "name": "Serena",
+        "avatar_path": "avatars/serena.png",
+        "message": "picked up a small fluffy ball when suddenly a flash of light blinds them. It was another prank sigil left by Syn. Their ears stretch high, soft fur sprouting across their arms and legs as a fluffy tail pops into place. When the light fades, they’re left standing as a startled rabbit-girl—long-eared, wide-eyed, and very, very naked. Syn’s giggle in the distance makes it clear the missing clothes weren’t an accident."
+    },
+    {
+        "name": "KatrinaGB",
+        "avatar_path": "avatars/katrinagb.png",
+        "message": "picks up a notebook that Syn left behind, and a soft glow crawls up their arm. Soon they are transformed into a handsome young man filled with curiosity and a desire to experiment with their new perspective.",
+    },
+    {
+        "name": "Kiyo",
+        "avatar_path": "avatars/kiyoshigb.png",
+        "message": "hesitate after hearing a familiar giggle. But too late they feel their hair grow very long and their frame grow smaller. Soon they have a small pair of breast of their own...",
+    },    
+    {
+        "name": "RileyGB",
+        "avatar_path": "avatars/rileygb.png",
+        "message": "drinks a strange soda with a magical curse on it. Next thing they know, they are weak and pathetic Riley. Forced to dress 'en femme' by their best friend Genny and come to the party.",
+    },    
     
 ]
 
