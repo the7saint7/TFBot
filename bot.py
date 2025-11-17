@@ -249,9 +249,45 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
         last_segment = folder_normalized.rsplit("/", 1)[-1]
         folder_candidates.add(last_segment)
         for folder_candidate in folder_candidates:
-            if folder_candidate in variants:
-                return True
+        if folder_candidate in variants:
+            return True
     return False
+
+
+def _find_character_by_token(token: str) -> Optional[TFCharacter]:
+    normalized = (token or "").strip()
+    if not normalized:
+        return None
+    for character in CHARACTER_POOL:
+        if _character_matches_token(character, normalized):
+            return character
+    return None
+
+
+def _build_roleplay_state(
+    character: TFCharacter, actor: discord.Member, guild: Optional[discord.Guild]
+) -> TransformationState:
+    now = utc_now()
+    guild_id = 0
+    if guild is not None:
+        guild_id = guild.id
+    elif actor.guild:
+        guild_id = actor.guild.id
+    return TransformationState(
+        user_id=actor.id,
+        guild_id=guild_id,
+        character_name=character.name,
+        character_avatar_path=character.avatar_path,
+        character_message=character.message,
+        original_nick=actor.nick,
+        started_at=now,
+        expires_at=now + timedelta(hours=1),
+        duration_label="roleplay",
+        avatar_applied=False,
+        original_display_name=member_profile_name(actor),
+        is_inanimate=False,
+        inanimate_responses=tuple(),
+    )
 
 
 def _token_active(token: str) -> bool:
@@ -2306,8 +2342,14 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
     target_token, text = args.split(None, 1)
     target_state = _find_state_by_token(ctx.guild, target_token)
     if target_state is None:
-        await ctx.reply(f"Couldn't find a transformed character matching `{target_token}`.", mention_author=False)
-        return
+        character = _find_character_by_token(target_token)
+        if character is None:
+            await ctx.reply(
+                f"Couldn't find a character or active TF matching `{target_token}`.",
+                mention_author=False,
+            )
+            return
+        target_state = _build_roleplay_state(character, actor, ctx.guild)
     if target_state.is_inanimate:
         await ctx.reply(f"{target_state.character_name} can't speak right now.", mention_author=False)
         return
