@@ -249,8 +249,8 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
         last_segment = folder_normalized.rsplit("/", 1)[-1]
         folder_candidates.add(last_segment)
         for folder_candidate in folder_candidates:
-        if folder_candidate in variants:
-            return True
+            if folder_candidate in variants:
+                return True
     return False
 
 
