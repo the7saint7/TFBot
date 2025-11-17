@@ -1277,6 +1277,11 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         character_message = character.message
         inanimate_responses = tuple()
         duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
+        if _name_matches_token(selected_name, "narrator") or _name_matches_token(
+            selected_name, "ball"
+        ):
+            duration_label = "1 hour"
+            duration_delta = timedelta(hours=1)
     now = utc_now()
     expires_at = now + duration_delta
     original_nick = member.nick
