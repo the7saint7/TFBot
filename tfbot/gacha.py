@@ -197,6 +197,7 @@ class GachaManager:
         else:
             self._boost_target_rarities = ("rare", "epic", "ultra")
         self._gacha_channel: Optional[discord.TextChannel] = None
+        self._rp_forum_post_id = int_from_env("TFBOT_RP_FORUM_POST_ID", 0)
 
     def _load_rarity_weights(self) -> Dict[str, float]:
         default_weights = {"common": 70.0, "rare": 25.0, "epic": 4.0, "ultra": 1.0}
@@ -1886,6 +1887,20 @@ class GachaManager:
             "- `!givecoins @user [amount]` - (Admins) Grant Rudy coins to a player.",
             "- `!givecharacter @user <name>` - (Admins) Grant a character plus a common outfit if available.",
         ]
+        if self._rp_forum_post_id:
+            rp_channel = f"<#{self._rp_forum_post_id}>"
+            lines.extend(
+                [
+                    "",
+                    "**RP Thread Commands**",
+                    f"Use these inside {rp_channel} (only the assigned DM/owner has access).",
+                    "- `!dm` — Show or assign the Dungeon Master for the RP thread.",
+                    "- `!n <text>` — Narrator shortcut for `!say narrator <text>`.",
+                    "- `!b <text>` — Syn's Ball shortcut for `!say ball <text>`.",
+                    "- `!r <target> [forced]` — Reroll a player (seeding their first TF if needed).",
+                    "- `!rename <target> <new name>` — Override how a player's VN panel name appears.",
+                ]
+            )
         message = "\n".join(lines)
         try:
             await ctx.message.delete()

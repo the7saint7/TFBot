@@ -82,6 +82,7 @@ from tfbot.panels import (
     vn_outfit_selection,
     persist_outfit_selections,
 )
+from tfbot.roleplay import RoleplayCog, add_roleplay_cog
 from tfbot.utils import (
     float_from_env,
     int_from_env,
@@ -118,6 +119,8 @@ TF_ARCHIVE_CHANNEL_ID = int_from_env("TFBOT_ARCHIVE_CHANNEL_ID", 0)
 TF_STATE_FILE = Path(os.getenv("TFBOT_STATE_FILE", "tf_state.json"))
 TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
 TF_REROLL_FILE = Path(os.getenv("TFBOT_REROLL_FILE", "tf_reroll.json"))
+ROLEPLAY_FORUM_POST_ID = int_from_env("TFBOT_RP_FORUM_POST_ID", 0)
+ROLEPLAY_STATE_FILE = Path(os.getenv("TFBOT_RP_STATE_FILE", "rp_forum_state.json"))
 MESSAGE_STYLE = os.getenv(
     "TFBOT_MESSAGE_STYLE",
     "vn" if GACHA_ENABLED else "classic",
@@ -264,6 +267,24 @@ def _find_character_by_token(token: str) -> Optional[TFCharacter]:
     return None
 
 
+def _find_inanimate_form_by_token(token: str) -> Optional[Dict[str, object]]:
+    normalized = (token or "").strip()
+    if not normalized:
+        return None
+    variants = _token_variants(normalized)
+    if not variants:
+        return None
+    for entry in INANIMATE_FORMS:
+        name_raw = str(entry.get("name", "")).strip()
+        if not name_raw:
+            continue
+        lowered = name_raw.lower()
+        first = lowered.split(" ", 1)[0]
+        if lowered in variants or first in variants:
+            return entry
+    return None
+
+
 def _build_roleplay_state(
     character: TFCharacter, actor: discord.Member, guild: Optional[discord.Guild]
 ) -> TransformationState:
@@ -285,6 +306,58 @@ def _build_roleplay_state(
         duration_label="roleplay",
         avatar_applied=False,
         original_display_name=member_profile_name(actor),
+        is_inanimate=False,
+        inanimate_responses=tuple(),
+    )
+
+
+def _build_inanimate_roleplay_state(
+    entry: Dict[str, object], actor: discord.Member, guild: Optional[discord.Guild]
+) -> TransformationState:
+    now = utc_now()
+    guild_id = actor.guild.id if actor.guild else 0
+    if guild is not None:
+        guild_id = guild.id
+    responses_raw = entry.get("responses") or []
+    responses: Tuple[str, ...]
+    if isinstance(responses_raw, (list, tuple)):
+        responses = tuple(str(item).strip() for item in responses_raw if str(item).strip())
+    else:
+        responses = tuple()
+    if not responses:
+        message = str(entry.get("message") or "").strip()
+        responses = (message,) if message else tuple()
+    return TransformationState(
+        user_id=actor.id,
+        guild_id=guild_id,
+        character_name=str(entry.get("name") or "Mysterious Relic"),
+        character_avatar_path=str(entry.get("avatar_path") or ""),
+        character_message=str(entry.get("message") or ""),
+        original_nick=actor.nick,
+        started_at=now,
+        expires_at=now + timedelta(hours=1),
+        duration_label="roleplay",
+        avatar_applied=False,
+        original_display_name=member_profile_name(actor),
+        is_inanimate=True,
+        inanimate_responses=responses,
+    )
+
+
+def _build_placeholder_state(member: discord.Member, guild: discord.Guild) -> TransformationState:
+    now = utc_now()
+    return TransformationState(
+        user_id=member.id,
+        guild_id=guild.id,
+        character_name="",
+        character_avatar_path="",
+        character_message="",
+        original_nick=member.nick,
+        original_display_name=member_profile_name(member),
+        started_at=now,
+        expires_at=now,
+        duration_label="",
+        avatar_applied=False,
         is_inanimate=False,
         inanimate_responses=tuple(),
     )
@@ -710,6 +783,26 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents)
+ROLEPLAY_COG: Optional[RoleplayCog] = None
+
+
+@bot.event
+async def setup_hook():
+    global ROLEPLAY_COG
+    if ROLEPLAY_FORUM_POST_ID > 0:
+        ROLEPLAY_COG = await add_roleplay_cog(
+            bot,
+            forum_post_id=ROLEPLAY_FORUM_POST_ID,
+            state_file=ROLEPLAY_STATE_FILE,
+        )
+
+
+def _selection_scope_for_channel(channel: Optional[discord.abc.GuildChannel]) -> Optional[str]:
+    if ROLEPLAY_COG is None or channel is None:
+        return None
+    if ROLEPLAY_COG.is_roleplay_post(channel):
+        return "rp"
+    return None
 
 
 class GuardedHelpCommand(commands.DefaultHelpCommand):
@@ -983,6 +1076,8 @@ async def relay_transformed_message(
     if guild is None:
         return False
 
+    selection_scope = _selection_scope_for_channel(message.channel)
+
     cleaned_content = message.content.strip()
     original_content = cleaned_content
     generated_inanimate_response = False
@@ -1049,15 +1144,21 @@ async def relay_transformed_message(
                 reply_context.author,
                 reply_context.text[:120],
             )
+        character_display_name = state.character_name
+        if ROLEPLAY_COG and message.guild and ROLEPLAY_COG.is_roleplay_post(message.channel):
+            override_display = ROLEPLAY_COG.resolve_display_name(message.guild.id, message.author.id)
+            if override_display:
+                character_display_name = override_display
         vn_file = render_vn_panel(
             state=state,
             message_content=cleaned_content,
-            character_display_name=state.character_name,
+            character_display_name=character_display_name,
             original_name=message.author.display_name,
             attachment_id=str(message.id),
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
             reply_context=reply_context,
+            selection_scope=selection_scope,
             gacha_star_count=gacha_stars,
             gacha_outfit_override=gacha_outfit,
             gacha_pose_override=gacha_pose,
@@ -1510,7 +1611,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
-    author_is_admin = is_admin(author)
+    roleplay_dm_override = (
+        ROLEPLAY_COG is not None
+        and ROLEPLAY_COG.is_roleplay_post(ctx.channel)
+        and ROLEPLAY_COG.has_control(author)
+    )
+    author_is_admin = is_admin(author) or roleplay_dm_override
 
     guild = ctx.guild
     if guild is None:
@@ -1543,23 +1649,27 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 return None
             forced_token = parts[1].lower()
 
-        def _state_matches(state: TransformationState) -> bool:
-            if state.guild_id != guild.id:
-                return False
-            if _name_matches_token(state.character_name, first_token_input):
-                return True
-            character_entry = CHARACTER_BY_NAME.get(state.character_name.strip().lower())
+        character_state_matches: list[TransformationState] = []
+        member_state_matches: list[TransformationState] = []
+
+        for state_candidate in active_transformations.values():
+            if state_candidate.guild_id != guild.id:
+                continue
+            if _name_matches_token(state_candidate.character_name, first_token_input):
+                character_state_matches.append(state_candidate)
+                continue
+            character_entry = CHARACTER_BY_NAME.get(state_candidate.character_name.strip().lower())
             if character_entry and _character_matches_token(character_entry, first_token_input):
-                return True
-            member_obj = guild.get_member(state.user_id)
+                character_state_matches.append(state_candidate)
+                continue
+            member_obj = guild.get_member(state_candidate.user_id)
             if member_obj:
                 profile = member_profile_name(member_obj).lower()
                 profile_first = profile.split(" ", 1)[0]
                 if profile in first_token_variants or profile_first in first_token_variants:
-                    return True
-            return False
+                    member_state_matches.append(state_candidate)
 
-        matching_states = [s for s in active_transformations.values() if _state_matches(s)]
+        matching_states = character_state_matches or member_state_matches
         target_member = None
         if matching_states:
             state = matching_states[0]
@@ -1589,14 +1699,41 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 if member_candidate:
                     state = find_active_transformation(member_candidate.id, guild.id)
                     target_member = member_candidate
-                else:
-                    state = None
             if state is None:
-                await ctx.reply(
-                    f"No active transformation found for `{first_token_input}`.",
-                    mention_author=False,
-                )
-                return None
+                # In RP, allow DM/owner to bootstrap a first TF for the target.
+                if roleplay_dm_override and guild:
+                    if target_member is None:
+                        user_id_token = _extract_user_id_from_token(first_token_input)
+                        member_lookup: Optional[discord.Member] = None
+                        if user_id_token:
+                            member_lookup = guild.get_member(user_id_token)
+                        if member_lookup is None:
+                            member_lookup = discord.utils.find(
+                                lambda m: m.name.lower() == first_token or m.display_name.lower() == first_token,
+                                guild.members,
+                            )
+                        target_member = member_lookup
+                    if target_member is None:
+                        await ctx.reply(
+                            f"Couldn't find a member matching `{first_token_input}`.",
+                            mention_author=False,
+                        )
+                        return None
+                    logger.debug(
+                        "RP reroll creating placeholder state for %s (%s)",
+                        target_member,
+                        target_member.id,
+                    )
+                    placeholder = _build_placeholder_state(target_member, guild)
+                    key = state_key(guild.id, target_member.id)
+                    active_transformations[key] = placeholder
+                    state = placeholder
+                else:
+                    await ctx.reply(
+                        f"No active transformation found for `{first_token_input}`.",
+                        mention_author=False,
+                    )
+                    return None
             if target_member is None:
                 _, target_member = await fetch_member(state.guild_id, state.user_id)
         if target_member is None:
@@ -2023,6 +2160,17 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     except discord.HTTPException:
         pass
 
+    async def send_channel_feedback(content: str, **kwargs) -> None:
+        kwargs.setdefault("mention_author", False)
+        reference = None
+        try:
+            reference = ctx.message.to_reference(fail_if_not_exists=False)
+        except (AttributeError, discord.HTTPException):
+            reference = None
+        if reference is not None:
+            kwargs.setdefault("reference", reference)
+        await ctx.send(content, **kwargs)
+
     await ensure_state_restored()
 
     if VN_BACKGROUND_ROOT is None:
@@ -2128,10 +2276,10 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
 
     if target_spec:
         if ctx.guild is None or actor_member is None:
-            await ctx.reply("Targeted background changes can only be used inside a server channel.", mention_author=False)
+            await send_channel_feedback("Targeted background changes can only be used inside a server channel.")
             return
         if not can_target_others:
-            await ctx.reply("Only admins or the Narrator can set backgrounds for other characters.", mention_author=False)
+            await send_channel_feedback("Only admins or the Narrator can set backgrounds for other characters.")
             return
         target_lower = target_spec.lower()
         if target_lower == "all":
@@ -2141,7 +2289,7 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
                 if state.guild_id == ctx.guild.id and not state.is_inanimate
             ]
             if not targets:
-                await ctx.reply("No active characters are available to update right now.", mention_author=False)
+                await send_channel_feedback("No active characters are available to update right now.")
                 return
             failures = 0
             for state in targets:
@@ -2149,27 +2297,45 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
                     failures += 1
             schedule_history_refresh()
             updated = len(targets) - failures
-            await ctx.reply(
-                f"Background set to `{display}` for {updated} character{'s' if updated != 1 else ''}.",
-                mention_author=False,
+            await send_channel_feedback(
+                f"Background set to `{display}` for {updated} character{'s' if updated != 1 else ''}."
             )
             return
 
         target_state = _find_state_by_token(ctx.guild, target_spec)
         if target_state is None:
-            await ctx.reply(f"Couldn't find a transformed character matching `{target_spec}`.", mention_author=False)
+            rp_narrator_target = (
+                ROLEPLAY_COG is not None
+                and ROLEPLAY_COG.is_roleplay_post(ctx.channel)
+                and _name_matches_token("narrator", target_spec)
+            )
+            if rp_narrator_target:
+                dm_user_id = ROLEPLAY_COG.dm_user_id
+                if not dm_user_id:
+                    await send_channel_feedback("Assign a DM before setting the narrator's background.")
+                    return
+                dm_member = ctx.guild.get_member(dm_user_id)
+                if dm_member is None:
+                    await send_channel_feedback("I couldn't find the assigned DM in this server.")
+                    return
+                if not set_selected_background(dm_user_id, selected_path):
+                    await send_channel_feedback("Unable to update the narrator's background right now.")
+                    return
+                schedule_history_refresh()
+                await send_channel_feedback(f"Narrator background set to `{display}`.")
+                return
+            await send_channel_feedback(f"Couldn't find a transformed character matching `{target_spec}`.")
             return
         if target_state.is_inanimate:
-            await ctx.reply(f"{target_state.character_name} is inanimate and can't use VN backgrounds.", mention_author=False)
+            await send_channel_feedback(
+                f"{target_state.character_name} is inanimate and can't use VN backgrounds."
+            )
             return
         if not set_selected_background(target_state.user_id, selected_path):
-            await ctx.reply("Unable to update that background right now.", mention_author=False)
+            await send_channel_feedback("Unable to update that background right now.")
             return
         schedule_history_refresh()
-        await ctx.reply(
-            f"Background for {target_state.character_name} set to `{display}`.",
-            mention_author=False,
-        )
+        await send_channel_feedback(f"Background for {target_state.character_name} set to `{display}`.")
         return
 
     if not set_selected_background(ctx.author.id, selected_path):
@@ -2201,6 +2367,10 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
         return
 
     await ensure_state_restored()
+
+    selection_scope = _selection_scope_for_channel(
+        ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
+    )
 
     guild_id = ctx.guild.id if ctx.guild else None
     actor_member = ctx.author if isinstance(ctx.author, discord.Member) else None
@@ -2292,7 +2462,12 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
     else:
         normalized_pose = None
 
-    if not set_selected_pose_outfit(state.character_name, parsed_pose if normalized_pose else None, parsed_outfit):
+    if not set_selected_pose_outfit(
+        state.character_name,
+        parsed_pose if normalized_pose else None,
+        parsed_outfit,
+        scope=selection_scope,
+    ):
         pose_lines = []
         for pose, options in pose_outfits.items():
             pose_lines.append(f"{pose}: {', '.join(options)}")
@@ -2306,7 +2481,10 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
             await ctx.send(message)
         return
 
-    selected_pose, selected_outfit = get_selected_pose_outfit(state.character_name)
+    selected_pose, selected_outfit = get_selected_pose_outfit(
+        state.character_name,
+        scope=selection_scope,
+    )
     pose_label = selected_pose or "auto"
     outfit_label = selected_outfit or parsed_outfit
     confirmation = (
@@ -2330,6 +2508,8 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return
     can_use_command = is_admin(actor) or _actor_has_narrator_power(actor)
+    if not can_use_command and ROLEPLAY_COG is not None and ROLEPLAY_COG.is_roleplay_post(ctx.channel):
+        can_use_command = ROLEPLAY_COG.has_control(actor)
     if not can_use_command:
         await ctx.reply("Only admins or the Narrator can use `!say`.", mention_author=False)
         return
@@ -2339,18 +2519,37 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
         await ctx.reply("Usage: `!say <character> <text>`", mention_author=False)
         return
 
+    selection_scope = _selection_scope_for_channel(
+        ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
+    )
+
+    selection_scope = _selection_scope_for_channel(ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None)
+
     target_token, text = args.split(None, 1)
     target_state = _find_state_by_token(ctx.guild, target_token)
     if target_state is None:
         character = _find_character_by_token(target_token)
-        if character is None:
-            await ctx.reply(
-                f"Couldn't find a character or active TF matching `{target_token}`.",
-                mention_author=False,
-            )
-            return
-        target_state = _build_roleplay_state(character, actor, ctx.guild)
-    if target_state.is_inanimate:
+        if character is not None:
+            target_state = _build_roleplay_state(character, actor, ctx.guild)
+        else:
+            inanimate_entry = _find_inanimate_form_by_token(target_token)
+            if inanimate_entry is not None:
+                target_state = _build_inanimate_roleplay_state(inanimate_entry, actor, ctx.guild)
+    if target_state is None:
+        await ctx.reply(
+            f"Couldn't find a character or active TF matching `{target_token}`.",
+            mention_author=False,
+        )
+        return
+    if (
+        ROLEPLAY_COG
+        and ROLEPLAY_COG.is_roleplay_post(ctx.channel)
+        and ROLEPLAY_COG.dm_user_id
+        and _name_matches_token(target_state.character_name, "narrator")
+    ):
+        target_state.user_id = ROLEPLAY_COG.dm_user_id
+    is_ball_character = target_state.is_inanimate and _name_matches_token(target_state.character_name, "ball")
+    if target_state.is_inanimate and not is_ball_character:
         await ctx.reply(f"{target_state.character_name} can't speak right now.", mention_author=False)
         return
 
@@ -2387,7 +2586,10 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
 
     files: list[discord.File] = []
     payload: dict = {}
-    if MESSAGE_STYLE == "vn":
+    if MESSAGE_STYLE == "vn" and not target_state.is_inanimate:
+        if formatted_segments is None:
+            formatted_segments = parse_discord_formatting(cleaned_content)
+        custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
         vn_file = render_vn_panel(
             state=target_state,
             message_content=cleaned_content,
@@ -2397,6 +2599,7 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
             reply_context=reply_context,
+            selection_scope=selection_scope,
         )
         if vn_file:
             files.append(vn_file)
@@ -2412,12 +2615,8 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
     send_kwargs.update(payload)
     if files:
         send_kwargs["files"] = files
-    message_reference = ctx.message.reference
-    if message_reference:
-        if isinstance(message_reference, discord.Message):
-            message_reference = message_reference.to_reference(fail_if_not_exists=False)
-        send_kwargs["reference"] = message_reference
-        send_kwargs["mention_author"] = False
+    send_kwargs["reference"] = ctx.message.to_reference(fail_if_not_exists=False)
+    send_kwargs["mention_author"] = False
 
     try:
         sent_message = await ctx.channel.send(**send_kwargs)
@@ -2451,7 +2650,20 @@ async def on_message(message: discord.Message):
     ctx = await bot.get_context(message)
     if ctx.command:
         command_invoked = True
+        logger.debug(
+            "Invoking command %s by %s in channel %s",
+            ctx.command.qualified_name,
+            message.author.id,
+            getattr(message.channel, "id", None),
+        )
         await bot.invoke(ctx)
+    elif message.content.startswith(str(bot.command_prefix)):
+        logger.debug(
+            "Command-like message ignored (ctx.command missing) content=%s author=%s channel=%s",
+            message.content,
+            message.author.id,
+            getattr(message.channel, "id", None),
+        )
 
     if command_invoked:
         return None
@@ -2469,24 +2681,31 @@ async def on_message(message: discord.Message):
     if not CLASSIC_ENABLED:
         return None
 
+    channel_id = getattr(message.channel, "id", None)
+    is_roleplay_forum_post = ROLEPLAY_COG is not None and ROLEPLAY_COG.is_roleplay_post(message.channel)
     is_admin_user = is_admin(message.author)
-    if message.guild and message.guild.owner_id == message.author.id:
+    if message.guild and message.guild.owner_id == message.author.id and not is_roleplay_forum_post:
         logger.debug("Ignoring message %s from server owner %s", message.id, message.author.id)
         return None
-    channel_id = getattr(message.channel, "id", None)
-    if message.guild and TF_CHANNEL_ID > 0 and channel_id != TF_CHANNEL_ID:
+    allowed_channels: set[int] = set()
+    if TF_CHANNEL_ID > 0:
+        allowed_channels.add(TF_CHANNEL_ID)
+    rp_forum_post_id = ROLEPLAY_COG.forum_post_id if ROLEPLAY_COG else 0
+    if rp_forum_post_id:
+        allowed_channels.add(rp_forum_post_id)
+    if message.guild and allowed_channels and channel_id not in allowed_channels:
         logger.info(
-            "Skipping message %s: channel %s is not the configured TF channel (%s).",
+            "Skipping message %s: channel %s is not in the monitored TF/RP channels %s.",
             message.id,
             channel_id,
-            TF_CHANNEL_ID,
+            ", ".join(str(cid) for cid in sorted(allowed_channels)),
         )
         return None
 
     profile: Optional["GachaProfile"] = None
     gacha_equipped = False
     gacha_handled = False
-    if GACHA_MANAGER is not None and message.guild:
+    if not is_roleplay_forum_post and GACHA_MANAGER is not None and message.guild:
         profile = await GACHA_MANAGER.ensure_profile(message.guild.id, message.author.id)
         allowed = await GACHA_MANAGER.enforce_spam_policy(message, profile=profile)
         if not allowed:
@@ -2517,6 +2736,9 @@ async def on_message(message: discord.Message):
             message.author.id,
             message.guild.id,
         )
+        return None
+
+    if is_roleplay_forum_post:
         return None
 
     logger.info(

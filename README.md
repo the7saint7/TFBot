@@ -39,6 +39,8 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | `TFBOT_VN_CACHE_DIR` | Directory that stores cached composite VN avatars (set empty to disable) | `vn_cache` |
 | `TFBOT_VN_SELECTIONS` | JSON file storing per-character outfit overrides | `tf_outfits.json` |
 | `TFBOT_STATS_FILE` | JSON file storing per-user TF counts | `tf_stats.json` |
+| `TFBOT_RP_FORUM_POST_ID` | Optional forum post (thread) ID to enable the RP assistant. When set, RP-only commands monitor that single post. | _(unset)_ |
+| `TFBOT_RP_STATE_FILE` | JSON file that persists RP-specific assignments (DM, renamed characters, original identities). | `rp_forum_state.json` |
 | `TFBOT_AI_REWRITE` | Enable GPT paraphrasing for character voice (`true`/`false`) | `false` |
 | `TFBOT_AI_MODEL` | OpenAI chat model used for rewrites | `gpt-3.5-turbo-1106` |
 | `TFBOT_AI_MAX_TOKENS` | Maximum tokens to generate during rewrites | `80` |
@@ -74,6 +76,14 @@ Set `TFBOT_MODE=gacha` to run only the collection game. If you keep the default 
 - Any member can type `!tf` to see how many times they've transformed and how often each character has appeared.
 - Set `TFBOT_MAGIC_EMOJI_NAME` to the custom emoji name you want prefixed on TF narration; the bot looks it up per guild and falls back to plain text if missing.
 - Only one user can embody a given character at a time; if every character is occupied, additional messages simply won't trigger until someone reverts.
+- If you run a dedicated RP forum post, set `TFBOT_RP_FORUM_POST_ID` to the thread ID. Inside that post the DM can manage long-term identities with a separate set of shortcuts:
+  - `!dm` — Show the current Dungeon Master assignment, or run `!dm @user` (admin/owner only) to assign the DM role.
+  - `!n <text>` — Narrator shortcut for `!say narrator <text>` (DM/owner only).
+  - `!b <text>` – Syn's Ball shortcut for `!say ball <text>` (DM/owner only).
+  - `!r <target> [forced]` – Convenience wrapper around `!reroll`, including the ability to seed a player's first TF directly from the RP thread (DM/owner only).
+  - `!rename <target> <new name>` – Override a player's displayed VN panel name within the RP post (DM/owner only).
+  - `!unload <target>` – Remove a player's RP assignment and stop their VN relay until they’re rerolled again.
+  - The RP thread keeps its own background/outfit selections so changing cosmetics there will not affect the classic TF channel.
 
 Update `tf_characters.py` with your own roster (names, local avatar paths under `avatars/`, narration). Each `message` should contain only the unique narration body; the bot automatically prefixes the user's name and appends “becomes **{character}** for {duration}!” around it. Drop your PNGs/JPGs into the `avatars` folder and point each `avatar_path` field at the correct file.
 

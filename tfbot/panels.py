@@ -685,13 +685,45 @@ def list_available_outfits(character_name: str) -> Sequence[str]:
     return sorted(outfits)
 
 
-def get_selected_outfit_for_dir(directory: Path) -> Optional[str]:
-    _, outfit = get_selected_pose_outfit_for_dir(directory)
+def _normalize_selection_scope(scope: Optional[str]) -> str:
+    if scope is None:
+        return "default"
+    normalized = scope.strip().lower()
+    return normalized or "default"
+
+
+def _selection_lookup_keys(directory: Path, scope: Optional[str]) -> list[str]:
+    base = directory.name.lower()
+    normalized = _normalize_selection_scope(scope)
+    keys: list[str] = []
+    if normalized != "default":
+        keys.append(f"{normalized}:{base}")
+    keys.append(base)
+    return keys
+
+
+def _selection_store_key(directory: Path, scope: Optional[str]) -> str:
+    base = directory.name.lower()
+    normalized = _normalize_selection_scope(scope)
+    if normalized == "default":
+        return base
+    return f"{normalized}:{base}"
+
+
+def get_selected_outfit_for_dir(directory: Path, scope: Optional[str] = None) -> Optional[str]:
+    _, outfit = get_selected_pose_outfit_for_dir(directory, scope=scope)
     return outfit
 
 
-def get_selected_pose_outfit_for_dir(directory: Path) -> Tuple[Optional[str], Optional[str]]:
-    entry = vn_outfit_selection.get(directory.name.lower())
+def get_selected_pose_outfit_for_dir(
+    directory: Path,
+    scope: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    entry = None
+    for key in _selection_lookup_keys(directory, scope):
+        entry = vn_outfit_selection.get(key)
+        if entry:
+            break
     if not entry:
         return None, None
     pose: Optional[str] = None
@@ -714,26 +746,35 @@ def get_selected_pose_outfit_for_dir(directory: Path) -> Tuple[Optional[str], Op
     return pose, outfit
 
 
-def get_selected_outfit_name(character_name: str) -> Optional[str]:
-    _, outfit = get_selected_pose_outfit(character_name)
+def get_selected_outfit_name(character_name: str, scope: Optional[str] = None) -> Optional[str]:
+    _, outfit = get_selected_pose_outfit(character_name, scope=scope)
     return outfit
 
 
-def get_selected_pose_outfit(character_name: str) -> Tuple[Optional[str], Optional[str]]:
+def get_selected_pose_outfit(
+    character_name: str,
+    scope: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
     directory, _ = resolve_character_directory(character_name)
     if directory is None:
         return None, None
-    return get_selected_pose_outfit_for_dir(directory)
+    return get_selected_pose_outfit_for_dir(directory, scope=scope)
 
 
-def set_selected_outfit_name(character_name: str, outfit_name: str) -> bool:
-    return set_selected_pose_outfit(character_name, None, outfit_name)
+def set_selected_outfit_name(
+    character_name: str,
+    outfit_name: str,
+    scope: Optional[str] = None,
+) -> bool:
+    return set_selected_pose_outfit(character_name, None, outfit_name, scope=scope)
 
 
 def set_selected_pose_outfit(
     character_name: str,
     pose_name: Optional[str],
     outfit_name: str,
+    *,
+    scope: Optional[str] = None,
 ) -> bool:
     directory, attempted = resolve_character_directory(character_name)
     if directory is None:
@@ -781,8 +822,8 @@ def set_selected_pose_outfit(
     if matched_outfit is None or matched_pose is None:
         return False
 
-    key = directory.name.lower()
-    vn_outfit_selection[key] = {"pose": matched_pose, "outfit": matched_outfit}
+    store_key = _selection_store_key(directory, scope)
+    vn_outfit_selection[store_key] = {"pose": matched_pose, "outfit": matched_outfit}
     persist_outfit_selections()
     compose_game_avatar.cache_clear()
     logger.info(
@@ -794,7 +835,7 @@ def set_selected_pose_outfit(
     return True
 
 
-_COMPOSE_AVATAR_CACHE: "OrderedDict[Tuple[str, Optional[str], Optional[str]], 'Image.Image']" = OrderedDict()
+_COMPOSE_AVATAR_CACHE: "OrderedDict[Tuple[str, Optional[str], Optional[str], str], 'Image.Image']" = OrderedDict()
 _COMPOSE_AVATAR_CACHE_LIMIT = 512
 
 
@@ -802,13 +843,20 @@ def compose_game_avatar(
     character_name: str,
     pose_override: Optional[str] = None,
     outfit_override: Optional[str] = None,
+    selection_scope: Optional[str] = None,
 ) -> Optional["Image.Image"]:
-    cache_key = (character_name, pose_override, outfit_override)
+    scope_key = _normalize_selection_scope(selection_scope)
+    cache_key = (character_name, pose_override, outfit_override, scope_key)
     cached = _COMPOSE_AVATAR_CACHE.get(cache_key)
     if cached is not None:
         _COMPOSE_AVATAR_CACHE.move_to_end(cache_key)
         return cached
-    image = _compose_game_avatar_uncached(character_name, pose_override, outfit_override)
+    image = _compose_game_avatar_uncached(
+        character_name,
+        pose_override,
+        outfit_override,
+        selection_scope=scope_key,
+    )
     if image is not None:
         _COMPOSE_AVATAR_CACHE[cache_key] = image
         _COMPOSE_AVATAR_CACHE.move_to_end(cache_key)
@@ -821,6 +869,8 @@ def _compose_game_avatar_uncached(
     character_name: str,
     pose_override: Optional[str] = None,
     outfit_override: Optional[str] = None,
+    *,
+    selection_scope: Optional[str] = None,
 ) -> Optional["Image.Image"]:
     layout = resolve_panel_layout(character_name)
     if layout and layout.get("disable_avatar"):
@@ -843,7 +893,10 @@ def _compose_game_avatar_uncached(
         logger.debug("VN sprite: no variant directory found for %s", character_dir.name)
         return None
 
-    preferred_pose, preferred_outfit = get_selected_pose_outfit_for_dir(character_dir)
+    preferred_pose, preferred_outfit = get_selected_pose_outfit_for_dir(
+        character_dir,
+        scope=selection_scope,
+    )
     if pose_override:
         cleaned_pose = pose_override.strip()
         if cleaned_pose:
@@ -1748,6 +1801,7 @@ def render_vn_panel(
     formatted_segments: Sequence[dict],
     custom_emoji_images: Dict[str, "Image.Image"],
     reply_context: Optional[ReplyContext],
+    selection_scope: Optional[str] = None,
     gacha_star_count: Optional[int] = None,
     gacha_rudy: Optional[int] = None,
     gacha_frog: Optional[int] = None,
@@ -1840,6 +1894,7 @@ def render_vn_panel(
             state.character_name,
             pose_override=gacha_pose_override,
             outfit_override=gacha_outfit_override,
+            selection_scope=selection_scope,
         )
     if avatar_image is not None and avatar_box:
         cropped = _crop_transparent_vertical(avatar_image)
