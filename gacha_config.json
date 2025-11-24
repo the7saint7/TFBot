@@ -1445,7 +1445,7 @@
       },
       "rarity": "rare"
     },
-    "john_leonalife": {
+    "johnLeonalife": {
       "display_name": "John Leonalife",
       "poses": {
         "a": {
@@ -1520,7 +1520,7 @@
       },
       "rarity": "epic"
     },
-    "johngb_legacy": {
+    "johngbLegacy": {
       "display_name": "Johngb Legacy",
       "poses": {
         "a": {
@@ -3958,7 +3958,7 @@
       "rarity": "rare"
     },
 
-    "kiyoshiGB_ptn6": {
+    "kiyoshiGBPtn6": {
       "display_name": "Kiyoshi GB (Potion #6)",
       "poses": {
         "a": {
@@ -4105,7 +4105,7 @@
       "rarity": "rare"
     },
 
-    "johnGB_ptn6": {
+    "johnGBPtn6": {
       "display_name": "JohnGB (Potion #6)",
       "poses": {
         "a": {
@@ -4159,7 +4159,7 @@
       "rarity": "ultra"
     },
 
-    "johnGB_oneEye": {
+    "johnGBOneEye": {
       "display_name": "JohnGB OneEye",
       "poses": {
         "a": {
@@ -4199,7 +4199,7 @@
       "rarity": "rare"
     },
 
-    "john_styled": {
+    "johnStyled": {
       "display_name": "John Styled (Shorts)",
       "poses": {
         "a": {

@@ -514,7 +514,7 @@ TF_CHARACTERS = [
     },
     {
         "name": "John Styled (Shorts)",
-        "folder": "john_styled",
+        "folder": "johnStyled",
         "avatar_path": "avatars/john_styled.png",
         "message": " finds one of Syn's trap and becomes transforms.",
     },
@@ -526,19 +526,19 @@ TF_CHARACTERS = [
     },
     {
         "name": "John OneEye (Shorts)",
-        "folder": "john_oneEye",
+        "folder": "johnOneEye",
         "avatar_path": "avatars/john_oneEye.png",
         "message": " finds one of Syn's trap and becomes transforms.",
     },
     {
         "name": "JohnGB (Potion #6)",
-        "folder": "johnGB_pt6",
+        "folder": "johnGBPt6",
         "avatar_path": "avatars/johnGB_ptn6.png",
         "message": " finds one of Syn's trap and becomes transforms.",
     },
     {
         "name": "KiyoshiGB (Potion #6)",
-        "folder": "kiyoshiGB_ptn6",
+        "folder": "kiyoshiGBPtn6",
         "avatar_path": "avatars/kiyoshiGB_ptn6.png",
         "message": " finds one of Syn's trap and becomes transforms.",
     },
