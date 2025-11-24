@@ -927,6 +927,9 @@ def _compose_game_avatar_uncached(
         )
         return None
 
+    pose_metadata = _get_pose_metadata(config, variant_dir.name)
+    sprite_height_limit = _resolve_image_height(config, pose_metadata)
+
     outfit_path = outfit_asset.base_path
     face_path = _select_face_path(variant_dir)
 
@@ -938,8 +941,9 @@ def _compose_game_avatar_uncached(
         accessory_token = "noacc"
         if outfit_asset.accessory_layers:
             accessory_token = "-".join(layer.stem.lower() for layer in outfit_asset.accessory_layers)
+        height_token = f"h{sprite_height_limit}" if sprite_height_limit else "auto"
         cache_dir = VN_CACHE_DIR / character_dir.name.lower() / variant_dir.name.lower()
-        cache_file = cache_dir / f"{outfit_path.stem.lower()}__{face_token}__{accessory_token}.png"
+        cache_file = cache_dir / f"{outfit_path.stem.lower()}__{face_token}__{accessory_token}__{height_token}.png"
         if cache_file.exists():
             try:
                 cached = Image.open(cache_file).convert("RGBA")
@@ -977,7 +981,6 @@ def _compose_game_avatar_uncached(
             face_path,
         )
 
-    pose_metadata = _get_pose_metadata(config, variant_dir.name)
     facing = str(pose_metadata.get("facing") or config.get("facing") or "left").lower()
     logger.debug("VN sprite: pose %s facing=%s", variant_dir.name, facing)
     if facing != "right":
@@ -987,6 +990,10 @@ def _compose_game_avatar_uncached(
         logger.debug("VN sprite: sprite mirrored for pose %s", variant_dir.name)
 
     outfit_image = _crop_transparent_vertical(outfit_image)
+    if sprite_height_limit:
+        limit = min(sprite_height_limit, outfit_image.height)
+        if limit > 0 and limit < outfit_image.height:
+            outfit_image = outfit_image.crop((0, 0, outfit_image.width, limit))
 
     if VN_CACHE_DIR and cache_file:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,6 +1020,19 @@ def _get_pose_metadata(config: Dict, pose_name: str) -> Dict:
         if isinstance(value, dict):
             return value
     return {}
+
+
+def _resolve_image_height(config: Dict, pose_metadata: Dict) -> Optional[int]:
+    raw_value = pose_metadata.get("image_height")
+    if raw_value is None:
+        raw_value = config.get("image_height")
+    if raw_value is None:
+        return None
+    try:
+        value = int(str(raw_value).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return value if value > 0 else None
 
 
 def _select_outfit_path(
