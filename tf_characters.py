@@ -480,5 +480,113 @@ TF_CHARACTERS = [
         "message": "drinks a strange soda with a magical curse on it. Next thing they know, they are weak and pathetic Riley. Forced to dress 'en femme' by their best friend Genny and come to the party.",
     },    
     
+
+
+
+
+
+
+
+
+    {
+        "name": "CorneliaGB (Shorts)",
+        "folder": "corneliaGB",
+        "avatar_path": "avatars/corneliaGB.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },    
+    {
+        "name": "Emo Chick (Potion #6)",
+        "folder": "emoChick",
+        "avatar_path": "avatars/emoChick.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },    
+    {
+        "name": "Hinano (Shorts)",
+        "folder": "hinano",
+        "avatar_path": "avatars/hinano.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "JackGB (Shorts)",
+        "folder": "jackGB",
+        "avatar_path": "avatars/jackGB.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "John Styled (Shorts)",
+        "folder": "john_styled",
+        "avatar_path": "avatars/john_styled.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "John Fem (Shorts)",
+        "folder": "johnFem",
+        "avatar_path": "avatars/johnFem.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "John OneEye (Shorts)",
+        "folder": "john_oneEye",
+        "avatar_path": "avatars/john_oneEye.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "JohnGB (Potion #6)",
+        "folder": "johnGB_pt6",
+        "avatar_path": "avatars/johnGB_ptn6.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "KiyoshiGB (Potion #6)",
+        "folder": "kiyoshiGB_ptn6",
+        "avatar_path": "avatars/kiyoshiGB_ptn6.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "KatrinaBimbo (Shorts)",
+        "folder": "katrinaBimbo",
+        "avatar_path": "avatars/katrinaBimbo.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "Kutsumi (Shorts)",
+        "folder": "kutsumi",
+        "avatar_path": "avatars/kutsumi.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "Liliana (Aftermath)",
+        "folder": "liliana",
+        "avatar_path": "avatars/liliana.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "Reika (Shorts)",
+        "folder": "reika",
+        "avatar_path": "avatars/reika.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "ZoeyGB (Potion #6)",
+        "folder": "zoeyGB",
+        "avatar_path": "avatars/zoeyGB.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+    {
+        "name": "Sera (Shorts)",
+        "folder": "serena",
+        "avatar_path": "avatars/sera.png",
+        "message": " finds one of Syn's trap and becomes transforms.",
+    },
+
+
+
+
+
+
+
+
+
+
 ]
 

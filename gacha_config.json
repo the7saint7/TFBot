@@ -131,6 +131,12 @@
             },
             "uniform_alt": {
               "rarity": "rare"
+            },
+            "gym_b": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
             }
           }
         }
@@ -3748,7 +3754,670 @@
         }
       },
       "rarity": "epic"
+    },
+
+
+
+
+
+
+
+
+
+
+
+    "corneliaGB": {
+      "display_name": "CorneliaGB (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    
+    "zoeyGB": {
+      "display_name": "ZoeyGB (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "sera": {
+      "display_name": "Sera (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_topless": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "reika": {
+      "display_name": "Reika (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_topless": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "liliana": {
+      "display_name": "Liliana (Aftermath)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_plain": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_b": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_plain": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_b": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },    
+    "kutsumi": {
+      "display_name": "Kutsimi (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "nun": {
+              "rarity": "common"
+            },
+            "lingery": {
+              "rarity": "epic"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "kiyoshiGB_ptn6": {
+      "display_name": "Kiyoshi GB (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "bathrobe": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "fashion": {
+              "rarity": "rare"
+            },
+            "magical": {
+              "rarity": "rare"
+            },
+            "pj": {
+              "rarity": "rare"
+            },
+            "swimsuit1": {
+              "rarity": "rare"
+            },
+            "swimsuit2": {
+              "rarity": "rare"
+            },
+            "swimsuit3": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "fashion": {
+              "rarity": "rare"
+            },
+            "magical": {
+              "rarity": "rare"
+            },
+            "pj": {
+              "rarity": "rare"
+            },
+            "swimsuit1": {
+              "rarity": "rare"
+            },
+            "swimsuit2": {
+              "rarity": "rare"
+            },
+            "swimsuit3": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "fashion": {
+              "rarity": "rare"
+            },
+            "magical": {
+              "rarity": "rare"
+            },
+            "pj": {
+              "rarity": "rare"
+            },
+            "swimsuit1": {
+              "rarity": "rare"
+            },
+            "swimsuit2": {
+              "rarity": "rare"
+            },
+            "swimsuit3": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+
+    "katrinaBimbo": {
+      "display_name": "Katrina Bimbo (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "bra": {
+              "rarity": "rare"
+            },
+            "bunny_girl": {
+              "rarity": "epic"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "casual_d": {
+              "rarity": "rare"
+            },
+            "magical_girl": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "micro_swimsuit": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "panties": {
+              "rarity": "rare"
+            },
+            "sexy": {
+              "rarity": "rare"
+            },
+            "underwear_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "johnGB_ptn6": {
+      "display_name": "JohnGB (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "bottomless": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+
+    "johnGB_oneEye": {
+      "display_name": "JohnGB OneEye",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual_pose2": {
+              "rarity": "common"
+            },
+            "nude_pose2": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "johnFem": {
+      "display_name": "John Fem (Katrina's Notebook)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "john_styled": {
+      "display_name": "John Styled (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "latex_underwear_wig": {
+              "rarity": "rare"
+            },
+            "latex_underwear_wig_hose": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "latex": {
+              "rarity": "rare"
+            },
+            "latex_panties": {
+              "rarity": "rare"
+            },
+            "latex_underwear": {
+              "rarity": "rare"
+            },
+            "long_hair_dress_a": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "panties": {
+              "rarity": "rare"
+            },
+            "towel": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "wig": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "allison": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "gym_blouse": {
+              "rarity": "rare"
+            },
+            "gym_bra": {
+              "rarity": "rare"
+            },
+            "gym_skirt": {
+              "rarity": "rare"
+            },
+            "gym_skirt_b": {
+              "rarity": "rare"
+            },
+            "gym_topless": {
+              "rarity": "rare"
+            },
+            "gym_vest": {
+              "rarity": "rare"
+            },
+            "gym_vest_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+    "jackGB": {
+      "display_name": "Jack GB (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "suits": {
+              "rarity": "common"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "suits": {
+              "rarity": "common"
+            }
+          }
+        },
+        "d": {
+          "outfits": {
+            "suits": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },    
+
+    "emoChick": {
+      "display_name": "Emo Chick (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual2": {
+              "rarity": "rare"
+            },
+            "casual_3": {
+              "rarity": "epic"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual2": {
+              "rarity": "rare"
+            },
+            "casual_3": {
+              "rarity": "epic"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual2": {
+              "rarity": "rare"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+
+    "hinano": {
+      "display_name": "Hinano (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
     }
+
 
 
   },
