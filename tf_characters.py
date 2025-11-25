@@ -570,7 +570,7 @@ TF_CHARACTERS = [
         "message": " finds one of Syn's trap and becomes transforms."
     },
     {
-        "name": "John Fem (Shorts)",
+        "name": "John Fem (Katrina's Notebook)",
         "folder": "johnFem",
         "avatar_path": "avatars/johnFem.png",
         "message": " finds one of Syn's trap and becomes transforms."
