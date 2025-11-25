@@ -2150,7 +2150,26 @@ async def slash_unload_all_command(
     await rp_cog.unload_identity_command(ctx, member="all")
 
 
+def _is_authorized_guild(ctx_guild: Optional[discord.Guild]) -> bool:
+    if ctx_guild is None:
+        return False
+    allowed_channels = {
+        cid
+        for cid in (
+            TF_CHANNEL_ID,
+            TF_HISTORY_CHANNEL_ID,
+            TF_ARCHIVE_CHANNEL_ID,
+            GACHA_CHANNEL_ID,
+        )
+        if cid
+    }
+    if not allowed_channels:
+        return True
+    return ctx_guild.id in {bot.get_channel(cid).guild.id for cid in allowed_channels if bot.get_channel(cid)}
+
+
 async def tf_stats_command(ctx: commands.Context):
+    await ensure_state_restored()
     guild_id = ctx.guild.id if ctx.guild else None
     if guild_id is None:
         await ctx.reply(
@@ -2179,7 +2198,7 @@ async def tf_stats_command(ctx: commands.Context):
             )
         if hasattr(ctx, "_responded"):
             ctx._responded = True
-        return
+        return False
 
 
 @bot.tree.command(name="tf", description="DM your transformation statistics.")
@@ -2187,7 +2206,12 @@ async def tf_stats_command(ctx: commands.Context):
 async def slash_tf_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
     ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
-    await tf_stats_command(ctx)
+    if not _is_authorized_guild(interaction.guild):
+        await interaction.followup.send("This command isn't available in this guild.", ephemeral=True)
+        return
+    handled = await tf_stats_command(ctx)
+    if handled is False:
+        return
     if not ctx.responded:
         await interaction.followup.send("Check your DMs for your stats.", ephemeral=True)
         try:
