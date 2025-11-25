@@ -488,7 +488,7 @@ TF_CHARACTERS = [
     {
         "name": "Allene (Fusion)",
         "avatar_path": "avatars/irene_allison.png",
-        "message": " saw Mel and Zoey high-five as they stepped on one of Syn's magical trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!",
+        "message": " saw Allison and Irene high-five as they stepped on one of Syn's magical trap. Soon their 3 bodies merge with them in full control of the resulting amalgam!",
         "folder": "allene"
     },
     {

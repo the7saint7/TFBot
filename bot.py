@@ -152,6 +152,7 @@ MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 SPECIAL_REROLL_FORMS = ("ball", "narrator")
 ADMIN_ONLY_RANDOM_FORMS = ("syn", "circe")
 CHARACTER_AUTOCOMPLETE_LIMIT = 25
+OUTFIT_AUTOCOMPLETE_LIMIT = 25
 CHARACTER_DIRECTORY_CACHE_TTL = 120.0  # seconds
 
 
@@ -296,6 +297,44 @@ async def _character_name_autocomplete(
     guild = interaction.guild
     matches = _autocomplete_character_names(current, guild)
     return [app_commands.Choice(name=name, value=name) for name in matches]
+
+
+async def _outfit_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    await ensure_state_restored()
+    guild = interaction.guild
+    actor = interaction.user
+    if guild is None or actor is None:
+        return []
+    state = find_active_transformation(actor.id, guild.id)
+    if state is None or not state.character_name:
+        return []
+    pose_outfits = list_pose_outfits(state.character_name)
+    if not pose_outfits:
+        return []
+    normalized_query = (current or "").strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+    for pose, options in sorted(pose_outfits.items(), key=lambda item: item[0].lower()):
+        pose_token = pose.strip()
+        for option in sorted(options, key=lambda value: value.lower()):
+            option_label = option.strip()
+            if not option_label:
+                continue
+            value_parts = [part for part in (pose_token, option_label) if part]
+            if not value_parts:
+                continue
+            value = " ".join(value_parts)
+            match_source = value.lower()
+            if normalized_query and normalized_query not in match_source:
+                continue
+            label_pose = pose_token or "auto"
+            label = f"{label_pose} - {option_label}"
+            choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
+            if len(choices) >= OUTFIT_AUTOCOMPLETE_LIMIT:
+                return choices
+    return choices
 
 
 def _find_inanimate_form_by_token(token: str) -> Optional[Dict[str, object]]:
@@ -1478,6 +1517,10 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
             inanimate_responses = (character_message,)
         duration_label = "10 minutes"
         duration_delta = INANIMATE_DURATION
+        selected_folder_token = _normalize_folder_token(selected_name)
+        if selected_folder_token in {"narrator", "ball"}:
+            duration_label = "1 hour"
+            duration_delta = timedelta(hours=1)
     else:
         character = _select_weighted_character(available_characters)
         selected_name = character.name
@@ -2705,6 +2748,7 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
 
 @bot.tree.command(name="outfit", description="Select an outfit (optionally include pose).")
 @app_commands.describe(outfit="Provide the outfit or `pose outfit`. Admins may append a target folder.")
+@app_commands.autocomplete(outfit=_outfit_autocomplete)
 @app_commands.guild_only()
 async def slash_outfit_command(
     interaction: discord.Interaction,
