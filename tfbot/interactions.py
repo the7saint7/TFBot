@@ -26,10 +26,11 @@ class InteractionContextAdapter:
         self.default_ephemeral = default_ephemeral
         self._responded = False
         self.message = _InteractionMessageProxy(interaction)
+        self._responded_flag = False
 
     @property
     def responded(self) -> bool:
-        return self._responded
+        return self._responded_flag or self._responded
 
     async def reply(self, *args, **kwargs):
         kwargs.pop("mention_author", None)
@@ -46,15 +47,20 @@ class InteractionContextAdapter:
                     await self.interaction.response.defer(ephemeral=ephemeral)
                 await self.interaction.followup.send(*args, ephemeral=ephemeral, **kwargs)
             self._responded = True
+            self._responded_flag = True
             return
 
         if not self.interaction.response.is_done():
             await self.interaction.response.defer(ephemeral=ephemeral)
         await self.interaction.followup.send(*args, ephemeral=ephemeral, **kwargs)
         self._responded = True
+        self._responded_flag = True
 
     async def send(self, *args, **kwargs):
         await self.reply(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        return f"<InteractionContextAdapter guild={getattr(self.guild, 'id', None)} user={getattr(self.author, 'id', None)}>"
 
 
 class _InteractionMessageProxy:

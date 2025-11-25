@@ -2153,7 +2153,7 @@ async def slash_unload_all_command(
 def _is_authorized_guild(ctx_guild: Optional[discord.Guild]) -> bool:
     if ctx_guild is None:
         return False
-    allowed_channels = {
+    channel_ids = [
         cid
         for cid in (
             TF_CHANNEL_ID,
@@ -2162,30 +2162,44 @@ def _is_authorized_guild(ctx_guild: Optional[discord.Guild]) -> bool:
             GACHA_CHANNEL_ID,
         )
         if cid
-    }
-    if not allowed_channels:
+    ]
+    if not channel_ids:
         return True
-    return ctx_guild.id in {bot.get_channel(cid).guild.id for cid in allowed_channels if bot.get_channel(cid)}
+    allowed_guilds: set[int] = set()
+    for channel_id in channel_ids:
+        channel = bot.get_channel(channel_id)
+        if channel and channel.guild:
+            allowed_guilds.add(channel.guild.id)
+        else:
+            # Channel not found in cache; don't restrict.
+            return True
+    if not allowed_guilds:
+        return True
+    return ctx_guild.id in allowed_guilds
 
 
 async def tf_stats_command(ctx: commands.Context):
+    logger.debug("TF stats: starting for ctx=%s (guild=%s user=%s)", ctx, getattr(ctx.guild, "id", None), getattr(ctx.author, "id", None))
     await ensure_state_restored()
     guild_id = ctx.guild.id if ctx.guild else None
     if guild_id is None:
+        logger.debug("TF stats: no guild context; aborting.")
         await ctx.reply(
             "Run this command from a server so I know which TF roster to check.",
             mention_author=False,
         )
-        return None
+        return False
 
     guild_data = tf_stats.get(str(guild_id), {})
     user_data = guild_data.get(str(ctx.author.id))
     has_stats = bool(user_data)
     if not user_data:
         user_data = {"total": 0, "characters": {}}
+    logger.debug("TF stats: has_stats=%s data_keys=%s", has_stats, list(user_data.keys()))
 
     key = state_key(guild_id, ctx.author.id)
     current_state = active_transformations.get(key)
+    logger.debug("TF stats: current_state=%s", current_state)
 
     if not has_stats and current_state is None:
         try:
@@ -2196,44 +2210,19 @@ async def tf_stats_command(ctx: commands.Context):
                 mention_author=False,
                 delete_after=10,
             )
+        logger.debug("TF stats: no stats and no active TF; message sent.")
         if hasattr(ctx, "_responded"):
             ctx._responded = True
+            if hasattr(ctx, "_responded_flag"):
+                ctx._responded_flag = True
         return False
-
-
-@bot.tree.command(name="tf", description="DM your transformation statistics.")
-@app_commands.guild_only()
-async def slash_tf_command(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
-    if not _is_authorized_guild(interaction.guild):
-        await interaction.followup.send("This command isn't available in this guild.", ephemeral=True)
-        return
-    handled = await tf_stats_command(ctx)
-    if handled is False:
-        return
-    if not ctx.responded:
-        await interaction.followup.send("Check your DMs for your stats.", ephemeral=True)
-        try:
-            await ctx.author.send(
-                "You haven't experienced any transformations yet."
-            )
-        except discord.Forbidden:
-            await ctx.reply(
-                "I couldn't DM you. Please enable direct messages from server members.",
-                mention_author=False,
-                delete_after=10,
-            )
-        return None
 
     embed = discord.Embed(
         title="Transformation Stats",
         color=0x9B59B6,
         timestamp=utc_now(),
     )
-    avatar_url = (
-        ctx.author.display_avatar.url if ctx.author.display_avatar else None
-    )
+    avatar_url = ctx.author.display_avatar.url if ctx.author.display_avatar else None
     embed.set_author(
         name=ctx.author.display_name,
         icon_url=avatar_url,
@@ -2287,14 +2276,13 @@ async def slash_tf_command(interaction: discord.Interaction) -> None:
 
     try:
         await ctx.author.send(embed=embed)
+        logger.debug("TF stats: embed DM sent to %s", ctx.author)
         if current_state:
             pose_outfits = list_pose_outfits(current_state.character_name)
             if pose_outfits:
                 selected_pose, selected_outfit = get_selected_pose_outfit(current_state.character_name)
                 selected_pose_normalized = normalize_pose_name(selected_pose)
-                selected_outfit_normalized = (
-                    selected_outfit.lower() if selected_outfit else None
-                )
+                selected_outfit_normalized = selected_outfit.lower() if selected_outfit else None
                 pose_lines: list[str] = []
                 for pose, options in pose_outfits.items():
                     entries: list[str] = []
@@ -2321,21 +2309,42 @@ async def slash_tf_command(interaction: discord.Interaction) -> None:
                     await ctx.author.send(outfit_note)
                 except discord.Forbidden:
                     pass
-        if hasattr(ctx, "_responded"):
-            ctx._responded = True
+        return True
     except discord.Forbidden:
         await ctx.reply(
             "I couldn't DM you. Please enable direct messages from server members.",
             mention_author=False,
             delete_after=10,
         )
+        return False
     finally:
         message = getattr(ctx, "message", None)
         if message is not None:
             try:
                 await message.delete()
-            except Exception:  # slash adapter noop
+            except Exception:
                 pass
+
+
+@bot.tree.command(name="tf", description="DM your transformation statistics.")
+@app_commands.guild_only()
+async def slash_tf_command(interaction: discord.Interaction) -> None:
+    logger.debug("Slash /tf invoked by %s in guild %s channel %s", interaction.user, getattr(interaction.guild, "id", None), getattr(interaction.channel, "id", None))
+    if not _is_authorized_guild(interaction.guild):
+        logger.debug("Slash /tf: guild not authorized.")
+        await interaction.response.send_message("This command isn't available in this guild.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
+    logger.debug("Slash /tf: before stats responded=%s flags=%s", getattr(ctx, "responded", None), getattr(ctx, "_responded_flag", None))
+    handled = await tf_stats_command(ctx)
+    logger.debug("Slash /tf: after stats handled=%s responded=%s flags=%s", handled, getattr(ctx, "responded", None), getattr(ctx, "_responded_flag", None))
+    if handled is False:
+        return
+    if not ctx.responded:
+        await interaction.followup.send("Check your DMs for your stats.", ephemeral=True)
+    logger.debug("TF stats: completed for %s", ctx.author)
+    return True
 
 
 async def background_command(ctx: commands.Context, *, selection: str = ""):
