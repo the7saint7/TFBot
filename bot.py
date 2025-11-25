@@ -2161,12 +2161,25 @@ async def tf_stats_command(ctx: commands.Context):
 
     guild_data = tf_stats.get(str(guild_id), {})
     user_data = guild_data.get(str(ctx.author.id))
-
+    has_stats = bool(user_data)
     if not user_data:
+        user_data = {"total": 0, "characters": {}}
+
+    key = state_key(guild_id, ctx.author.id)
+    current_state = active_transformations.get(key)
+
+    if not has_stats and current_state is None:
         try:
-            await ctx.message.delete()
-        except discord.HTTPException:
-            pass
+            await ctx.author.send("You haven't experienced any transformations yet.")
+        except discord.Forbidden:
+            await ctx.reply(
+                "I couldn't DM you. Please enable direct messages from server members.",
+                mention_author=False,
+                delete_after=10,
+            )
+        if hasattr(ctx, "_responded"):
+            ctx._responded = True
+        return
 
 
 @bot.tree.command(name="tf", description="DM your transformation statistics.")
@@ -2228,8 +2241,6 @@ async def slash_tf_command(interaction: discord.Interaction) -> None:
             name = "By Character" if idx == 0 else "\u200b"
             embed.add_field(name=name, value=chunk or "\u200b", inline=False)
 
-    key = state_key(guild_id, ctx.author.id)
-    current_state = active_transformations.get(key)
     if current_state:
         remaining = max(
             (current_state.expires_at - utc_now()).total_seconds(),
@@ -2286,6 +2297,8 @@ async def slash_tf_command(interaction: discord.Interaction) -> None:
                     await ctx.author.send(outfit_note)
                 except discord.Forbidden:
                     pass
+        if hasattr(ctx, "_responded"):
+            ctx._responded = True
     except discord.Forbidden:
         await ctx.reply(
             "I couldn't DM you. Please enable direct messages from server members.",
@@ -2293,10 +2306,12 @@ async def slash_tf_command(interaction: discord.Interaction) -> None:
             delete_after=10,
         )
     finally:
-        try:
-            await ctx.message.delete()
-        except discord.HTTPException:
-            pass
+        message = getattr(ctx, "message", None)
+        if message is not None:
+            try:
+                await message.delete()
+            except Exception:  # slash adapter noop
+                pass
 
 
 async def background_command(ctx: commands.Context, *, selection: str = ""):
