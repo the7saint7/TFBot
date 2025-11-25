@@ -1332,7 +1332,6 @@ def _load_vn_font(size: int, style: str = "regular"):
         attempted.add(candidate)
         if candidate.exists():
             try:
-                logger.debug("VN sprite: loading font %s (size=%s style=%s)", candidate, size, style_key)
                 return ImageFont.truetype(str(candidate), size=size)
             except OSError as exc:
                 logger.warning("Failed to load VN font %s: %s", candidate, exc)
@@ -1779,9 +1778,7 @@ def _crop_transparent_top(image: "Image.Image") -> "Image.Image":
     if top <= 0 or height <= 0:
         return image
     bottom = min(image.height, max(top + height, top + 1))
-    cropped = image.crop((0, top, image.width, bottom))
-    logger.debug("VN sprite: trimmed transparent top (%s -> %s)", image.size, cropped.size)
-    return cropped
+    return image.crop((0, top, image.width, bottom))
 
 
 def _crop_transparent_left(image: "Image.Image") -> "Image.Image":
@@ -1800,9 +1797,7 @@ def _crop_transparent_left(image: "Image.Image") -> "Image.Image":
         left += 1
     if left >= right - 1:
         return image
-    cropped = image.crop((left, 0, right, image.height))
-    logger.debug("VN sprite: trimmed transparent left (%s -> %s)", image.size, cropped.size)
-    return cropped
+    return image.crop((left, 0, right, image.height))
 
 
 def _crop_transparent_vertical(image: "Image.Image") -> "Image.Image":

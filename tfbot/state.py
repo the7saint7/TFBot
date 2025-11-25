@@ -53,6 +53,7 @@ def serialize_state(state: TransformationState) -> Dict[str, object]:
         "user_id": state.user_id,
         "guild_id": state.guild_id,
         "character_name": state.character_name,
+        "character_folder": state.character_folder,
         "character_avatar_path": state.character_avatar_path,
         "character_message": state.character_message,
         "original_nick": state.original_nick,
@@ -73,6 +74,7 @@ def deserialize_state(payload: Dict[str, object]) -> TransformationState:
         user_id=int(payload["user_id"]),
         guild_id=int(payload["guild_id"]),
         character_name=str(payload["character_name"]),
+        character_folder=str(payload.get("character_folder") or "") or None,
         character_avatar_path=str(
             payload.get("character_avatar_path") or payload.get("character_avatar_url", "")
         ),

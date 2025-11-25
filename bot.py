@@ -6,14 +6,17 @@ import logging
 import os
 import random
 import re
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -23,6 +26,11 @@ try:
     import yaml
 except ImportError:
     yaml = None
+
+try:
+    import PIL  # type: ignore
+except ImportError:
+    PIL = None
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -60,6 +68,7 @@ from tfbot.panels import (
     VN_BACKGROUND_DEFAULT_RELATIVE,
     VN_AVATAR_MODE,
     VN_AVATAR_SCALE,
+    VN_ASSET_ROOT,
     apply_mention_placeholders,
     compose_game_avatar,
     fetch_avatar_bytes,
@@ -83,6 +92,7 @@ from tfbot.panels import (
     persist_outfit_selections,
 )
 from tfbot.roleplay import RoleplayCog, add_roleplay_cog
+from tfbot.interactions import InteractionContextAdapter
 from tfbot.utils import (
     float_from_env,
     int_from_env,
@@ -102,6 +112,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("tfbot")
+if PIL is not None:
+    logging.getLogger("PIL").setLevel(logging.ERROR)
 
 
 BOT_MODE = os.getenv("TFBOT_MODE", "classic").lower()
@@ -139,6 +151,16 @@ MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 SPECIAL_REROLL_FORMS = ("ball", "narrator")
 ADMIN_ONLY_RANDOM_FORMS = ("syn", "circe")
+CHARACTER_AUTOCOMPLETE_LIMIT = 25
+CHARACTER_DIRECTORY_CACHE_TTL = 120.0  # seconds
+
+
+def _normalize_folder_token(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    normalized = value.strip().replace("\\", "/").strip("/").lower()
+    return normalized
+CHARACTER_DIRECTORY_CACHE_TTL = 120.0  # seconds
 
 def _parse_featured_weight_map(raw: str) -> Dict[str, float]:
     """Parse comma/semicolon separated token=weight entries."""
@@ -178,111 +200,124 @@ INANIMATE_TF_CHANCE = float(os.getenv("TFBOT_INANIMATE_CHANCE", "0"))
 
 
 def _is_special_reroll_name(name: str) -> bool:
-    normalized = (name or "").strip().lower()
-    if not normalized:
-        return False
-    for token in SPECIAL_REROLL_FORMS:
-        if normalized == token:
-            return True
-        if normalized.startswith(f"{token} "):
-            return True
-        if normalized.endswith(f" ({token})"):
-            return True
-    return False
+    normalized = _normalize_folder_token(name)
+    return bool(normalized and normalized in {token.lower() for token in SPECIAL_REROLL_FORMS})
 
 
 def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
     if state is None:
         return False
-    name = (state.character_name or "").strip()
-    if not name:
+    token = state.character_folder or state.character_name
+    return _is_special_reroll_name(token)
+
+
+def _state_folder_token(state: TransformationState) -> str:
+    if not state:
+        return ""
+    if state.character_folder:
+        return _normalize_folder_token(state.character_folder)
+    lookup = CHARACTER_BY_NAME.get((state.character_name or "").strip().lower())
+    if lookup and lookup.folder:
+        return _normalize_folder_token(lookup.folder)
+    return _normalize_folder_token(state.character_name)
+
+
+def _state_matches_folder(state: TransformationState, folder_name: str) -> bool:
+    normalized = _normalize_folder_token(folder_name)
+    if not normalized:
         return False
-    return _is_special_reroll_name(name)
+    return _state_folder_token(state) == normalized
 
 
-def _token_variants(token: str) -> set[str]:
-    normalized_token = (token or "").strip().lower()
-    if not normalized_token:
-        return set()
-    variants = {normalized_token}
-
-    def _add(value: str) -> None:
-        cleaned = value.strip()
-        if cleaned:
-            variants.add(cleaned)
-
-    if "_" in normalized_token:
-        _add(normalized_token.replace("_", " "))
-        _add(normalized_token.replace("_", ""))
-        _add(normalized_token.split("_", 1)[0])
-    if "-" in normalized_token:
-        _add(normalized_token.replace("-", " "))
-        _add(normalized_token.replace("-", ""))
-        _add(normalized_token.split("-", 1)[0])
-    return variants
-
-
-def _name_matches_token(name: str, token: str) -> bool:
-    name_normalized = (name or "").strip().lower()
-    if not name_normalized:
-        return False
-    first_token = name_normalized.split(" ", 1)[0]
-    variants = _token_variants(token)
-    if not variants:
-        return False
-    for variant in variants:
-        if variant == name_normalized or variant == first_token:
-            return True
-    return False
-
-
-def _character_matches_token(character: TFCharacter, token: str) -> bool:
-    variants = _token_variants(token)
-    if not variants:
-        return False
-    name_normalized = character.name.lower()
-    first_token = name_normalized.split(" ", 1)[0]
-    for variant in variants:
-        if variant == name_normalized or variant == first_token:
-            return True
-    folder_name_raw = (character.folder or "").strip()
-    if folder_name_raw:
-        folder_normalized = folder_name_raw.replace("\\", "/").strip("/").lower()
-        folder_candidates = {folder_normalized}
-        last_segment = folder_normalized.rsplit("/", 1)[-1]
-        folder_candidates.add(last_segment)
-        for folder_candidate in folder_candidates:
-            if folder_candidate in variants:
-                return True
-    return False
-
-
-def _find_character_by_token(token: str) -> Optional[TFCharacter]:
-    normalized = (token or "").strip()
+def _find_character_by_folder(folder_name: str) -> Optional[TFCharacter]:
+    normalized = _normalize_folder_token(folder_name)
     if not normalized:
         return None
-    for character in CHARACTER_POOL:
-        if _character_matches_token(character, normalized):
-            return character
+    return CHARACTER_BY_FOLDER.get(normalized)
+
+
+def _character_directory_root() -> Optional[Path]:
+    if VN_ASSET_ROOT:
+        return VN_ASSET_ROOT
+    fallback = BASE_DIR / "characters"
+    if fallback.exists():
+        return fallback
     return None
+
+
+def _list_character_directory_names(refresh: bool = False) -> Sequence[str]:
+    global _CHARACTER_DIRECTORY_CACHE, _CHARACTER_DIRECTORY_CACHE_EXPIRY
+    now = time.monotonic()
+    if not refresh and _CHARACTER_DIRECTORY_CACHE and now < _CHARACTER_DIRECTORY_CACHE_EXPIRY:
+        return _CHARACTER_DIRECTORY_CACHE
+
+    root = _character_directory_root()
+    names: list[str] = []
+    if root and root.exists():
+        try:
+            names = [
+                child.name
+                for child in sorted(root.iterdir(), key=lambda p: p.name.lower())
+                if child.is_dir()
+            ]
+        except OSError as exc:
+            logger.warning("Failed to read character directories from %s: %s", root, exc)
+            names = []
+    _CHARACTER_DIRECTORY_CACHE = names
+    _CHARACTER_DIRECTORY_CACHE_EXPIRY = now + CHARACTER_DIRECTORY_CACHE_TTL
+    return names
+
+
+def _autocomplete_character_names(
+    query: str,
+    guild: Optional[discord.Guild],
+) -> Sequence[str]:
+    normalized = (query or "").strip().lower()
+    seen: set[str] = set()
+    results: list[str] = []
+
+    for name in _list_character_directory_names():
+        lowered = name.lower()
+        if normalized and normalized not in lowered:
+            continue
+        if name in seen:
+            continue
+        results.append(name)
+        seen.add(name)
+        if len(results) >= CHARACTER_AUTOCOMPLETE_LIMIT:
+            break
+    return results
+
+
+async def _character_name_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    guild = interaction.guild
+    matches = _autocomplete_character_names(current, guild)
+    return [app_commands.Choice(name=name, value=name) for name in matches]
 
 
 def _find_inanimate_form_by_token(token: str) -> Optional[Dict[str, object]]:
     normalized = (token or "").strip()
     if not normalized:
         return None
-    variants = _token_variants(normalized)
-    if not variants:
-        return None
+    normalized = normalized.lower()
     for entry in INANIMATE_FORMS:
         name_raw = str(entry.get("name", "")).strip()
         if not name_raw:
             continue
-        lowered = name_raw.lower()
-        first = lowered.split(" ", 1)[0]
-        if lowered in variants or first in variants:
+        if name_raw.lower() == normalized:
             return entry
     return None
+
+
+def _resolve_roleplay_cog(channel: Optional[discord.abc.GuildChannel]) -> tuple[Optional[RoleplayCog], Optional[str]]:
+    if ROLEPLAY_COG is None:
+        return None, "Roleplay commands are not configured on this bot."
+    if channel is None or not ROLEPLAY_COG.is_roleplay_post(channel):
+        return None, "Use this command inside the RP forum post."
+    return ROLEPLAY_COG, None
 
 
 def _build_roleplay_state(
@@ -298,6 +333,7 @@ def _build_roleplay_state(
         user_id=actor.id,
         guild_id=guild_id,
         character_name=character.name,
+        character_folder=character.folder,
         character_avatar_path=character.avatar_path,
         character_message=character.message,
         original_nick=actor.nick,
@@ -331,6 +367,7 @@ def _build_inanimate_roleplay_state(
         user_id=actor.id,
         guild_id=guild_id,
         character_name=str(entry.get("name") or "Mysterious Relic"),
+        character_folder=None,
         character_avatar_path=str(entry.get("avatar_path") or ""),
         character_message=str(entry.get("message") or ""),
         original_nick=actor.nick,
@@ -350,6 +387,7 @@ def _build_placeholder_state(member: discord.Member, guild: discord.Guild) -> Tr
         user_id=member.id,
         guild_id=guild.id,
         character_name="",
+        character_folder=None,
         character_avatar_path="",
         character_message="",
         original_nick=member.nick,
@@ -364,11 +402,11 @@ def _build_placeholder_state(member: discord.Member, guild: discord.Guild) -> Tr
 
 
 def _token_active(token: str) -> bool:
-    normalized = (token or "").strip()
+    normalized = _normalize_folder_token(token)
     if not normalized:
         return False
     for state in active_transformations.values():
-        if _name_matches_token(state.character_name, normalized):
+        if _state_folder_token(state) == normalized:
             return True
     return False
 
@@ -380,7 +418,8 @@ def _character_weight(character: TFCharacter) -> float:
     for token, bonus in FEATURED_TF_WEIGHTS.items():
         if bonus <= 0:
             continue
-        if _character_matches_token(character, token) and not _token_active(token):
+        folder_token = _normalize_folder_token(character.folder)
+        if folder_token and folder_token == _normalize_folder_token(token) and not _token_active(token):
             weight *= bonus
     return max(weight, 0.0)
 
@@ -407,7 +446,7 @@ def _actor_has_narrator_power(member: Optional[discord.Member]) -> bool:
     state = find_active_transformation(member.id, member.guild.id)
     if not state:
         return False
-    return _name_matches_token(state.character_name, "narrator")
+    return _state_matches_folder(state, "narrator")
 
 
 def _extract_user_id_from_token(token: str) -> Optional[int]:
@@ -428,64 +467,38 @@ def _extract_user_id_from_token(token: str) -> Optional[int]:
     return None
 
 
-def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[TransformationState]:
-    normalized = (token or "").strip()
-    if not normalized:
+def _find_state_by_folder(guild: discord.Guild, token: str) -> Optional[TransformationState]:
+    normalized_value = (token or "").strip()
+    if not normalized_value:
         return None
-    user_id = _extract_user_id_from_token(normalized)
+    user_id = _extract_user_id_from_token(normalized_value)
     if user_id is not None:
         state = active_transformations.get(state_key(guild.id, user_id))
         if state:
             return state
-    token_variants = _token_variants(normalized)
+    folder_token = _normalize_folder_token(normalized_value)
+    if not folder_token:
+        return None
     for state in active_transformations.values():
         if state.guild_id != guild.id:
             continue
-        if _name_matches_token(state.character_name, normalized):
+        if _state_folder_token(state) == folder_token:
             return state
-        character_entry = CHARACTER_BY_NAME.get(state.character_name.strip().lower())
-        if character_entry and _character_matches_token(character_entry, normalized):
-            return state
-        member_obj = guild.get_member(state.user_id)
-        if member_obj:
-            profile = member_profile_name(member_obj).lower()
-            profile_first = profile.split(" ", 1)[0]
-            display = member_obj.display_name.lower()
-            display_first = display.split(" ", 1)[0]
-            username = member_obj.name.lower()
-            username_first = username.split(" ", 1)[0]
-            if (
-                profile in token_variants
-                or profile_first in token_variants
-                or display in token_variants
-                or display_first in token_variants
-                or username in token_variants
-                or username_first in token_variants
-            ):
-                return state
     return None
 
 
 def _is_admin_only_random_name(name: str) -> bool:
-    normalized = (name or "").strip().lower()
-    if not normalized:
-        return False
-    for token in ADMIN_ONLY_RANDOM_FORMS:
-        if normalized == token:
-            return True
-        if normalized.startswith(f"{token} "):
-            return True
-        if normalized.endswith(f" ({token})"):
-            return True
-    return False
+    normalized = _normalize_folder_token(name)
+    return bool(normalized and normalized in {token.lower() for token in ADMIN_ONLY_RANDOM_FORMS})
 
 
-def _format_special_reroll_hint(character_name: str) -> Optional[str]:
-    if not _is_special_reroll_name(character_name):
+def _format_special_reroll_hint(character_label: str, folder_token: Optional[str] = None) -> Optional[str]:
+    token = folder_token or character_label
+    if not _is_special_reroll_name(token):
         return None
     return (
         "```diff\n"
-        f"- {character_name} perk unlocked! Use `!reroll character` for a random swap or `!reroll character character` to force a form.\n"
+        f"- {character_label} perk unlocked! Use `/reroll character` for a random swap or `/reroll character character` to force a form.\n"
         "```"
     )
 
@@ -740,7 +753,10 @@ def _build_character_pool(
                     avatar_path = str((avatar_root / candidate).resolve())
                 else:
                     avatar_path = str(candidate)
-            folder_name = str(entry.get("folder", "")).strip() or None
+            folder_name = str(entry.get("folder", "")).strip()
+            if not folder_name or folder_name.upper() == "TODO":
+                logger.warning("Skipping character %s: missing folder assignment.", entry.get("name", "Unnamed"))
+                continue
             pool.append(
                 TFCharacter(
                     name=entry["name"],
@@ -757,19 +773,24 @@ def _build_character_pool(
 
 
 _CHARACTER_DATASET = _load_character_dataset()
-_CHARACTER_FOLDER_OVERRIDES = {
-    str(entry.get("name", "")).strip().lower(): str(entry.get("folder", "")).strip()
-    for entry in _CHARACTER_DATASET
-    if isinstance(entry, dict)
-    and str(entry.get("name", "")).strip()
-    and str(entry.get("folder", "")).strip()
-}
 CHARACTER_POOL = _build_character_pool(_CHARACTER_DATASET, CHARACTER_AVATAR_ROOT)
 CHARACTER_BY_NAME: Dict[str, TFCharacter] = {
     character.name.strip().lower(): character for character in CHARACTER_POOL
 }
+CHARACTER_BY_FOLDER: Dict[str, TFCharacter] = {}
+for character in CHARACTER_POOL:
+    folder_token = _normalize_folder_token(character.folder or character.name)
+    if folder_token and folder_token not in CHARACTER_BY_FOLDER:
+        CHARACTER_BY_FOLDER[folder_token] = character
+_CHARACTER_FOLDER_OVERRIDES = {
+    character.name.strip().lower(): character.folder.strip()
+    for character in CHARACTER_POOL
+    if character.folder and character.folder.strip()
+}
 set_character_directory_overrides(_CHARACTER_FOLDER_OVERRIDES)
 GACHA_MANAGER = None
+_CHARACTER_DIRECTORY_CACHE: list[str] = []
+_CHARACTER_DIRECTORY_CACHE_EXPIRY: float = 0.0
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
@@ -782,12 +803,18 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents)
+
+class TFBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        await setup_bot_extensions()
+
+
+bot = TFBot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents)
 ROLEPLAY_COG: Optional[RoleplayCog] = None
+_SYNCED_APP_COMMAND_GUILDS: set[int] = set()
 
 
-@bot.event
-async def setup_hook():
+async def setup_bot_extensions() -> None:
     global ROLEPLAY_COG
     if ROLEPLAY_FORUM_POST_ID > 0:
         ROLEPLAY_COG = await add_roleplay_cog(
@@ -795,6 +822,46 @@ async def setup_hook():
             forum_post_id=ROLEPLAY_FORUM_POST_ID,
             state_file=ROLEPLAY_STATE_FILE,
         )
+    try:
+        await bot.tree.sync()
+    except discord.HTTPException as exc:
+        logger.warning("Failed to sync application commands: %s", exc)
+    await _sync_application_commands_for_known_guilds()
+
+
+def _known_command_guild_ids() -> set[int]:
+    guild_ids = {guild.id for guild in bot.guilds}
+    possible_channels = [
+        TF_CHANNEL_ID,
+        GACHA_CHANNEL_ID,
+        TF_HISTORY_CHANNEL_ID,
+        TF_ARCHIVE_CHANNEL_ID,
+    ]
+    for channel_id in possible_channels:
+        channel = bot.get_channel(channel_id)
+        if isinstance(channel, discord.abc.GuildChannel):
+            guild_ids.add(channel.guild.id)
+    return {gid for gid in guild_ids if gid}
+
+
+async def _sync_application_commands_for_known_guilds(extra_guild_ids: Optional[Iterable[int]] = None) -> None:
+    guild_ids = _known_command_guild_ids()
+    if extra_guild_ids:
+        guild_ids.update(extra_guild_ids)
+    for guild_id in guild_ids:
+        if guild_id in _SYNCED_APP_COMMAND_GUILDS:
+            continue
+        try:
+            await bot.tree.sync(guild=discord.Object(id=guild_id))
+            _SYNCED_APP_COMMAND_GUILDS.add(guild_id)
+            logger.info("Synced application commands for guild %s", guild_id)
+        except discord.HTTPException as exc:
+            logger.warning("Failed to sync application commands for guild %s: %s", guild_id, exc)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    await _sync_application_commands_for_known_guilds(extra_guild_ids=[guild.id])
 
 
 def _selection_scope_for_channel(channel: Optional[discord.abc.GuildChannel]) -> Optional[str]:
@@ -866,6 +933,10 @@ async def ensure_state_restored() -> None:
     states = load_states_from_disk()
     now = utc_now()
     for state in states:
+        if not state.character_folder:
+            lookup = CHARACTER_BY_NAME.get((state.character_name or "").strip().lower())
+            if lookup and lookup.folder:
+                state.character_folder = lookup.folder
         key = state_key(state.guild_id, state.user_id)
         active_transformations[key] = state
         remaining = max((state.expires_at - now).total_seconds(), 0)
@@ -1414,9 +1485,8 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         character_message = character.message
         inanimate_responses = tuple()
         duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
-        if _name_matches_token(selected_name, "narrator") or _name_matches_token(
-            selected_name, "ball"
-        ):
+        selected_folder_token = _normalize_folder_token(character.folder if character and character.folder else selected_name)
+        if selected_folder_token in {"narrator", "ball"}:
             duration_label = "1 hour"
             duration_delta = timedelta(hours=1)
     now = utc_now()
@@ -1428,6 +1498,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         user_id=member.id,
         guild_id=message.guild.id,
         character_name=selected_name,
+        character_folder=character.folder if character else None,
         character_avatar_path=character_avatar_path,
         character_message=character_message,
         original_nick=original_nick,
@@ -1469,7 +1540,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         duration_label,
         selected_name,
     )
-    special_hint = _format_special_reroll_hint(selected_name)
+    special_hint = _format_special_reroll_hint(selected_name, character.folder if character else None)
     if special_hint:
         response_text = f"{response_text}\n{special_hint}"
     emoji_prefix = _get_magic_emoji(message.guild)
@@ -1553,6 +1624,7 @@ def current_history_channel_id() -> int:
 @bot.event
 async def on_ready():
     await ensure_state_restored()
+    await _sync_application_commands_for_known_guilds()
     logger.info("Logged in as %s (id=%s)", bot.user, bot.user.id if bot.user else "unknown")
     logger.info("TF chance set to %.0f%%", TF_CHANCE * 100)
     logger.info("Message style: %s", MESSAGE_STYLE.upper())
@@ -1568,8 +1640,6 @@ async def on_ready():
     schedule_history_refresh()
 
 
-@bot.command(name="synreset", hidden=True)
-@commands.guild_only()
 async def secret_reset_command(ctx: commands.Context):
     author = ctx.author
     if not isinstance(author, discord.Member):
@@ -1604,9 +1674,18 @@ async def secret_reset_command(ctx: commands.Context):
     await ctx.channel.send(f"TF reset completed. Restored {restored} transformations.", delete_after=10)
 
 
-@bot.command(name="reroll")
-@commands.guild_only()
+@bot.tree.command(name="synreset", description="Reset all active transformations in this server.")
+@app_commands.guild_only()
+async def slash_synreset_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    await secret_reset_command(ctx)
+    if not ctx.responded:
+        await interaction.followup.send("TF reset completed.", ephemeral=True)
+
+
 async def reroll_command(ctx: commands.Context, *, args: str = ""):
+    await ensure_state_restored()
     author = ctx.author
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
@@ -1633,191 +1712,154 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     forced_character: Optional[TFCharacter] = None
     forced_inanimate: Optional[Dict[str, object]] = None
 
-    query = args.strip()
+    tokens = [token for token in args.split() if token.strip()]
     forced_token: Optional[str] = None
-    if query:
-        parts = query.split()
-        first_token_input = parts[0]
-        first_token = first_token_input.lower()
-        first_token_variants = _token_variants(first_token_input)
-        if len(parts) > 1:
-            if not can_force_reroll:
-                await ctx.reply(
-                    "Only admins or Syn's Ball/Narrator TFs can force a reroll into a specific form.",
-                    mention_author=False,
-                )
+    target_member: Optional[discord.Member] = None
+    target_is_admin = False
+    state: Optional[TransformationState] = None
+
+    if not tokens:
+        slash_member = getattr(ctx, "_slash_target_member", None)
+        slash_folder = getattr(ctx, "_slash_target_folder", None)
+        if slash_member is not None:
+            tokens = [slash_member.mention]
+        elif slash_folder:
+            tokens = [slash_folder]
+        forced_override = getattr(ctx, "_slash_force_folder", None)
+        if forced_override:
+            forced_token = forced_override
+
+    if tokens:
+        first = tokens.pop(0)
+        mention_id = _extract_user_id_from_token(first)
+        if mention_id is not None:
+            _, member_lookup = await fetch_member(guild.id, mention_id)
+            if member_lookup is None:
+                await ctx.reply("I couldn't find that member.", mention_author=False)
                 return None
-            forced_token = parts[1].lower()
-
-        character_state_matches: list[TransformationState] = []
-        member_state_matches: list[TransformationState] = []
-
-        for state_candidate in active_transformations.values():
-            if state_candidate.guild_id != guild.id:
-                continue
-            if _name_matches_token(state_candidate.character_name, first_token_input):
-                character_state_matches.append(state_candidate)
-                continue
-            character_entry = CHARACTER_BY_NAME.get(state_candidate.character_name.strip().lower())
-            if character_entry and _character_matches_token(character_entry, first_token_input):
-                character_state_matches.append(state_candidate)
-                continue
-            member_obj = guild.get_member(state_candidate.user_id)
-            if member_obj:
-                profile = member_profile_name(member_obj).lower()
-                profile_first = profile.split(" ", 1)[0]
-                if profile in first_token_variants or profile_first in first_token_variants:
-                    member_state_matches.append(state_candidate)
-
-        matching_states = character_state_matches or member_state_matches
-        target_member = None
-        if matching_states:
-            state = matching_states[0]
-            _, target_member = await fetch_member(state.guild_id, state.user_id)
+            target_member = member_lookup
+            target_is_admin = is_admin(member_lookup)
+            state = find_active_transformation(member_lookup.id, guild.id)
+            if state is None:
+                placeholder = _build_placeholder_state(member_lookup, guild)
+                active_transformations[state_key(guild.id, member_lookup.id)] = placeholder
+                state = placeholder
         else:
-            # Fallback: caller's own transformation
-            caller_state = author_state
-            if caller_state:
-                if _name_matches_token(caller_state.character_name, first_token_input):
-                    state = caller_state
-                    target_member = author
-                else:
-                    entry = CHARACTER_BY_NAME.get(caller_state.character_name.strip().lower())
-                    if entry and _character_matches_token(entry, first_token_input):
-                        state = caller_state
-                        target_member = author
+            state = _find_state_by_folder(guild, first)
             if state is None:
-                member_candidate = discord.utils.find(
-                    lambda m: (
-                        m.display_name.lower() in first_token_variants
-                        or m.display_name.split(" ", 1)[0].lower() in first_token_variants
-                        or m.name.lower() in first_token_variants
-                        or m.name.split(" ", 1)[0].lower() in first_token_variants
-                    ),
-                    guild.members if guild else [],
+                potential_member = discord.utils.find(
+                    lambda m: m.name.lower() == first.lower()
+                    or m.display_name.lower() == first.lower(),
+                    guild.members,
                 )
-                if member_candidate:
-                    state = find_active_transformation(member_candidate.id, guild.id)
-                    target_member = member_candidate
-            if state is None:
-                # In RP, allow DM/owner to bootstrap a first TF for the target.
-                if roleplay_dm_override and guild:
-                    if target_member is None:
-                        user_id_token = _extract_user_id_from_token(first_token_input)
-                        member_lookup: Optional[discord.Member] = None
-                        if user_id_token:
-                            member_lookup = guild.get_member(user_id_token)
-                        if member_lookup is None:
-                            member_lookup = discord.utils.find(
-                                lambda m: m.name.lower() == first_token or m.display_name.lower() == first_token,
-                                guild.members,
-                            )
-                        target_member = member_lookup
-                    if target_member is None:
-                        await ctx.reply(
-                            f"Couldn't find a member matching `{first_token_input}`.",
-                            mention_author=False,
-                        )
-                        return None
-                    logger.debug(
-                        "RP reroll creating placeholder state for %s (%s)",
-                        target_member,
-                        target_member.id,
-                    )
-                    placeholder = _build_placeholder_state(target_member, guild)
-                    key = state_key(guild.id, target_member.id)
-                    active_transformations[key] = placeholder
+                if potential_member:
+                    target_member = potential_member
+                    target_is_admin = is_admin(potential_member)
+                    placeholder = _build_placeholder_state(potential_member, guild)
+                    active_transformations[state_key(guild.id, potential_member.id)] = placeholder
                     state = placeholder
                 else:
                     await ctx.reply(
-                        f"No active transformation found for `{first_token_input}`.",
+                        f"No active transformation uses folder `{first}`.",
                         mention_author=False,
                     )
                     return None
-            if target_member is None:
-                _, target_member = await fetch_member(state.guild_id, state.user_id)
-        if target_member is None:
+            if state is not None and target_member is None:
+                _, member_lookup = await fetch_member(state.guild_id, state.user_id)
+                target_member = member_lookup
+                target_is_admin = bool(member_lookup and is_admin(member_lookup))
+        if tokens:
+            forced_token = tokens.pop(0)
+        if tokens:
             await ctx.reply(
-                f"Unable to locate the member transformed into {state.character_name}.",
+                "Too many arguments. Provide at most a target and optional forced folder.",
                 mention_author=False,
             )
             return None
-
-        target_is_admin = isinstance(target_member, discord.Member) and is_admin(target_member)
-
-        if (
-            not author_is_admin
-            and target_member.id == author.id
-            and not author_has_special_reroll
-        ):
-            await ctx.reply(
-                "You can't use your reroll on yourself. Ask another player to reroll you instead.",
-                mention_author=False,
-            )
-            return None
-
-        if forced_token:
-            forced_character = next(
-                (character for character in CHARACTER_POOL if _character_matches_token(character, forced_token)),
-                None,
-            )
-            if forced_character is None:
-                forced_inanimate = next(
-                    (
-                        entry
-                        for entry in INANIMATE_FORMS
-                        if str(entry.get("name", "")).split(" ", 1)[0].lower() == forced_token
-                        or str(entry.get("name", "")).lower() == forced_token
-                    ),
-                    None,
-                )
-            if forced_character is None and forced_inanimate is None:
-                await ctx.reply(
-                    f"Unknown target `{forced_token}`. Provide a valid first name.",
-                    mention_author=False,
-                )
-                return None
-            forced_special_name = None
-            if forced_character is not None and _is_special_reroll_name(forced_character.name):
-                forced_special_name = forced_character.name
-            elif forced_inanimate is not None and _is_special_reroll_name(
-                str(forced_inanimate.get("name", ""))
-            ):
-                forced_special_name = str(forced_inanimate.get("name", ""))
-            if (
-                forced_character is not None
-                and _is_admin_only_random_name(forced_character.name)
-                and not author_is_admin
-                and not target_is_admin
-            ):
-                await ctx.reply(
-                    "You can only force Syn or Circe onto admins unless you're an admin yourself.",
-                    mention_author=False,
-                )
-                return None
-            if forced_special_name and author_has_special_reroll and not author_is_admin:
-                await ctx.reply(
-                    "Ball/Narrator TFs can't force others into Ball or Narrator. Ask an admin or owner.",
-                    mention_author=False,
-                )
-                return None
     else:
         if not author_is_admin:
             await ctx.reply(
-                "You need to specify someone to reroll, e.g. `!reroll charname`.",
+                "Specify someone to reroll, e.g. `/reroll target_folder:<folder>` or mention the user.",
                 mention_author=False,
             )
             return None
         target_member = author
-        key = state_key(guild.id, target_member.id)
+        target_is_admin = is_admin(author)
         state = author_state
         if state is None:
+            await ctx.reply("You are not currently transformed.", mention_author=False)
+            return None
+
+    if forced_token is None:
+        forced_override = getattr(ctx, "_slash_force_folder", None)
+        if forced_override:
+            forced_token = forced_override
+
+    if state is None and roleplay_dm_override and target_member is not None:
+        placeholder = _build_placeholder_state(target_member, guild)
+        key_placeholder = state_key(guild.id, target_member.id)
+        active_transformations[key_placeholder] = placeholder
+        state = placeholder
+
+    if state is None:
+        await ctx.reply(
+            "Unable to locate a transformation to reroll. Make sure the target is currently transformed.",
+            mention_author=False,
+        )
+        return None
+    if target_member is None:
+        _, target_member = await fetch_member(state.guild_id, state.user_id)
+        if target_member is None:
             await ctx.reply(
-                "You are not currently transformed; nothing to reroll.",
+                "Unable to locate the member transformed into this character.",
                 mention_author=False,
             )
             return None
-        target_is_admin = isinstance(target_member, discord.Member) and is_admin(target_member)
+        target_is_admin = is_admin(target_member)
+
+    if not author_is_admin and target_member.id == author.id and not author_has_special_reroll:
+        await ctx.reply(
+            "You can't use your own reroll. Ask another player or admin.",
+            mention_author=False,
+        )
+        return None
+
+    if forced_token:
+        forced_character = _find_character_by_folder(forced_token)
+        forced_inanimate = None
+        if forced_character is None:
+            forced_inanimate = next(
+                (entry for entry in INANIMATE_FORMS if str(entry.get("name", "")).strip().lower() == forced_token.lower()),
+                None,
+            )
+        if forced_character is None and forced_inanimate is None:
+            await ctx.reply(
+                f"Unknown folder `{forced_token}`. Use a valid character folder.",
+                mention_author=False,
+            )
+            return None
+        forced_special_token = None
+        if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
+            forced_special_token = forced_character.folder or forced_character.name
+        elif forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
+            forced_special_token = str(forced_inanimate.get("name", ""))
+        if (
+            forced_character is not None
+            and _is_admin_only_random_name(forced_character.folder or forced_character.name)
+            and not author_is_admin
+            and not target_is_admin
+        ):
+            await ctx.reply(
+                "You can only force Syn or Circe onto admins unless you're an admin yourself.",
+                mention_author=False,
+            )
+            return None
+        if forced_special_token and author_has_special_reroll and not author_is_admin:
+            await ctx.reply(
+                "Ball/Narrator TFs can't force others into Ball or Narrator. Ask an admin or owner.",
+                mention_author=False,
+            )
+            return None
 
     key = state_key(guild.id, target_member.id)
     current_state = active_transformations.get(key)
@@ -1860,6 +1902,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     forced_mode = forced_character is not None or forced_inanimate is not None
 
     new_name: str
+    new_folder: Optional[str]
     new_avatar_path: str
     new_message: str
     new_is_inanimate: bool
@@ -1867,6 +1910,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
     if forced_inanimate is not None:
         new_name = str(forced_inanimate.get("name") or "Mystery Relic")
+        new_folder = None
         new_avatar_path = str(forced_inanimate.get("avatar_path") or "")
         new_message = str(forced_inanimate.get("message") or "You feel unsettlingly still.")
         responses_raw = forced_inanimate.get("responses") or []
@@ -1879,6 +1923,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         new_is_inanimate = True
     elif forced_character is not None:
         new_name = forced_character.name
+        new_folder = forced_character.folder
         new_avatar_path = forced_character.avatar_path
         new_message = forced_character.message
         new_responses = tuple()
@@ -1903,6 +1948,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             return None
         chosen = random.choice(available_characters)
         new_name = chosen.name
+        new_folder = chosen.folder
         new_avatar_path = chosen.avatar_path
         new_message = chosen.message
         new_responses = tuple()
@@ -1923,6 +1969,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
     previous_character = state.character_name
     state.character_name = new_name
+    state.character_folder = new_folder
     state.character_avatar_path = new_avatar_path
     state.character_message = new_message
     state.avatar_applied = False
@@ -1987,7 +2034,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             response_text = (
                 f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
             )
-    special_hint = _format_special_reroll_hint(new_name)
+    special_hint = _format_special_reroll_hint(new_name, new_folder)
     if special_hint:
         response_text = f"{response_text}\n{special_hint}"
     emoji_prefix = _get_magic_emoji(guild)
@@ -2013,7 +2060,96 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     )
 
 
-@bot.command(name="tf", aliases=["TF"])
+@bot.tree.command(name="reroll", description="Reroll an active transformation.")
+@app_commands.describe(
+    target_member="Member to reroll (leave empty to target by folder).",
+    target_folder="Folder of the active form to reroll.",
+    force_folder="Folder to force (admins or special forms only).",
+)
+@app_commands.autocomplete(target_folder=_character_name_autocomplete, force_folder=_character_name_autocomplete)
+@app_commands.guild_only()
+async def slash_reroll_command(
+    interaction: discord.Interaction,
+    target_member: Optional[discord.Member] = None,
+    target_folder: Optional[str] = None,
+    force_folder: Optional[str] = None,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    ctx._slash_target_member = target_member
+    ctx._slash_target_folder = target_folder
+    ctx._slash_force_folder = force_folder
+    await reroll_command(ctx, args="")
+    if not ctx.responded:
+        await interaction.followup.send("No reroll was performed.", ephemeral=True)
+
+
+@bot.tree.command(name="dm", description="Show or assign the RP DM (use inside the RP forum thread).")
+@app_commands.describe(member="Member to assign as the DM (leave blank to view current).")
+@app_commands.guild_only()
+async def slash_dm_command(
+    interaction: discord.Interaction,
+    member: Optional[discord.Member] = None,
+) -> None:
+    rp_cog, error = _resolve_roleplay_cog(interaction.channel)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    target = member.mention if member else ""
+    await rp_cog.assign_dm_command(ctx, target=target)
+
+
+@bot.tree.command(name="rename", description="RP: rename a participant for VN panels.")
+@app_commands.describe(member="Player to rename", new_name="New VN display name")
+@app_commands.guild_only()
+async def slash_rename_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    new_name: str,
+) -> None:
+    rp_cog, error = _resolve_roleplay_cog(interaction.channel)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    if not await rp_cog._ensure_dm_actor(ctx):
+        return
+    await rp_cog.rename_identity_command(ctx, member=member.mention, new_name=new_name)
+
+
+@bot.tree.command(name="unload", description="RP: remove a player's RP assignment/alias.")
+@app_commands.describe(member="Player to unload (mention) or type 'all'. Leave blank for instructions.")
+@app_commands.guild_only()
+async def slash_unload_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    rp_cog, error = _resolve_roleplay_cog(interaction.channel)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
+    if not await rp_cog._ensure_dm_actor(ctx):
+        return
+    await rp_cog.unload_identity_command(ctx, member=member.mention)
+
+
+@bot.tree.command(name="unloadall", description="RP: unload every participant in the RP thread (DM only).")
+@app_commands.guild_only()
+async def slash_unload_all_command(
+    interaction: discord.Interaction,
+) -> None:
+    rp_cog, error = _resolve_roleplay_cog(interaction.channel)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
+    if not await rp_cog._ensure_dm_actor(ctx):
+        return
+    await rp_cog.unload_identity_command(ctx, member="all")
+
+
 async def tf_stats_command(ctx: commands.Context):
     guild_id = ctx.guild.id if ctx.guild else None
     if guild_id is None:
@@ -2031,6 +2167,16 @@ async def tf_stats_command(ctx: commands.Context):
             await ctx.message.delete()
         except discord.HTTPException:
             pass
+
+
+@bot.tree.command(name="tf", description="DM your transformation statistics.")
+@app_commands.guild_only()
+async def slash_tf_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
+    await tf_stats_command(ctx)
+    if not ctx.responded:
+        await interaction.followup.send("Check your DMs for your stats.", ephemeral=True)
         try:
             await ctx.author.send(
                 "You haven't experienced any transformations yet."
@@ -2133,8 +2279,8 @@ async def tf_stats_command(ctx: commands.Context):
                 outfit_note = (
                     f"Outfits available for {current_state.character_name}:\n"
                     + "\n".join(f"- {line}" for line in pose_lines)
-                    + "\nUse `!outfit <outfit>` to pick by name or "
-                    + "`!outfit <pose> <outfit>` (you can also separate with ':' or '/')."
+                    + "\nUse `/outfit <outfit>` to pick by name or "
+                    + "`/outfit <pose> <outfit>` (you can also separate with ':' or '/')."
                 )
                 try:
                     await ctx.author.send(outfit_note)
@@ -2153,7 +2299,6 @@ async def tf_stats_command(ctx: commands.Context):
             pass
 
 
-@bot.command(name="bg")
 async def background_command(ctx: commands.Context, *, selection: str = ""):
     try:
         await ctx.message.delete()
@@ -2220,8 +2365,8 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
             else "system default"
         )
         instructions = (
-            "Use `!bg <number>` to apply that background to your VN panel.\n"
-            "Example: `!bg 45` selects option 45 from the list.\n"
+            "Use `/bg <number>` to apply that background to your VN panel.\n"
+            "Example: `/bg 45` selects option 45 from the list.\n"
             f"The default background is `{default_display}`."
         )
 
@@ -2231,7 +2376,7 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
             await ctx.author.send(instructions)
         except discord.Forbidden:
             if ctx.guild:
-                await ctx.send("I couldn't DM you. Please enable direct messages, then rerun `!bg`.", delete_after=10)
+                await ctx.send("I couldn't DM you. Please enable direct messages, then rerun `/bg`.", delete_after=10)
             return
 
         return
@@ -2253,7 +2398,7 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
         index = int(selection)
     except ValueError:
         try:
-            await ctx.author.send(f"`{selection}` isn't a valid background number. Use `!bg` with no arguments to see the list.")
+            await ctx.author.send(f"`{selection}` isn't a valid background number. Use `/bg` with no arguments to see the list.")
         except discord.Forbidden:
             if ctx.guild:
                 await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
@@ -2302,12 +2447,12 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
             )
             return
 
-        target_state = _find_state_by_token(ctx.guild, target_spec)
+        target_state = _find_state_by_folder(ctx.guild, target_spec)
         if target_state is None:
             rp_narrator_target = (
                 ROLEPLAY_COG is not None
                 and ROLEPLAY_COG.is_roleplay_post(ctx.channel)
-                and _name_matches_token("narrator", target_spec)
+                and _normalize_folder_token(target_spec) == "narrator"
             )
             if rp_narrator_target:
                 dm_user_id = ROLEPLAY_COG.dm_user_id
@@ -2354,12 +2499,24 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     schedule_history_refresh()
 
 
+@bot.tree.command(name="bg", description="Select or manage VN backgrounds.")
+@app_commands.describe(selection="Background number (append a folder or member to target them).")
+@app_commands.guild_only()
+async def slash_bg_command(
+    interaction: discord.Interaction,
+    selection: Optional[str] = None,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    await background_command(ctx, selection=selection or "")
+    if not ctx.responded:
+        await interaction.followup.send("Check your DMs for the background list.", ephemeral=True)
 
-@bot.command(name="outfit")
+
 async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
     outfit_name = outfit_name.strip()
     if not outfit_name:
-        message = "Usage: !outfit <outfit>` or `!outfit <pose> <outfit>`"
+        message = "Usage: /outfit <outfit>` or `/outfit <pose> <outfit>`"
         if ctx.guild:
             await ctx.reply(message, mention_author=False)
         else:
@@ -2384,7 +2541,7 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
         base_value, candidate = outfit_name.rsplit(" ", 1)
         candidate = candidate.strip()
         if candidate:
-            matched_state = _find_state_by_token(ctx.guild, candidate)
+            matched_state = _find_state_by_folder(ctx.guild, candidate)
             if matched_state:
                 target_state = matched_state
                 outfit_name = base_value.strip()
@@ -2440,7 +2597,7 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
             parsed_outfit = outfit_name
 
     if not parsed_outfit:
-        message = "Please provide the outfit to select. Example: `!outfit cheer` or `!outfit b cheer`."
+        message = "Please provide the outfit to select. Example: `/outfit cheer` or `/outfit b cheer`."
         if ctx.guild:
             await ctx.reply(message, mention_author=False)
         else:
@@ -2498,64 +2655,129 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
         await ctx.send(confirmation)
 
 
-@bot.command(name="say")
-@commands.guild_only()
-async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
+@bot.tree.command(name="outfit", description="Select an outfit (optionally include pose).")
+@app_commands.describe(outfit="Provide the outfit or `pose outfit`. Admins may append a target folder.")
+@app_commands.guild_only()
+async def slash_outfit_command(
+    interaction: discord.Interaction,
+    outfit: str,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    await outfit_command(ctx, outfit_name=outfit or "")
+    if not ctx.responded:
+        await interaction.followup.send("No outfit change was applied.", ephemeral=True)
+
+
+async def _handle_slash_say(
+    interaction: discord.Interaction,
+    character: str,
+    text: str,
+    *,
+    enforce_permissions: bool = True,
+) -> None:
     await ensure_state_restored()
 
-    actor = ctx.author
-    if not isinstance(actor, discord.Member):
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
-        return
-    can_use_command = is_admin(actor) or _actor_has_narrator_power(actor)
-    if not can_use_command and ROLEPLAY_COG is not None and ROLEPLAY_COG.is_roleplay_post(ctx.channel):
-        can_use_command = ROLEPLAY_COG.has_control(actor)
-    if not can_use_command:
-        await ctx.reply("Only admins or the Narrator can use `!say`.", mention_author=False)
-        return
-
-    args = args.strip()
-    if not args or " " not in args:
-        await ctx.reply("Usage: `!say <character> <text>`", mention_author=False)
-        return
-
-    selection_scope = _selection_scope_for_channel(
-        ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
-    )
-
-    selection_scope = _selection_scope_for_channel(ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None)
-
-    target_token, text = args.split(None, 1)
-    target_state = _find_state_by_token(ctx.guild, target_token)
-    if target_state is None:
-        character = _find_character_by_token(target_token)
-        if character is not None:
-            target_state = _build_roleplay_state(character, actor, ctx.guild)
-        else:
-            inanimate_entry = _find_inanimate_form_by_token(target_token)
-            if inanimate_entry is not None:
-                target_state = _build_inanimate_roleplay_state(inanimate_entry, actor, ctx.guild)
-    if target_state is None:
-        await ctx.reply(
-            f"Couldn't find a character or active TF matching `{target_token}`.",
-            mention_author=False,
+    guild = interaction.guild
+    actor = interaction.user
+    if guild is None or not isinstance(actor, discord.Member):
+        await interaction.response.send_message(
+            "Use this command from within a server channel.",
+            ephemeral=True,
         )
         return
-    if (
-        ROLEPLAY_COG
-        and ROLEPLAY_COG.is_roleplay_post(ctx.channel)
-        and ROLEPLAY_COG.dm_user_id
-        and _name_matches_token(target_state.character_name, "narrator")
-    ):
-        target_state.user_id = ROLEPLAY_COG.dm_user_id
-    is_ball_character = target_state.is_inanimate and _name_matches_token(target_state.character_name, "ball")
-    if target_state.is_inanimate and not is_ball_character:
-        await ctx.reply(f"{target_state.character_name} can't speak right now.", mention_author=False)
+
+    target_name = (character or "").strip()
+    cleaned_content = (text or "").strip()
+    if not target_name:
+        await interaction.response.send_message("Choose which character should speak.", ephemeral=True)
+        return
+    if not cleaned_content:
+        await interaction.response.send_message("Please provide what the character should say.", ephemeral=True)
         return
 
-    cleaned_content = text.strip()
+    guild_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
+    selection_scope = _selection_scope_for_channel(guild_channel)
+
+    if enforce_permissions:
+        can_use_command = is_admin(actor) or _actor_has_narrator_power(actor)
+        if not can_use_command and ROLEPLAY_COG is not None and guild_channel and ROLEPLAY_COG.is_roleplay_post(guild_channel):
+            can_use_command = ROLEPLAY_COG.has_control(actor)
+        if not can_use_command:
+            await interaction.response.send_message("Only admins or the Narrator can use this command.", ephemeral=True)
+            return
+
+    directory_lookup = {name.lower(): name for name in _list_character_directory_names()}
+    normalized_target = target_name.strip()
+    directory_choice = directory_lookup.get(normalized_target.lower())
+
+    target_state = None
+    if directory_choice is None:
+        target_state = _find_state_by_folder(guild, target_name)
+    if target_state is None:
+        folder_character = None
+        if directory_choice is not None:
+            folder_character = _find_character_by_folder(directory_choice)
+        if folder_character is None:
+            folder_character = _find_character_by_folder(target_name)
+        if folder_character is not None:
+            target_state = _build_roleplay_state(folder_character, actor, guild)
+        elif directory_choice is not None:
+            target_state = _build_roleplay_state(
+                TFCharacter(
+                    name=directory_choice,
+                    avatar_path="",
+                    message="",
+                    folder=directory_choice,
+                ),
+                actor,
+                guild,
+            )
+        else:
+            inanimate_entry = _find_inanimate_form_by_token(target_name)
+            if inanimate_entry is not None:
+                target_state = _build_inanimate_roleplay_state(inanimate_entry, actor, guild)
+    if target_state is None:
+        await interaction.response.send_message(
+            f"Couldn't find a character or active TF matching `{target_name}`.",
+            ephemeral=True,
+        )
+        return
+
+    if (
+        ROLEPLAY_COG
+        and guild_channel
+        and ROLEPLAY_COG.is_roleplay_post(guild_channel)
+        and ROLEPLAY_COG.dm_user_id
+        and _state_matches_folder(target_state, "narrator")
+    ):
+        target_state.user_id = ROLEPLAY_COG.dm_user_id
+
+    is_ball_character = target_state.is_inanimate and _state_matches_folder(target_state, "ball")
+    if target_state.is_inanimate and not is_ball_character:
+        await interaction.response.send_message(f"{target_state.character_name} can't speak right now.", ephemeral=True)
+        return
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(thinking=True)
+
+    reply_context: Optional[ReplyContext] = None
+    cleaned_content = cleaned_content.strip()
+    if AI_REWRITE_ENABLED and cleaned_content and not cleaned_content.startswith(str(bot.command_prefix)):
+        context_snippet = CHARACTER_CONTEXT.get(target_state.character_name) or target_state.character_message
+        rewritten = await rewrite_message_for_character(
+            original_text=cleaned_content,
+            character_name=target_state.character_name,
+            character_context=context_snippet,
+            user_name=actor.display_name,
+        )
+        if rewritten and rewritten.strip():
+            cleaned_content = rewritten.strip()
+
+    cleaned_content, _ = strip_urls(cleaned_content)
+    cleaned_content = cleaned_content.strip()
     if not cleaned_content:
-        await ctx.reply("Please provide what the character should say.", mention_author=False)
+        await interaction.followup.send("There's nothing for the character to say after filtering that text.", ephemeral=True)
         return
 
     _, member = await fetch_member(target_state.guild_id, target_state.user_id)
@@ -2566,36 +2788,25 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
         or f"User {target_state.user_id}"
     )
 
-    reply_context = await _resolve_reply_context(ctx.message)
-
-    if AI_REWRITE_ENABLED and not cleaned_content.startswith(str(bot.command_prefix)):
-        context_snippet = CHARACTER_CONTEXT.get(target_state.character_name) or target_state.character_message
-        rewritten = await rewrite_message_for_character(
-            original_text=cleaned_content,
-            character_name=target_state.character_name,
-            character_context=context_snippet,
-            user_name=original_name,
-        )
-        if rewritten and rewritten.strip():
-            cleaned_content = rewritten.strip()
-
-    cleaned_content, _ = strip_urls(cleaned_content)
-    cleaned_content = cleaned_content.strip()
     formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else []
-    custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
+    emoji_source = SimpleNamespace(guild=guild)
+    custom_emoji_images = await prepare_custom_emoji_images(emoji_source, formatted_segments)
 
     files: list[discord.File] = []
     payload: dict = {}
+    character_display_name = target_state.character_name
+    if ROLEPLAY_COG and guild_channel and ROLEPLAY_COG.is_roleplay_post(guild_channel):
+        override_display = ROLEPLAY_COG.resolve_display_name(guild.id, actor.id)
+        if override_display:
+            character_display_name = override_display
+
     if MESSAGE_STYLE == "vn" and not target_state.is_inanimate:
-        if formatted_segments is None:
-            formatted_segments = parse_discord_formatting(cleaned_content)
-        custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
         vn_file = render_vn_panel(
             state=target_state,
             message_content=cleaned_content,
-            character_display_name=target_state.character_name,
+            character_display_name=character_display_name,
             original_name=original_name,
-            attachment_id=str(ctx.message.id),
+            attachment_id=str(interaction.id),
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
             reply_context=reply_context,
@@ -2615,23 +2826,68 @@ async def narrator_say_command(ctx: commands.Context, *, args: str = ""):
     send_kwargs.update(payload)
     if files:
         send_kwargs["files"] = files
-    send_kwargs["reference"] = ctx.message.to_reference(fail_if_not_exists=False)
-    send_kwargs["mention_author"] = False
+    send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
 
     try:
-        sent_message = await ctx.channel.send(**send_kwargs)
+        sent_message = await interaction.followup.send(**send_kwargs, wait=True)
     except discord.HTTPException as exc:
-        logger.warning("Failed to send narrator say panel: %s", exc)
-        await ctx.reply("Couldn't deliver that panel.", mention_author=False)
+        logger.warning("Failed to send slash say panel: %s", exc)
+        await interaction.followup.send("Couldn't deliver that panel.", ephemeral=True)
         return
 
     if sent_message and cleaned_content:
         _register_relay_message(sent_message.id, target_state.character_name, cleaned_content)
 
-    try:
-        await ctx.message.delete()
-    except discord.HTTPException:
-        pass
+
+@bot.tree.command(name="say", description="Have a character deliver a line in the TF channel.")
+@app_commands.describe(
+    character="Character or active TF name to speak as.",
+    text="What the character should say.",
+)
+@app_commands.autocomplete(character=_character_name_autocomplete)
+@app_commands.guild_only()
+async def slash_say_command(
+    interaction: discord.Interaction,
+    character: str,
+    text: str,
+) -> None:
+    await _handle_slash_say(interaction, character, text, enforce_permissions=True)
+
+
+@bot.tree.command(name="n", description="RP Narrator shortcut (RP forum DM/owner only).")
+@app_commands.describe(text="What the Narrator should say.")
+@app_commands.guild_only()
+async def slash_narrator_shortcut(
+    interaction: discord.Interaction,
+    text: str,
+) -> None:
+    rp_cog, error = _resolve_roleplay_cog(interaction.channel)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
+    if not await rp_cog._ensure_dm_actor(ctx):
+        return
+    await _handle_slash_say(interaction, "narrator", text, enforce_permissions=False)
+
+
+@bot.tree.command(name="b", description="RP Syn's Ball shortcut (RP forum DM/owner only).")
+@app_commands.describe(text="What Syn's Ball should say.")
+@app_commands.guild_only()
+async def slash_ball_shortcut(
+    interaction: discord.Interaction,
+    text: str,
+) -> None:
+    rp_cog, error = _resolve_roleplay_cog(interaction.channel)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, default_ephemeral=True, bot=bot)
+    if not await rp_cog._ensure_dm_actor(ctx):
+        return
+    await _handle_slash_say(interaction, "ball", text, enforce_permissions=False)
+
+
 
 
 @bot.event

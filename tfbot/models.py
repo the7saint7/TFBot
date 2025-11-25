@@ -39,6 +39,7 @@ class TransformationState:
     started_at: datetime
     expires_at: datetime
     duration_label: str
+    character_folder: Optional[str] = None
     avatar_applied: bool = False
     original_display_name: str = ""
     is_inanimate: bool = False

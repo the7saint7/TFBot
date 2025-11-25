@@ -13,6 +13,7 @@ import discord
 from discord.ext import commands
 
 from .models import TransformationState
+from .interactions import InteractionContextAdapter
 from .state import active_transformations, persist_states, revert_tasks, state_key
 from .utils import is_admin, member_profile_name, utc_now
 
@@ -223,7 +224,7 @@ class RoleplayCog(commands.Cog):
     #
     async def _ensure_dm_actor(self, ctx: commands.Context) -> bool:
         if self.dm_user_id is None:
-            await ctx.reply("No DM is configured yet. Ask an admin to run `!dm <user>` first.", mention_author=False)
+            await ctx.reply("No DM is configured yet. Ask an admin to run `/dm <user>` first.", mention_author=False)
             return False
         if not isinstance(ctx.author, discord.Member):
             await ctx.reply("These commands can only be used within a server.", mention_author=False)
@@ -238,11 +239,6 @@ class RoleplayCog(commands.Cog):
     #
     # Commands
     #
-    @commands.command(
-        name="dm",
-        help="RP: show the current DM or assign one with `!dm @user` (admins/owner only).",
-    )
-    @commands.guild_only()
     async def assign_dm_command(self, ctx: commands.Context, *, target: str = ""):
         if not self.forum_post_id:
             await ctx.reply("The RP forum post isn't configured on this bot.", mention_author=False)
@@ -321,20 +317,15 @@ class RoleplayCog(commands.Cog):
         logger.debug("RP !dm assigned %s (%s) as DM.", member, member.id)
         await ctx.send(f"{member.mention} is now the RP DM.")
 
-    @commands.command(
-        name="n",
-        help="RP: narrator shortcut for `!say narrator <text>` (DM/owner only inside the RP post).",
-    )
-    @commands.guild_only()
     async def narrator_shortcut_command(self, ctx: commands.Context, *, text: str = ""):
         if not self.is_roleplay_post(ctx.channel):
-            await ctx.reply("`!n` can only be used inside the RP forum post.", mention_author=False)
+            await ctx.reply("`/n` can only be used inside the RP forum post.", mention_author=False)
             return
         if not await self._ensure_dm_actor(ctx):
             return
         cleaned = text.strip()
         if not cleaned:
-            await ctx.reply("Usage: `!n <text>`", mention_author=False)
+            await ctx.reply("Usage: `/n <text>`", mention_author=False)
             return
         logger.debug(
             "RP !n invoked by %s (%s) with %s chars",
@@ -348,20 +339,15 @@ class RoleplayCog(commands.Cog):
             return
         await ctx.invoke(say_command, args=f"narrator {cleaned}")
 
-    @commands.command(
-        name="b",
-        help="RP: Syn's Ball shortcut for `!say ball <text>` (DM/owner only inside the RP post).",
-    )
-    @commands.guild_only()
     async def ball_shortcut_command(self, ctx: commands.Context, *, text: str = ""):
         if not self.is_roleplay_post(ctx.channel):
-            await ctx.reply("`!b` can only be used inside the RP forum post.", mention_author=False)
+            await ctx.reply("`/b` can only be used inside the RP forum post.", mention_author=False)
             return
         if not await self._ensure_dm_actor(ctx):
             return
         cleaned = text.strip()
         if not cleaned:
-            await ctx.reply("Usage: `!b <text>`", mention_author=False)
+            await ctx.reply("Usage: `/b <text>`", mention_author=False)
             return
         logger.debug(
             "RP !b invoked by %s (%s) with %s chars",
@@ -375,11 +361,6 @@ class RoleplayCog(commands.Cog):
             return
         await ctx.invoke(say_command, args=f"ball {cleaned}")
 
-    @commands.command(
-        name="r",
-        help="RP: reroll helper that proxies the global `!reroll` command and seeds first TFs.",
-    )
-    @commands.guild_only()
     async def reroll_shortcut_command(self, ctx: commands.Context, *, args: str = ""):
         if not self.is_roleplay_post(ctx.channel):
             await ctx.reply("`!r` can only be used inside the RP forum post.", mention_author=False)
@@ -400,24 +381,19 @@ class RoleplayCog(commands.Cog):
         await ctx.invoke(reroll_command, args=args)
         await self._finalize_reroll(ctx.guild, before)
 
-    @commands.command(
-        name="rename",
-        help="RP: rename a participant for VN panels, e.g. `!rename @player New Name`.",
-    )
-    @commands.guild_only()
     async def rename_identity_command(self, ctx: commands.Context, member: str, *, new_name: str):
         if not self.is_roleplay_post(ctx.channel):
-            await ctx.reply("`!rename` can only be used inside the RP forum post.", mention_author=False)
+            await ctx.reply("`/rename` can only be used inside the RP forum post.", mention_author=False)
             return
         if not await self._ensure_dm_actor(ctx):
             return
         member_arg = member.strip()
         if not member_arg:
-            await ctx.send("Please specify which player to rename, e.g. `!rename @player New Name`.")
+            await ctx.send("Please specify which player to rename, e.g. `/rename @player New Name`.")
             return
         cleaned = new_name.strip()
         if not cleaned:
-            await ctx.send("Provide the new display name, e.g. `!rename @player New Name`.")
+            await ctx.send("Provide the new display name, e.g. `/rename @player New Name`.")
             return
         converter = commands.MemberConverter()
         try:
@@ -439,21 +415,42 @@ class RoleplayCog(commands.Cog):
             mention_author=False,
         )
 
-    @commands.command(
-        name="unload",
-        help="RP: remove a player's RP assignment/alias so they can be reassigned fresh.",
-    )
-    @commands.guild_only()
     async def unload_identity_command(self, ctx: commands.Context, *, member: str):
         if not self.is_roleplay_post(ctx.channel):
-            await ctx.reply("`!unload` can only be used inside the RP forum post.", mention_author=False)
+            await ctx.reply("`/unload` can only be used inside the RP forum post.", mention_author=False)
             return
         if not await self._ensure_dm_actor(ctx):
             return
         target_arg = member.strip()
         if not target_arg:
-            await ctx.send("Specify which player to unload, e.g. `!unload @player`.")
+            await ctx.send("Specify which player to unload, e.g. `/unload @player` or `/unload all`.")
             return
+        if target_arg.lower() == "all":
+            guild_id = ctx.guild.id
+            assignment_removed = 0
+            tf_removed = 0
+            keys_to_clear = [
+                (entry.get("guild_id"), entry.get("user_id"))
+                for entry in self.assignments.values()
+                if entry.get("guild_id") == guild_id
+            ]
+            for g_id, user_id in keys_to_clear:
+                if g_id is None or user_id is None:
+                    continue
+                if await self._unload_assignment(guild_id, int(user_id)):
+                    assignment_removed += 1
+            for key, state in list(active_transformations.items()):
+                g_id, u_id = key
+                if g_id != guild_id:
+                    continue
+                if await self._clear_active_transformation(g_id, u_id):
+                    tf_removed += 1
+            await ctx.reply(
+                f"Unloaded {assignment_removed} RP entries and removed {tf_removed} active TFs.",
+                mention_author=False,
+            )
+            return
+
         converter = commands.MemberConverter()
         try:
             resolved_member = await converter.convert(ctx, target_arg)
