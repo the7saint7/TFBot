@@ -2062,23 +2062,23 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
 @bot.tree.command(name="reroll", description="Reroll an active transformation.")
 @app_commands.describe(
-    target_member="Member to reroll (leave empty to target by folder).",
-    target_folder="Folder of the active form to reroll.",
-    force_folder="Folder to force (admins or special forms only).",
+    who_member="Member to reroll.",
+    who_character="Folder of the active form to reroll.",
+    to_character="Folder to force (admins or special forms only).",
 )
-@app_commands.autocomplete(target_folder=_character_name_autocomplete, force_folder=_character_name_autocomplete)
+@app_commands.autocomplete(who_character=_character_name_autocomplete, to_character=_character_name_autocomplete)
 @app_commands.guild_only()
 async def slash_reroll_command(
     interaction: discord.Interaction,
-    target_member: Optional[discord.Member] = None,
-    target_folder: Optional[str] = None,
-    force_folder: Optional[str] = None,
+    who_member: Optional[discord.Member] = None,
+    who_character: Optional[str] = None,
+    to_character: Optional[str] = None,
 ) -> None:
     await interaction.response.defer(thinking=True)
     ctx = InteractionContextAdapter(interaction, bot=bot)
-    ctx._slash_target_member = target_member
-    ctx._slash_target_folder = target_folder
-    ctx._slash_force_folder = force_folder
+    ctx._slash_target_member = who_member
+    ctx._slash_target_folder = who_character
+    ctx._slash_force_folder = to_character
     await reroll_command(ctx, args="")
     if not ctx.responded:
         await interaction.followup.send("No reroll was performed.", ephemeral=True)
