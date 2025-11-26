@@ -1294,6 +1294,11 @@ async def relay_transformed_message(
         cleaned_content, has_links = strip_urls(cleaned_content)
         cleaned_content = cleaned_content.strip()
 
+    if cleaned_content:
+        mention_ready_text, mention_lookup, has_mentions = prepare_panel_mentions(message, cleaned_content)
+        if has_mentions:
+            cleaned_content = apply_mention_placeholders(mention_ready_text, mention_lookup)
+
     description = cleaned_content if cleaned_content else "*no message content*"
     formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else None
     custom_emoji_images: Dict[str, "Image.Image"] = {}
