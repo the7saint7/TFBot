@@ -72,9 +72,11 @@ from tfbot.panels import (
     apply_mention_placeholders,
     compose_game_avatar,
     fetch_avatar_bytes,
+    get_accessory_states,
     get_selected_background_path,
     get_selected_outfit_name,
     get_selected_pose_outfit,
+    list_character_accessories,
     list_available_outfits,
     list_background_choices,
     list_pose_outfits,
@@ -88,6 +90,7 @@ from tfbot.panels import (
     set_selected_outfit_name,
     set_selected_pose_outfit,
     strip_urls,
+    toggle_accessory_state,
     vn_outfit_selection,
     persist_outfit_selections,
 )
@@ -153,6 +156,7 @@ SPECIAL_REROLL_FORMS = ("ball", "narrator")
 ADMIN_ONLY_RANDOM_FORMS = ("syn", "circe")
 CHARACTER_AUTOCOMPLETE_LIMIT = 25
 OUTFIT_AUTOCOMPLETE_LIMIT = 25
+ACCESSORY_AUTOCOMPLETE_LIMIT = 25
 CHARACTER_DIRECTORY_CACHE_TTL = 120.0  # seconds
 
 
@@ -334,6 +338,39 @@ async def _outfit_autocomplete(
             choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
             if len(choices) >= OUTFIT_AUTOCOMPLETE_LIMIT:
                 return choices
+    return choices
+
+
+async def _accessory_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    await ensure_state_restored()
+    guild = interaction.guild
+    actor = interaction.user
+    if guild is None or actor is None:
+        return []
+    state = find_active_transformation(actor.id, guild.id)
+    if state is None or not state.character_name:
+        return []
+    accessories = list_character_accessories(state.character_name)
+    if not accessories:
+        return []
+    guild_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
+    selection_scope = _selection_scope_for_channel(guild_channel)
+    accessory_states = get_accessory_states(state.character_name, scope=selection_scope)
+    normalized_query = (current or "").strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+    for key, label in sorted(accessories.items(), key=lambda item: item[1].lower() if item[1] else item[0]):
+        display_label = label or key
+        match_source = f"{display_label} {key}".lower()
+        if normalized_query and normalized_query not in match_source:
+            continue
+        status = accessory_states.get(key, "off")
+        choice_label = f"{display_label} ({status})"
+        choices.append(app_commands.Choice(name=choice_label[:100], value=key[:100]))
+        if len(choices) >= ACCESSORY_AUTOCOMPLETE_LIMIT:
+            break
     return choices
 
 
@@ -908,6 +945,27 @@ def _selection_scope_for_channel(channel: Optional[discord.abc.GuildChannel]) ->
         return None
     if ROLEPLAY_COG.is_roleplay_post(channel):
         return "rp"
+    return None
+
+
+def _resolve_accessory_key_input(accessory_name: str, accessories: Mapping[str, str]) -> Optional[str]:
+    normalized = (accessory_name or "").strip().lower()
+    if not normalized:
+        return None
+    compact = normalized.replace(" ", "").replace("_", "").replace("/", "").replace("-", "")
+    if normalized in accessories:
+        return normalized
+    for key in accessories.keys():
+        key_compact = key.replace(" ", "").replace("_", "").replace("/", "").replace("-", "")
+        if normalized == key or (compact and compact == key_compact):
+            return key
+    for key, label in accessories.items():
+        label_value = (label or "").strip().lower()
+        if not label_value:
+            continue
+        label_compact = label_value.replace(" ", "").replace("_", "").replace("/", "").replace("-", "")
+        if normalized == label_value or (compact and compact == label_compact):
+            return key
     return None
 
 
@@ -2759,6 +2817,135 @@ async def slash_outfit_command(
     await outfit_command(ctx, outfit_name=outfit or "")
     if not ctx.responded:
         await interaction.followup.send("No outfit change was applied.", ephemeral=True)
+
+
+async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""):
+    accessory_name = accessory_name.strip()
+
+    await ensure_state_restored()
+
+    selection_scope = _selection_scope_for_channel(
+        ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
+    )
+    guild_id = ctx.guild.id if ctx.guild else None
+    actor_member = ctx.author if isinstance(ctx.author, discord.Member) else None
+    can_target_others = (
+        ctx.guild is not None
+        and actor_member is not None
+        and (is_admin(actor_member) or _actor_has_narrator_power(actor_member))
+    )
+    target_state: Optional[TransformationState] = None
+    if accessory_name and can_target_others and ctx.guild and " " in accessory_name:
+        base_value, candidate = accessory_name.rsplit(" ", 1)
+        candidate = candidate.strip()
+        if candidate:
+            matched_state = _find_state_by_folder(ctx.guild, candidate)
+            if matched_state:
+                target_state = matched_state
+                accessory_name = base_value.strip()
+    if target_state and target_state.is_inanimate:
+        message = f"{target_state.character_name} is inanimate and can't change accessories."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+    state = target_state or find_active_transformation(ctx.author.id, guild_id)
+    if not state:
+        fallback_state = find_active_transformation(ctx.author.id)
+        if fallback_state and ctx.guild and fallback_state.guild_id != guild_id:
+            target_guild = bot.get_guild(fallback_state.guild_id)
+            guild_name = target_guild.name if target_guild else f"server {fallback_state.guild_id}"
+            message = (
+                "You're transformed right now, but in a different server. "
+                f"Use this command in **{guild_name}** to change those accessories."
+            )
+        else:
+            message = "You need to be transformed to manage accessories."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    accessories = list_character_accessories(state.character_name)
+    if not accessories:
+        message = f"No accessories are available for {state.character_name}."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    accessory_states = get_accessory_states(state.character_name, scope=selection_scope)
+
+    if not accessory_name:
+        lines = []
+        for key, label in sorted(accessories.items(), key=lambda item: item[1].lower() if item[1] else item[0]):
+            status = accessory_states.get(key, "off")
+            display = label or key
+            lines.append(f"- {display}: {status}")
+        message = (
+            f"Accessories for {state.character_name} (scope `{selection_scope or 'default'}`):\n"
+            + "\n".join(lines)
+        )
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    resolved_key = _resolve_accessory_key_input(accessory_name, accessories)
+    if not resolved_key:
+        available_labels = ", ".join(sorted((label or key) for key, label in accessories.items()))
+        message = (
+            f"Unknown accessory `{accessory_name}`. "
+            f"Available options: {available_labels or 'none'}."
+        )
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    new_state = toggle_accessory_state(
+        state.character_name,
+        resolved_key,
+        scope=selection_scope,
+    )
+    if new_state is None:
+        message = "Unable to update that accessory. Please try again."
+        if ctx.guild:
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.send(message)
+        return
+
+    schedule_history_refresh()
+    label = accessories.get(resolved_key) or resolved_key
+    confirmation = (
+        f"Accessory `{label}` for {state.character_name} set to `{new_state}`. "
+        "Future VN panels will use this state."
+    )
+    if ctx.guild:
+        await ctx.reply(confirmation, mention_author=False)
+    else:
+        await ctx.send(confirmation)
+
+
+@bot.tree.command(name="accessories", description="List or toggle VN accessories.")
+@app_commands.describe(accessory="Select an accessory to toggle. Leave blank to list them.")
+@app_commands.autocomplete(accessory=_accessory_autocomplete)
+@app_commands.guild_only()
+async def slash_accessories_command(
+    interaction: discord.Interaction,
+    accessory: Optional[str] = None,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    await accessories_command(ctx, accessory_name=accessory or "")
+    if not ctx.responded:
+        await interaction.followup.send("No accessory change was applied.", ephemeral=True)
 
 
 async def _handle_slash_say(

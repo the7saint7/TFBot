@@ -9,6 +9,7 @@ import os
 import random
 import re
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence, Tuple
@@ -217,7 +218,7 @@ def resolve_panel_layout(character_name: str) -> Optional[Dict]:
         return None
     return _PANEL_LAYOUT_OVERRIDES.get(key)
 
-vn_outfit_selection: Dict[str, Dict[str, str]] = {}
+vn_outfit_selection: Dict[str, Dict[str, object]] = {}
 background_selections: Dict[str, str] = {}
 _vn_config_cache: Dict[str, Dict] = {}
 _VN_BACKGROUND_IMAGES: list[Path] = []
@@ -269,20 +270,22 @@ def _character_directory_index(root: str) -> Dict[str, Path]:
         return {}
 
 
-def load_outfit_selections() -> Dict[str, Dict[str, str]]:
+def load_outfit_selections() -> Dict[str, Dict[str, object]]:
     if not VN_SELECTION_FILE.exists():
         return {}
     try:
         data = json.loads(VN_SELECTION_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            normalized: Dict[str, Dict[str, str]] = {}
+            normalized: Dict[str, Dict[str, object]] = {}
             for key, value in data.items():
-                entry: Dict[str, str] = {}
+                entry: Dict[str, object] = {}
                 pose_value: Optional[str] = None
                 outfit_value: Optional[str] = None
+                accessories_value: Dict[str, str] = {}
                 if isinstance(value, dict):
                     pose_raw = value.get("pose")
                     outfit_raw = value.get("outfit") or value.get("name")
+                    accessories_raw = value.get("accessories")
                     if isinstance(pose_raw, str):
                         pose_value = pose_raw.strip()
                     elif pose_raw is not None:
@@ -291,6 +294,14 @@ def load_outfit_selections() -> Dict[str, Dict[str, str]]:
                         outfit_value = outfit_raw.strip()
                     elif outfit_raw is not None:
                         outfit_value = str(outfit_raw).strip()
+                    if isinstance(accessories_raw, Mapping):
+                        for acc_key, acc_value in accessories_raw.items():
+                            normalized_key = str(acc_key).strip().lower()
+                            if not normalized_key:
+                                continue
+                            normalized_value = str(acc_value).strip().lower()
+                            if normalized_value == "on":
+                                accessories_value[normalized_key] = "on"
                 elif isinstance(value, str):
                     outfit_value = value.strip()
                 elif value is not None:
@@ -300,6 +311,8 @@ def load_outfit_selections() -> Dict[str, Dict[str, str]]:
                     if pose_value:
                         entry["pose"] = pose_value
                     entry["outfit"] = outfit_value
+                    if accessories_value:
+                        entry["accessories"] = accessories_value
                     normalized[str(key).lower()] = entry
             return normalized
     except json.JSONDecodeError as exc:
@@ -469,20 +482,25 @@ def _default_accessory_layer(accessory_dir: Path) -> Optional[Path]:
     return sprite_files[0]
 
 
+def _accessory_order_from_name(source_name: str) -> int:
+    normalized_name = source_name.lower()
+    order = 0
+    if "-" in normalized_name:
+        suffix = normalized_name.rsplit("-", 1)[-1]
+        if suffix.lstrip("-").isdigit():
+            try:
+                order = int(suffix)
+            except ValueError:
+                order = 0
+    return order
+
+
 def _collect_accessory_layers(entry: Path, include_all: bool = False) -> list[Tuple[int, Path]]:
     accessories: list[Tuple[int, Path]] = []
     seen_paths: set[Path] = set()
 
     def _add_layer(path: Path, source_name: str) -> None:
-        normalized_name = source_name.lower()
-        order = 0
-        if "-" in normalized_name:
-            suffix = normalized_name.rsplit("-", 1)[-1]
-            if suffix.lstrip("-").isdigit():
-                try:
-                    order = int(suffix)
-                except ValueError:
-                    order = 0
+        order = _accessory_order_from_name(source_name)
         if path not in seen_paths:
             accessories.append((order, path))
             seen_paths.add(path)
@@ -509,6 +527,99 @@ def _collect_accessory_layers(entry: Path, include_all: bool = False) -> list[Tu
 
     accessories.sort(key=lambda item: item[0])
     return accessories
+
+
+@dataclass(frozen=True)
+class _AccessoryDefinition:
+    key: str
+    label: str
+    order: int
+    on_layer: Optional[Path]
+    off_layer: Optional[Path]
+
+
+_ACCESSORY_CACHE: Dict[str, Dict[str, _AccessoryDefinition]] = {}
+
+
+def _normalize_accessory_key(relative_path: Path) -> str:
+    return relative_path.as_posix().lower()
+
+
+def _format_accessory_label(relative_path: Path) -> str:
+    parts: list[str] = []
+    for part in relative_path.parts:
+        cleaned = part
+        if cleaned.lower().startswith("acc_"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.replace("_", " ").strip()
+        if cleaned:
+            parts.append(cleaned)
+    if not parts:
+        return relative_path.name
+    return " / ".join(parts)
+
+
+def _find_accessory_layer(accessory_dir: Path, target_state: str) -> Optional[Path]:
+    sprite_files = _gather_sprite_files(accessory_dir, recursive=True)
+    if not sprite_files:
+        return None
+    normalized = target_state.strip().lower()
+    if not normalized:
+        return None
+    for candidate in sprite_files:
+        if candidate.stem.lower() == normalized:
+            return candidate
+    for candidate in sprite_files:
+        if normalized in candidate.stem.lower():
+            return candidate
+    for candidate in sprite_files:
+        parents = [parent.name.lower() for parent in candidate.parents]
+        if normalized in parents:
+            return candidate
+    return None
+
+
+def _discover_variant_accessories(variant_dir: Path) -> Dict[str, _AccessoryDefinition]:
+    cache_key = variant_dir.resolve().as_posix()
+    cached = _ACCESSORY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    outfits_dir = variant_dir / "outfits"
+    if not outfits_dir.exists():
+        _ACCESSORY_CACHE[cache_key] = {}
+        return {}
+    definitions: Dict[str, _AccessoryDefinition] = {}
+    try:
+        entries = sorted(outfits_dir.rglob("*"), key=lambda p: p.as_posix().lower())
+    except OSError as exc:
+        logger.warning("VN sprite: failed to scan accessories for %s: %s", variant_dir, exc)
+        _ACCESSORY_CACHE[cache_key] = {}
+        return {}
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if not entry.name.lower().startswith("acc"):
+            continue
+        try:
+            relative = entry.relative_to(outfits_dir)
+        except ValueError:
+            continue
+        key = _normalize_accessory_key(relative)
+        if key in definitions:
+            continue
+        label = _format_accessory_label(relative) or entry.name
+        order = _accessory_order_from_name(entry.name)
+        on_layer = _find_accessory_layer(entry, "on")
+        off_layer = _find_accessory_layer(entry, "off")
+        definitions[key] = _AccessoryDefinition(
+            key=key,
+            label=label,
+            order=order,
+            on_layer=on_layer,
+            off_layer=off_layer,
+        )
+    _ACCESSORY_CACHE[cache_key] = definitions
+    return definitions
 
 
 def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
@@ -540,18 +651,6 @@ def _discover_outfit_assets(variant_dir: Path) -> Dict[str, OutfitAsset]:
                 accessory_layers=tuple(layer for _, layer in accessories),
             )
 
-    for entry in entries:
-        if entry.is_dir() and entry.name.lower().startswith("acc"):
-            global_layers = _collect_accessory_layers(entry)
-            if global_layers:
-                for key, asset in list(assets.items()):
-                    combined = list(asset.accessory_layers)
-                    combined.extend(layer for _, layer in global_layers)
-                    assets[key] = OutfitAsset(
-                        name=asset.name,
-                        base_path=asset.base_path,
-                        accessory_layers=tuple(combined),
-                    )
     return assets
 
 
@@ -683,6 +782,204 @@ def list_available_outfits(character_name: str) -> Sequence[str]:
     for options in pose_map.values():
         outfits.update(options)
     return sorted(outfits)
+
+
+def _list_accessories_for_dir(directory: Path) -> Dict[str, str]:
+    config = _load_character_config(directory)
+    variant_dirs = _ordered_variant_dirs(directory, config)
+    if not variant_dirs:
+        return {}
+    accessories: Dict[str, str] = {}
+    for variant_dir in variant_dirs:
+        definitions = _discover_variant_accessories(variant_dir)
+        for key, definition in definitions.items():
+            if key not in accessories:
+                accessories[key] = definition.label or definition.key
+    return accessories
+
+
+def list_character_accessories(character_name: str) -> Dict[str, str]:
+    directory, _ = resolve_character_directory(character_name)
+    if directory is None:
+        return {}
+    return _list_accessories_for_dir(directory)
+
+
+def _stored_accessory_states_for_dir(
+    directory: Path,
+    scope: Optional[str],
+) -> Dict[str, str]:
+    for lookup_key in _selection_lookup_keys(directory, scope):
+        entry = vn_outfit_selection.get(lookup_key)
+        if isinstance(entry, dict):
+            raw_accessories = entry.get("accessories")
+            if isinstance(raw_accessories, Mapping):
+                normalized: Dict[str, str] = {}
+                for key, value in raw_accessories.items():
+                    normalized_key = str(key).strip().lower()
+                    if not normalized_key:
+                        continue
+                    normalized_value = str(value).strip().lower()
+                    if normalized_value == "on":
+                        normalized[normalized_key] = "on"
+                return normalized
+    return {}
+
+
+def get_accessory_states_for_dir(
+    directory: Path,
+    scope: Optional[str] = None,
+) -> Dict[str, str]:
+    accessories = _list_accessories_for_dir(directory)
+    if not accessories:
+        return {}
+    stored_states = _stored_accessory_states_for_dir(directory, scope)
+    states: Dict[str, str] = {}
+    for key in accessories.keys():
+        states[key] = stored_states.get(key, "off")
+    return states
+
+
+def get_accessory_states(
+    character_name: str,
+    scope: Optional[str] = None,
+) -> Dict[str, str]:
+    directory, _ = resolve_character_directory(character_name)
+    if directory is None:
+        return {}
+    return get_accessory_states_for_dir(directory, scope=scope)
+
+
+def _set_accessory_state_for_dir(
+    directory: Path,
+    accessory_key: str,
+    enabled: bool,
+    *,
+    scope: Optional[str],
+) -> bool:
+    normalized_key = accessory_key.strip().lower()
+    if not normalized_key:
+        return False
+    store_key = _selection_store_key(directory, scope)
+    entry = vn_outfit_selection.get(store_key)
+    if isinstance(entry, dict):
+        target_entry = entry
+    else:
+        target_entry = {}
+        if isinstance(entry, str):
+            stripped = entry.strip()
+            if stripped:
+                target_entry["outfit"] = stripped
+        elif entry is not None:
+            stripped = str(entry).strip()
+            if stripped:
+                target_entry["outfit"] = stripped
+        vn_outfit_selection[store_key] = target_entry
+    accessories = target_entry.get("accessories")
+    if not isinstance(accessories, dict):
+        accessories = {}
+        target_entry["accessories"] = accessories
+    if enabled:
+        accessories[normalized_key] = "on"
+    else:
+        accessories.pop(normalized_key, None)
+        if not accessories:
+            target_entry.pop("accessories", None)
+    persist_outfit_selections()
+    compose_game_avatar.cache_clear()
+    logger.info(
+        "VN sprite: accessory %s for %s scope %s set to %s",
+        normalized_key,
+        directory.name,
+        _normalize_selection_scope(scope),
+        "on" if enabled else "off",
+    )
+    return True
+
+
+def set_accessory_state(
+    character_name: str,
+    accessory_key: str,
+    enabled: bool,
+    *,
+    scope: Optional[str] = None,
+) -> bool:
+    directory, attempted = resolve_character_directory(character_name)
+    if directory is None:
+        logger.debug("VN sprite: cannot set accessory for %s (tried %s)", character_name, attempted)
+        return False
+    accessories = _list_accessories_for_dir(directory)
+    normalized_key = accessory_key.strip().lower()
+    valid_key = None
+    if normalized_key in accessories:
+        valid_key = normalized_key
+    else:
+        for key in accessories.keys():
+            if key.lower() == normalized_key:
+                valid_key = key
+                break
+    if valid_key is None:
+        return False
+    return _set_accessory_state_for_dir(directory, valid_key, enabled, scope=scope)
+
+
+def toggle_accessory_state(
+    character_name: str,
+    accessory_key: str,
+    *,
+    scope: Optional[str] = None,
+) -> Optional[str]:
+    directory, attempted = resolve_character_directory(character_name)
+    if directory is None:
+        logger.debug("VN sprite: cannot toggle accessory for %s (tried %s)", character_name, attempted)
+        return None
+    accessories = _list_accessories_for_dir(directory)
+    if not accessories:
+        return None
+    normalized_key = accessory_key.strip().lower()
+    canonical_key = None
+    if normalized_key in accessories:
+        canonical_key = normalized_key
+    else:
+        for key in accessories.keys():
+            if key.lower() == normalized_key:
+                canonical_key = key
+                break
+    if canonical_key is None:
+        return None
+    states = get_accessory_states_for_dir(directory, scope=scope)
+    current_state = states.get(canonical_key, "off")
+    enabled = current_state != "on"
+    if not _set_accessory_state_for_dir(directory, canonical_key, enabled, scope=scope):
+        return None
+    return "on" if enabled else "off"
+
+
+def _resolve_optional_accessory_layers(
+    character_dir: Path,
+    variant_dir: Path,
+    scope: Optional[str],
+) -> list[Path]:
+    states = get_accessory_states_for_dir(character_dir, scope=scope)
+    if not states:
+        return []
+    variant_accessories = _discover_variant_accessories(variant_dir)
+    if not variant_accessories:
+        return []
+    layers: list[Tuple[int, Path]] = []
+    for key, state in states.items():
+        definition = variant_accessories.get(key)
+        if not definition:
+            continue
+        target_layer: Optional[Path]
+        if state == "on":
+            target_layer = definition.on_layer or definition.off_layer
+        else:
+            target_layer = definition.off_layer
+        if target_layer:
+            layers.append((definition.order, target_layer))
+    layers.sort(key=lambda item: item[0])
+    return [path for _, path in layers]
 
 
 def _normalize_selection_scope(scope: Optional[str]) -> str:
@@ -823,7 +1120,20 @@ def set_selected_pose_outfit(
         return False
 
     store_key = _selection_store_key(directory, scope)
-    vn_outfit_selection[store_key] = {"pose": matched_pose, "outfit": matched_outfit}
+    existing_entry = vn_outfit_selection.get(store_key)
+    accessory_entry: Optional[Dict[str, str]] = None
+    if isinstance(existing_entry, dict):
+        existing_accessories = existing_entry.get("accessories")
+        if isinstance(existing_accessories, Mapping):
+            accessory_entry = {
+                str(key).strip().lower(): "on"
+                for key, value in existing_accessories.items()
+                if str(value).strip().lower() == "on"
+            }
+    new_entry: Dict[str, object] = {"pose": matched_pose, "outfit": matched_outfit}
+    if accessory_entry:
+        new_entry["accessories"] = accessory_entry
+    vn_outfit_selection[store_key] = new_entry
     persist_outfit_selections()
     compose_game_avatar.cache_clear()
     logger.info(
@@ -933,14 +1243,22 @@ def _compose_game_avatar_uncached(
     outfit_path = outfit_asset.base_path
     face_path = _select_face_path(variant_dir)
 
+    optional_layers = _resolve_optional_accessory_layers(
+        character_dir,
+        variant_dir,
+        selection_scope,
+    )
+    combined_accessory_layers = list(outfit_asset.accessory_layers)
+    combined_accessory_layers.extend(optional_layers)
+
     cache_file: Optional[Path] = None
     if VN_CACHE_DIR:
         face_token = "noface"
         if face_path and face_path.exists():
             face_token = face_path.stem.lower()
         accessory_token = "noacc"
-        if outfit_asset.accessory_layers:
-            accessory_token = "-".join(layer.stem.lower() for layer in outfit_asset.accessory_layers)
+        if combined_accessory_layers:
+            accessory_token = "-".join(layer.stem.lower() for layer in combined_accessory_layers)
         height_token = f"h{sprite_height_limit}" if sprite_height_limit else "auto"
         cache_dir = VN_CACHE_DIR / character_dir.name.lower() / variant_dir.name.lower()
         cache_file = cache_dir / f"{outfit_path.stem.lower()}__{face_token}__{accessory_token}__{height_token}.png"
@@ -958,7 +1276,7 @@ def _compose_game_avatar_uncached(
         logger.warning("Failed to load outfit %s: %s", outfit_path, exc)
         return None
 
-    for layer_path in outfit_asset.accessory_layers:
+    for layer_path in combined_accessory_layers:
         if not layer_path.exists():
             continue
         try:
@@ -2363,6 +2681,10 @@ __all__ = [
     "resolve_character_name_color",
     "list_pose_outfits",
     "list_available_outfits",
+    "list_character_accessories",
+    "get_accessory_states",
+    "set_accessory_state",
+    "toggle_accessory_state",
     "get_selected_outfit_name",
     "get_selected_pose_outfit",
     "set_selected_outfit_name",
