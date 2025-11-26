@@ -633,67 +633,67 @@ TF_CHARACTERS = [
 
     {
         "name": "Yui Gyaru",
-        "folder": "yuiGyaru"
+        "folder": "yuiGyaru",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "Hannah (VR Experiment)",
-        "folder": "hannah"
+        "folder": "hannah",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "hikari (VR Experiment)",
-        "folder": "hikari"
+        "folder": "hikari",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "Hime (VR Experiment)",
-        "folder": "hime"
+        "folder": "hime",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "Hina (VR Experiment)",
-        "folder": "hina"
+        "folder": "hina",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "Hitomi (VR Experiment)",
-        "folder": "hitomi"
+        "folder": "hitomi",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "JaneBE (VR Experiment)",
-        "folder": "jane_be"
+        "folder": "jane_be",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "KatrinaBE (VR Experiment)",
-        "folder": "katrina_be"
+        "folder": "katrina_be",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "meika (VR Experiment)",
-        "folder": "meika"
+        "folder": "meika",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "Natsuki (VR Experiment)",
-        "folder": "natsuki"
+        "folder": "natsuki",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "Reika (VR Experiment)",
-        "folder": "reika_vrxp"
+        "folder": "reika_vrxp",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "Katrina Monkey (Revenge)",
-        "folder": "katrina_monkey"
+        "folder": "katrina_monkey",
         "message": " finds one of Syn's trap and transforms."
     },    
     {
         "name": "StevieGB (NovelAI)",
-        "folder": "stevieGB"
+        "folder": "stevieGB",
         "message": " finds one of Syn's trap and transforms."
     }    
 ]
