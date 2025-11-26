@@ -683,7 +683,7 @@ TF_CHARACTERS = [
     },    
     {
         "name": "Reika (VR Experiment)",
-        "folder": "reika"
+        "folder": "reika_vrxp"
         "message": " finds one of Syn's trap and transforms."
     },    
     {
