@@ -1820,9 +1820,22 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
     tokens = [token for token in args.split() if token.strip()]
     forced_token: Optional[str] = None
+    forced_token_blocked = False
     target_member: Optional[discord.Member] = None
     target_is_admin = False
     state: Optional[TransformationState] = None
+    placeholder_key: Optional[TransformKey] = None
+    placeholder_state: Optional[TransformationState] = None
+
+    def cleanup_placeholder() -> None:
+        nonlocal placeholder_key, placeholder_state
+        if placeholder_key is None or placeholder_state is None:
+            return
+        current = active_transformations.get(placeholder_key)
+        if current is placeholder_state and not placeholder_state.character_name:
+            active_transformations.pop(placeholder_key, None)
+        placeholder_key = None
+        placeholder_state = None
 
     if not tokens:
         slash_member = getattr(ctx, "_slash_target_member", None)
@@ -1835,23 +1848,26 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         if forced_override:
             forced_token = forced_override
 
-    if tokens:
-        first = tokens.pop(0)
-        mention_id = _extract_user_id_from_token(first)
-        if mention_id is not None:
-            _, member_lookup = await fetch_member(guild.id, mention_id)
-            if member_lookup is None:
-                await ctx.reply("I couldn't find that member.", mention_author=False)
-                return None
-            target_member = member_lookup
-            target_is_admin = is_admin(member_lookup)
-            state = find_active_transformation(member_lookup.id, guild.id)
-            if state is None:
-                placeholder = _build_placeholder_state(member_lookup, guild)
-                active_transformations[state_key(guild.id, member_lookup.id)] = placeholder
-                state = placeholder
-        else:
-            state = _find_state_by_folder(guild, first)
+    try:
+        if tokens:
+            first = tokens.pop(0)
+            mention_id = _extract_user_id_from_token(first)
+            if mention_id is not None:
+                _, member_lookup = await fetch_member(guild.id, mention_id)
+                if member_lookup is None:
+                    await ctx.reply("I couldn't find that member.", mention_author=False)
+                    return None
+                target_member = member_lookup
+                target_is_admin = is_admin(member_lookup)
+                state = find_active_transformation(member_lookup.id, guild.id)
+                if state is None:
+                    placeholder = _build_placeholder_state(member_lookup, guild)
+                    placeholder_key = state_key(guild.id, member_lookup.id)
+                    placeholder_state = placeholder
+                    active_transformations[placeholder_key] = placeholder
+                    state = placeholder
+            else:
+                state = _find_state_by_folder(guild, first)
             if state is None:
                 potential_member = discord.utils.find(
                     lambda m: m.name.lower() == first.lower()
@@ -1862,7 +1878,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     target_member = potential_member
                     target_is_admin = is_admin(potential_member)
                     placeholder = _build_placeholder_state(potential_member, guild)
-                    active_transformations[state_key(guild.id, potential_member.id)] = placeholder
+                    placeholder_key = state_key(guild.id, potential_member.id)
+                    placeholder_state = placeholder
+                    active_transformations[placeholder_key] = placeholder
                     state = placeholder
                 else:
                     await ctx.reply(
@@ -1882,288 +1900,302 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 mention_author=False,
             )
             return None
-    else:
-        if not author_is_admin:
-            await ctx.reply(
-                "Specify someone to reroll, e.g. `/reroll target_folder:<folder>` or mention the user.",
-                mention_author=False,
-            )
-            return None
-        target_member = author
-        target_is_admin = is_admin(author)
-        state = author_state
-        if state is None:
-            await ctx.reply("You are not currently transformed.", mention_author=False)
-            return None
-
-    if forced_token is None:
-        forced_override = getattr(ctx, "_slash_force_folder", None)
-        if forced_override:
-            forced_token = forced_override
-
-    if state is None and roleplay_dm_override and target_member is not None:
-        placeholder = _build_placeholder_state(target_member, guild)
-        key_placeholder = state_key(guild.id, target_member.id)
-        active_transformations[key_placeholder] = placeholder
-        state = placeholder
-
-    if state is None:
-        await ctx.reply(
-            "Unable to locate a transformation to reroll. Make sure the target is currently transformed.",
-            mention_author=False,
-        )
-        return None
-    if target_member is None:
-        _, target_member = await fetch_member(state.guild_id, state.user_id)
-        if target_member is None:
-            await ctx.reply(
-                "Unable to locate the member transformed into this character.",
-                mention_author=False,
-            )
-            return None
-        target_is_admin = is_admin(target_member)
-
-    if not author_is_admin and target_member.id == author.id and not author_has_special_reroll:
-        await ctx.reply(
-            "You can't use your own reroll. Ask another player or admin.",
-            mention_author=False,
-        )
-        return None
-
-    if forced_token:
-        forced_character = _find_character_by_folder(forced_token)
-        forced_inanimate = None
-        if forced_character is None:
-            forced_inanimate = next(
-                (entry for entry in INANIMATE_FORMS if str(entry.get("name", "")).strip().lower() == forced_token.lower()),
-                None,
-            )
-        if forced_character is None and forced_inanimate is None:
-            await ctx.reply(
-                f"Unknown folder `{forced_token}`. Use a valid character folder.",
-                mention_author=False,
-            )
-            return None
-        forced_special_token = None
-        if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
-            forced_special_token = forced_character.folder or forced_character.name
-        elif forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
-            forced_special_token = str(forced_inanimate.get("name", ""))
-        if (
-            forced_character is not None
-            and _is_admin_only_random_name(forced_character.folder or forced_character.name)
-            and not author_is_admin
-            and not target_is_admin
-        ):
-            await ctx.reply(
-                "You can only force Syn or Circe onto admins unless you're an admin yourself.",
-                mention_author=False,
-            )
-            return None
-        if forced_special_token and author_has_special_reroll and not author_is_admin:
-            await ctx.reply(
-                "Ball/Narrator TFs can't force others into Ball or Narrator. Ask an admin or owner.",
-                mention_author=False,
-            )
-            return None
-
-    key = state_key(guild.id, target_member.id)
-    current_state = active_transformations.get(key)
-    if current_state is None or current_state != state:
-        await ctx.reply(
-            "Unable to locate the transformation for this member.",
-            mention_author=False,
-        )
-        return None
-
-    used_names = {
-        current_state.character_name
-        for current_key, current_state in active_transformations.items()
-        if current_key != key
-    }
-
-    if not author_is_admin and not author_has_special_reroll:
-        last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
-        if last_reroll_at is not None:
-            cooldown_end = last_reroll_at + timedelta(hours=24)
-            if cooldown_end > now:
-                remaining = cooldown_end - now
-                remaining_seconds = max(int(remaining.total_seconds()), 0)
-                hours, remainder = divmod(remaining_seconds, 3600)
-                minutes = remainder // 60
-                if hours and minutes:
-                    when_text = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
-                elif hours:
-                    when_text = f"{hours} hour{'s' if hours != 1 else ''}"
-                elif minutes:
-                    when_text = f"{minutes} minute{'s' if minutes != 1 else ''}"
-                else:
-                    when_text = "less than a minute"
+        else:
+            if not author_is_admin:
                 await ctx.reply(
-                    f"You've already used your reroll. You can reroll again in {when_text}.",
+                    "Specify someone to reroll, e.g. `/reroll target_folder:<folder>` or mention the user.",
+                    mention_author=False,
+                )
+                return None
+            target_member = author
+            target_is_admin = is_admin(author)
+            state = author_state
+            if state is None:
+                await ctx.reply("You are not currently transformed.", mention_author=False)
+                return None
+
+        if forced_token is None:
+            forced_override = getattr(ctx, "_slash_force_folder", None)
+            if forced_override:
+                forced_token = forced_override
+        if forced_token and not can_force_reroll:
+            forced_token = None
+            forced_token_blocked = True
+
+        if state is None and roleplay_dm_override and target_member is not None:
+            placeholder = _build_placeholder_state(target_member, guild)
+            placeholder_key = state_key(guild.id, target_member.id)
+            placeholder_state = placeholder
+            active_transformations[placeholder_key] = placeholder
+            state = placeholder
+
+        if state is None:
+            await ctx.reply(
+                "Unable to locate a transformation to reroll. Make sure the target is currently transformed.",
+                mention_author=False,
+            )
+            return None
+        if target_member is None:
+            _, target_member = await fetch_member(state.guild_id, state.user_id)
+            if target_member is None:
+                await ctx.reply(
+                    "Unable to locate the member transformed into this character.",
+                    mention_author=False,
+                )
+                return None
+            target_is_admin = is_admin(target_member)
+
+        if not author_is_admin and target_member.id == author.id and not author_has_special_reroll:
+            await ctx.reply(
+                "You can't use your own reroll. Ask another player or admin.",
+                mention_author=False,
+            )
+            return None
+
+        if forced_token_blocked:
+            await ctx.reply(
+                "Only admins, owners, or Ball/Narrator forms can force a reroll. Picking a random form instead.",
+                mention_author=False,
+            )
+
+        if forced_token:
+            forced_character = _find_character_by_folder(forced_token)
+            forced_inanimate = None
+            if forced_character is None:
+                forced_inanimate = next(
+                    (entry for entry in INANIMATE_FORMS if str(entry.get("name", "")).strip().lower() == forced_token.lower()),
+                    None,
+                )
+            if forced_character is None and forced_inanimate is None:
+                await ctx.reply(
+                    f"Unknown folder `{forced_token}`. Use a valid character folder.",
+                    mention_author=False,
+                )
+                return None
+            forced_special_token = None
+            if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
+                forced_special_token = forced_character.folder or forced_character.name
+            elif forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
+                forced_special_token = str(forced_inanimate.get("name", ""))
+            if (
+                forced_character is not None
+                and _is_admin_only_random_name(forced_character.folder or forced_character.name)
+                and not author_is_admin
+                and not target_is_admin
+            ):
+                await ctx.reply(
+                    "You can only force Syn or Circe onto admins unless you're an admin yourself.",
+                    mention_author=False,
+                )
+                return None
+            if forced_special_token and author_has_special_reroll and not author_is_admin:
+                await ctx.reply(
+                    "Ball/Narrator TFs can't force others into Ball or Narrator. Ask an admin or owner.",
                     mention_author=False,
                 )
                 return None
 
-    forced_mode = forced_character is not None or forced_inanimate is not None
-
-    new_name: str
-    new_folder: Optional[str]
-    new_avatar_path: str
-    new_message: str
-    new_is_inanimate: bool
-    new_responses: Tuple[str, ...]
-
-    if forced_inanimate is not None:
-        new_name = str(forced_inanimate.get("name") or "Mystery Relic")
-        new_folder = None
-        new_avatar_path = str(forced_inanimate.get("avatar_path") or "")
-        new_message = str(forced_inanimate.get("message") or "You feel unsettlingly still.")
-        responses_raw = forced_inanimate.get("responses") or []
-        if isinstance(responses_raw, (list, tuple)):
-            new_responses = tuple(str(item).strip() for item in responses_raw if str(item).strip())
-        else:
-            new_responses = tuple()
-        if not new_responses:
-            new_responses = (new_message,)
-        new_is_inanimate = True
-    elif forced_character is not None:
-        new_name = forced_character.name
-        new_folder = forced_character.folder
-        new_avatar_path = forced_character.avatar_path
-        new_message = forced_character.message
-        new_responses = tuple()
-        new_is_inanimate = False
-    else:
-        available_characters = [
-            character
-            for character in CHARACTER_POOL
-            if character.name not in used_names and character.name != state.character_name
-        ]
-        if not target_is_admin:
-            available_characters = [
-                character
-                for character in available_characters
-                if not _is_admin_only_random_name(character.name)
-            ]
-        if not available_characters:
+        key = state_key(guild.id, target_member.id)
+        current_state = active_transformations.get(key)
+        if current_state is None or current_state != state:
             await ctx.reply(
-                "No alternative characters are available to reroll right now.",
+                "Unable to locate the transformation for this member.",
                 mention_author=False,
             )
             return None
-        chosen = random.choice(available_characters)
-        new_name = chosen.name
-        new_folder = chosen.folder
-        new_avatar_path = chosen.avatar_path
-        new_message = chosen.message
-        new_responses = tuple()
-        new_is_inanimate = False
 
-    if new_name == state.character_name:
-        await ctx.reply(
-            f"They are already transformed into {new_name}.",
-            mention_author=False,
-        )
-        return None
-    if new_name in used_names:
-        await ctx.reply(
-            f"{new_name} is already in use by another transformation.",
-            mention_author=False,
-        )
-        return None
+        used_names = {
+            current_state.character_name
+            for current_key, current_state in active_transformations.items()
+            if current_key != key
+        }
 
-    previous_character = state.character_name
-    state.character_name = new_name
-    state.character_folder = new_folder
-    state.character_avatar_path = new_avatar_path
-    state.character_message = new_message
-    state.avatar_applied = False
-    state.is_inanimate = new_is_inanimate
-    state.inanimate_responses = new_responses
+        if not author_is_admin and not author_has_special_reroll:
+            last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
+            if last_reroll_at is not None:
+                cooldown_end = last_reroll_at + timedelta(hours=24)
+                if cooldown_end > now:
+                    remaining = cooldown_end - now
+                    remaining_seconds = max(int(remaining.total_seconds()), 0)
+                    hours, remainder = divmod(remaining_seconds, 3600)
+                    minutes = remainder // 60
+                    if hours and minutes:
+                        when_text = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+                    elif hours:
+                        when_text = f"{hours} hour{'s' if hours != 1 else ''}"
+                    elif minutes:
+                        when_text = f"{minutes} minute{'s' if minutes != 1 else ''}"
+                    else:
+                        when_text = "less than a minute"
+                    await ctx.reply(
+                        f"You've already used your reroll. You can reroll again in {when_text}.",
+                        mention_author=False,
+                    )
+                    return None
 
-    if not author_is_admin:
-        guaranteed_duration = timedelta(hours=10)
-        state.started_at = now
-        state.expires_at = now + guaranteed_duration
-        state.duration_label = "10 hours"
-        existing_task = revert_tasks.get(key)
-        if existing_task:
-            existing_task.cancel()
-        revert_tasks[key] = asyncio.create_task(
-            _schedule_revert(state, guaranteed_duration.total_seconds())
-        )
+        forced_mode = forced_character is not None or forced_inanimate is not None
 
-    persist_states()
+        new_name: str
+        new_folder: Optional[str]
+        new_avatar_path: str
+        new_message: str
+        new_is_inanimate: bool
+        new_responses: Tuple[str, ...]
 
-    if not new_is_inanimate:
-        increment_tf_stats(guild.id, target_member.id, new_name)
-    if not author_is_admin and not author_has_special_reroll:
-        record_reroll_timestamp(guild.id, author.id, now)
-
-    history_details = (
-        f"Triggered by: **{author.display_name}**\n"
-        f"Member: **{target_member.display_name}**\n"
-        f"Previous Character: **{previous_character}**\n"
-        f"New Character: **{new_name}**"
-    )
-    if forced_mode:
-        history_details += "\nReason: Forced reroll override."
-    await send_history_message(
-        "TF Rerolled",
-        history_details,
-    )
-
-    original_name = member_profile_name(target_member)
-    if forced_mode:
-        custom_template = (
-            "barely has time to react before Syn swoops in with a grin and swaps them straight into {character}. Syn just had to spice things up."
-        )
-        response_text = _format_character_message(
-            custom_template,
-            original_name,
-            target_member.mention,
-            state.duration_label,
-            new_name,
-        )
-    else:
-        base_message = _format_character_message(
-            new_message,
-            original_name,
-            target_member.mention,
-            state.duration_label,
-            new_name,
-        )
-        if author_is_admin:
-            response_text = base_message
+        if forced_inanimate is not None:
+            new_name = str(forced_inanimate.get("name") or "Mystery Relic")
+            new_folder = None
+            new_avatar_path = str(forced_inanimate.get("avatar_path") or "")
+            new_message = str(forced_inanimate.get("message") or "You feel unsettlingly still.")
+            responses_raw = forced_inanimate.get("responses") or []
+            if isinstance(responses_raw, (list, tuple)):
+                new_responses = tuple(str(item).strip() for item in responses_raw if str(item).strip())
+            else:
+                new_responses = tuple()
+            if not new_responses:
+                new_responses = (new_message,)
+            new_is_inanimate = True
+        elif forced_character is not None:
+            new_name = forced_character.name
+            new_folder = forced_character.folder
+            new_avatar_path = forced_character.avatar_path
+            new_message = forced_character.message
+            new_responses = tuple()
+            new_is_inanimate = False
         else:
-            response_text = (
-                f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
+            available_characters = [
+                character
+                for character in CHARACTER_POOL
+                if character.name not in used_names and character.name != state.character_name
+            ]
+            if not target_is_admin:
+                available_characters = [
+                    character
+                    for character in available_characters
+                    if not _is_admin_only_random_name(character.name)
+                ]
+            if not available_characters:
+                await ctx.reply(
+                    "No alternative characters are available to reroll right now.",
+                    mention_author=False,
+                )
+                return None
+            chosen = random.choice(available_characters)
+            new_name = chosen.name
+            new_folder = chosen.folder
+            new_avatar_path = chosen.avatar_path
+            new_message = chosen.message
+            new_responses = tuple()
+            new_is_inanimate = False
+
+        if new_name == state.character_name:
+            await ctx.reply(
+                f"They are already transformed into {new_name}.",
+                mention_author=False,
             )
-    special_hint = _format_special_reroll_hint(new_name, new_folder)
-    if special_hint:
-        response_text = f"{response_text}\n{special_hint}"
-    emoji_prefix = _get_magic_emoji(guild)
-    try:
-        await ctx.channel.send(
-            f"{emoji_prefix} {response_text}",
-            allowed_mentions=discord.AllowedMentions(users=[target_member]),
+            return None
+        if new_name in used_names:
+            await ctx.reply(
+                f"{new_name} is already in use by another transformation.",
+                mention_author=False,
+            )
+            return None
+
+        previous_character = state.character_name
+        state.character_name = new_name
+        state.character_folder = new_folder
+        state.character_avatar_path = new_avatar_path
+        state.character_message = new_message
+        state.avatar_applied = False
+        state.is_inanimate = new_is_inanimate
+        state.inanimate_responses = new_responses
+        placeholder_key = None
+        placeholder_state = None
+
+        if not author_is_admin:
+            guaranteed_duration = timedelta(hours=10)
+            state.started_at = now
+            state.expires_at = now + guaranteed_duration
+            state.duration_label = "10 hours"
+            existing_task = revert_tasks.get(key)
+            if existing_task:
+                existing_task.cancel()
+            revert_tasks[key] = asyncio.create_task(
+                _schedule_revert(state, guaranteed_duration.total_seconds())
+            )
+
+        persist_states()
+
+        if not new_is_inanimate:
+            increment_tf_stats(guild.id, target_member.id, new_name)
+        if not author_is_admin and not author_has_special_reroll:
+            record_reroll_timestamp(guild.id, author.id, now)
+
+        history_details = (
+            f"Triggered by: **{author.display_name}**\n"
+            f"Member: **{target_member.display_name}**\n"
+            f"Previous Character: **{previous_character}**\n"
+            f"New Character: **{new_name}**"
         )
-    except discord.HTTPException as exc:
-        logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
+        if forced_mode:
+            history_details += "\nReason: Forced reroll override."
+        await send_history_message(
+            "TF Rerolled",
+            history_details,
+        )
 
-    try:
-        await ctx.message.delete()
-    except discord.HTTPException:
-        pass
+        original_name = member_profile_name(target_member)
+        if forced_mode:
+            custom_template = (
+                "barely has time to react before Syn swoops in with a grin and swaps them straight into {character}. Syn just had to spice things up."
+            )
+            response_text = _format_character_message(
+                custom_template,
+                original_name,
+                target_member.mention,
+                state.duration_label,
+                new_name,
+            )
+        else:
+            base_message = _format_character_message(
+                new_message,
+                original_name,
+                target_member.mention,
+                state.duration_label,
+                new_name,
+            )
+            if author_is_admin:
+                response_text = base_message
+            else:
+                response_text = (
+                    f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
+                )
+        special_hint = _format_special_reroll_hint(new_name, new_folder)
+        if special_hint:
+            response_text = f"{response_text}\n{special_hint}"
+        emoji_prefix = _get_magic_emoji(guild)
+        try:
+            await ctx.channel.send(
+                f"{emoji_prefix} {response_text}",
+                allowed_mentions=discord.AllowedMentions(users=[target_member]),
+            )
+        except discord.HTTPException as exc:
+            logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
 
-    summary_message = f"{target_member.display_name} has been rerolled into **{new_name}**."
-    if forced_mode:
-        summary_message += " (Syn insisted on this one.)"
-    await ctx.send(
-        summary_message,
-        delete_after=10,
-    )
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+
+        summary_message = f"{target_member.display_name} has been rerolled into **{new_name}**."
+        if forced_mode:
+            summary_message += " (Syn insisted on this one.)"
+        await ctx.send(
+            summary_message,
+            delete_after=10,
+        )
+    finally:
+        cleanup_placeholder()
 
 
 @bot.tree.command(name="reroll", description="Reroll an active transformation.")

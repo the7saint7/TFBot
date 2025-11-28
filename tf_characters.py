@@ -672,7 +672,7 @@ TF_CHARACTERS = [
         "message": " finds one of Syn's trap and transforms."
     },    
     {
-        "name": "meika (VR Experiment)",
+        "name": "Meika (VR Experiment)",
         "folder": "meika",
         "message": " finds one of Syn's trap and transforms."
     },    
