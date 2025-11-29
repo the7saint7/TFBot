@@ -1918,12 +1918,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 return None
 
         if forced_token is None:
-        forced_override = getattr(ctx, "_slash_force_folder", None)
-        if forced_override:
-            forced_token = forced_override
-    if forced_token and not can_force_reroll:
-        forced_token = None
-        forced_token_blocked = True
+            forced_override = getattr(ctx, "_slash_force_folder", None)
+            if forced_override:
+                forced_token = forced_override
+        if forced_token and not can_force_reroll:
+            forced_token = None
+            forced_token_blocked = True
 
         if state is None and roleplay_dm_override and target_member is not None:
             placeholder = _build_placeholder_state(target_member, guild)
