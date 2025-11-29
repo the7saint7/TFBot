@@ -1809,8 +1809,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         return None
     now = utc_now()
     author_state = find_active_transformation(author.id, guild.id)
-    author_has_special_reroll = _has_special_reroll_access(author_state)
-    can_force_reroll = author_is_admin or author_has_special_reroll
+    can_force_reroll = author_is_admin
     target_member: Optional[discord.Member] = None
     target_is_admin = False
     state: Optional[TransformationState] = None
@@ -1826,6 +1825,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     state: Optional[TransformationState] = None
     placeholder_key: Optional[TransformKey] = None
     placeholder_state: Optional[TransformationState] = None
+    target_selected = False
 
     def cleanup_placeholder() -> None:
         nonlocal placeholder_key, placeholder_state
@@ -1851,6 +1851,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     try:
         if tokens:
             first = tokens.pop(0)
+            target_selected = True
             mention_id = _extract_user_id_from_token(first)
             if mention_id is not None:
                 _, member_lookup = await fetch_member(guild.id, mention_id)
@@ -1892,6 +1893,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 _, member_lookup = await fetch_member(state.guild_id, state.user_id)
                 target_member = member_lookup
                 target_is_admin = bool(member_lookup and is_admin(member_lookup))
+
         if tokens:
             forced_token = tokens.pop(0)
         if tokens:
@@ -1900,10 +1902,11 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 mention_author=False,
             )
             return None
-        else:
+
+        if not target_selected:
             if not author_is_admin:
                 await ctx.reply(
-                    "Specify someone to reroll, e.g. `/reroll target_folder:<folder>` or mention the user.",
+                    "Specify someone to reroll, e.g. `/reroll who_member:<member>` or mention the user.",
                     mention_author=False,
                 )
                 return None
@@ -1915,12 +1918,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 return None
 
         if forced_token is None:
-            forced_override = getattr(ctx, "_slash_force_folder", None)
-            if forced_override:
-                forced_token = forced_override
-        if forced_token and not can_force_reroll:
-            forced_token = None
-            forced_token_blocked = True
+        forced_override = getattr(ctx, "_slash_force_folder", None)
+        if forced_override:
+            forced_token = forced_override
+    if forced_token and not can_force_reroll:
+        forced_token = None
+        forced_token_blocked = True
 
         if state is None and roleplay_dm_override and target_member is not None:
             placeholder = _build_placeholder_state(target_member, guild)
@@ -1945,7 +1948,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 return None
             target_is_admin = is_admin(target_member)
 
-        if not author_is_admin and target_member.id == author.id and not author_has_special_reroll:
+        if target_member.id == author.id:
             await ctx.reply(
                 "You can't use your own reroll. Ask another player or admin.",
                 mention_author=False,
@@ -1954,7 +1957,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
         if forced_token_blocked:
             await ctx.reply(
-                "Only admins, owners, or Ball/Narrator forms can force a reroll. Picking a random form instead.",
+                "The `to_character` option is disabled for regular rerolls. Choosing a random form instead.",
                 mention_author=False,
             )
 
@@ -1972,11 +1975,6 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     mention_author=False,
                 )
                 return None
-            forced_special_token = None
-            if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
-                forced_special_token = forced_character.folder or forced_character.name
-            elif forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
-                forced_special_token = str(forced_inanimate.get("name", ""))
             if (
                 forced_character is not None
                 and _is_admin_only_random_name(forced_character.folder or forced_character.name)
@@ -1985,12 +1983,6 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             ):
                 await ctx.reply(
                     "You can only force Syn or Circe onto admins unless you're an admin yourself.",
-                    mention_author=False,
-                )
-                return None
-            if forced_special_token and author_has_special_reroll and not author_is_admin:
-                await ctx.reply(
-                    "Ball/Narrator TFs can't force others into Ball or Narrator. Ask an admin or owner.",
                     mention_author=False,
                 )
                 return None
@@ -2010,7 +2002,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             if current_key != key
         }
 
-        if not author_is_admin and not author_has_special_reroll:
+        if not author_is_admin:
             last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
             if last_reroll_at is not None:
                 cooldown_end = last_reroll_at + timedelta(hours=24)
@@ -2128,7 +2120,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
         if not new_is_inanimate:
             increment_tf_stats(guild.id, target_member.id, new_name)
-        if not author_is_admin and not author_has_special_reroll:
+        if not author_is_admin:
             record_reroll_timestamp(guild.id, author.id, now)
 
         history_details = (
