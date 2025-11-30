@@ -32,6 +32,9 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | `TFBOT_VN_NAME_SIZE` | Font size (px) for VN character name | `34` |
 | `TFBOT_VN_TEXT_SIZE` | Font size (px) for VN dialogue text | `26` |
 | `TFBOT_VN_GAME_ROOT` | Path to Student Transfer game root for sprite composition | _(empty)_ |
+| `TFBOT_CHARACTERS_REPO` | Git URL that hosts a fresh `characters` folder; when set the bot clones/pulls it on startup and overrides other VN sprite roots | _(empty)_ |
+| `TFBOT_CHARACTERS_REPO_DIR` | Local directory used for the clone above (relative paths live under the project root) | `characters_repo` |
+| `TFBOT_CHARACTERS_REPO_SUBDIR` | Relative folder inside the cloned repo that points at the actual `characters` directory | `characters` |
 | `TFBOT_VN_OUTFIT` | Default outfit filename when composing sprites | `casual.png` |
 | `TFBOT_VN_FACE` | Default face sprite filename when composing sprites | `0.png` |
 | `TFBOT_VN_AVATAR_MODE` | `game` to build sprites from Student Transfer assets or `user` to keep member avatars | `game` |

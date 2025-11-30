@@ -6,6 +6,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -33,6 +35,93 @@ except ImportError:
     PIL = None
 
 BASE_DIR = Path(__file__).resolve().parent
+
+logging.basicConfig(
+    level=os.getenv("TFBOT_LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("tfbot")
+if PIL is not None:
+    logging.getLogger("PIL").setLevel(logging.ERROR)
+
+
+def _sync_character_repo() -> Optional[Path]:
+    repo_url = os.getenv("TFBOT_CHARACTERS_REPO", "").strip()
+    if not repo_url:
+        return None
+    repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip()
+    repo_dir_setting = repo_dir_setting or "characters_repo"
+    repo_dir = Path(repo_dir_setting)
+    if not repo_dir.is_absolute():
+        repo_dir = (BASE_DIR / repo_dir).resolve()
+    subdir_setting = os.getenv("TFBOT_CHARACTERS_REPO_SUBDIR", "characters").strip()
+    target_subdir = Path(subdir_setting) if subdir_setting else None
+    startup_logger = logging.getLogger("tfbot.startup")
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        startup_logger.warning(
+            "TFBOT_CHARACTERS_REPO is set but git is not available on PATH; skipping sprite sync."
+        )
+        return None
+    try:
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        startup_logger.warning("Unable to prepare directory %s for character repo: %s", repo_dir, exc)
+        return None
+
+    repo_git_dir = repo_dir / ".git"
+    if repo_dir.exists() and not repo_git_dir.exists():
+        startup_logger.warning(
+            "TFBOT_CHARACTERS_REPO destination %s exists but is not a git repository; skipping sync.",
+            repo_dir,
+        )
+    else:
+        if repo_git_dir.exists():
+            cmd = [git_executable, "-C", str(repo_dir), "pull", "--ff-only"]
+            action = "pull"
+        else:
+            cmd = [git_executable, "clone", repo_url, str(repo_dir)]
+            action = "clone"
+        startup_logger.info("Characters repo %s starting via `%s`.", action, " ".join(cmd))
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            output = result.stdout.strip() or result.stderr.strip()
+            if output:
+                startup_logger.info("Characters repo %sed via `%s`: %s", action, " ".join(cmd), output)
+            else:
+                startup_logger.info("Characters repo %sed via `%s`.", action, " ".join(cmd))
+        except subprocess.CalledProcessError as exc:
+            output = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            startup_logger.warning(
+                "Failed to %s characters repo %s (cmd=%s): %s",
+                action,
+                repo_url,
+                " ".join(cmd),
+                output,
+            )
+            return None
+
+    characters_dir = repo_dir
+    if target_subdir:
+        characters_dir = repo_dir / target_subdir
+    if not characters_dir.exists():
+        startup_logger.warning(
+            "Characters repo synced, but %s does not exist inside %s.",
+            target_subdir.as_posix() if target_subdir else ".",
+            repo_dir,
+        )
+        return None
+    return characters_dir
+
+
+_characters_repo_path = _sync_character_repo()
+if _characters_repo_path:
+    os.environ["TFBOT_VN_ASSET_ROOT"] = str(_characters_repo_path)
 
 from tf_characters import TF_CHARACTERS as _DEFAULT_CHARACTER_DATA
 from ai_rewriter import AI_REWRITE_ENABLED, rewrite_message_for_character
@@ -108,15 +197,6 @@ from tfbot.utils import (
 
 if TYPE_CHECKING:
     from tfbot.gacha import GachaProfile
-
-
-logging.basicConfig(
-    level=os.getenv("TFBOT_LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("tfbot")
-if PIL is not None:
-    logging.getLogger("PIL").setLevel(logging.ERROR)
 
 
 BOT_MODE = os.getenv("TFBOT_MODE", "classic").lower()
@@ -574,7 +654,8 @@ def _format_special_reroll_hint(character_label: str, folder_token: Optional[str
         return None
     return (
         "```diff\n"
-        f"- {character_label} perk unlocked! Use `/reroll character` for a random swap or `/reroll character character` to force a form.\n"
+        f"- {character_label} perk unlocked! Use `/reroll who_member:<target>` to reroll a non-admin or add `to_character:<folder>` to pick the form.\n"
+        "- You can't target admins or turn someone into Ball or Narrator.\n"
         "```"
     )
 
@@ -1809,7 +1890,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         return None
     now = utc_now()
     author_state = find_active_transformation(author.id, guild.id)
-    can_force_reroll = author_is_admin
+    author_has_special_power = _has_special_reroll_access(author_state)
+    author_special_label = author_state.character_name if author_state else ""
+    can_force_reroll = author_is_admin or author_has_special_power
     target_member: Optional[discord.Member] = None
     target_is_admin = False
     state: Optional[TransformationState] = None
@@ -1948,7 +2031,18 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 return None
             target_is_admin = is_admin(target_member)
 
-        if target_member.id == author.id:
+        if (
+            author_has_special_power
+            and not author_is_admin
+            and target_is_admin
+        ):
+            await ctx.reply(
+                "Ball and Narrator perks can't be used on admins.",
+                mention_author=False,
+            )
+            return None
+
+        if target_member.id == author.id and not (author_is_admin or author_has_special_power):
             await ctx.reply(
                 "You can't use your own reroll. Ask another player or admin.",
                 mention_author=False,
@@ -1986,6 +2080,17 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     mention_author=False,
                 )
                 return None
+            if (
+                forced_character is not None
+                and author_has_special_power
+                and not author_is_admin
+                and _is_special_reroll_name(forced_character.folder or forced_character.name)
+            ):
+                await ctx.reply(
+                    "Ball and Narrator perks can't force someone into Ball or Narrator.",
+                    mention_author=False,
+                )
+                return None
 
         key = state_key(guild.id, target_member.id)
         current_state = active_transformations.get(key)
@@ -2002,7 +2107,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             if current_key != key
         }
 
-        if not author_is_admin:
+        if not (author_is_admin or author_has_special_power):
             last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
             if last_reroll_at is not None:
                 cooldown_end = last_reroll_at + timedelta(hours=24)
@@ -2066,6 +2171,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     for character in available_characters
                     if not _is_admin_only_random_name(character.name)
                 ]
+            if author_has_special_power and not author_is_admin:
+                available_characters = [
+                    character
+                    for character in available_characters
+                    if not _is_special_reroll_name(character.folder or character.name)
+                ]
             if not available_characters:
                 await ctx.reply(
                     "No alternative characters are available to reroll right now.",
@@ -2104,7 +2215,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         placeholder_key = None
         placeholder_state = None
 
-        if not author_is_admin:
+        if not (author_is_admin or author_has_special_power):
             guaranteed_duration = timedelta(hours=10)
             state.started_at = now
             state.expires_at = now + guaranteed_duration
@@ -2120,7 +2231,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
         if not new_is_inanimate:
             increment_tf_stats(guild.id, target_member.id, new_name)
-        if not author_is_admin:
+        if not (author_is_admin or author_has_special_power):
             record_reroll_timestamp(guild.id, author.id, now)
 
         history_details = (
@@ -2158,6 +2269,11 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
             if author_is_admin:
                 response_text = base_message
+            elif author_has_special_power:
+                perk_name = author_special_label or "their perk"
+                response_text = (
+                    f"{author.display_name} channels {perk_name} on {target_member.mention}! {base_message}"
+                )
             else:
                 response_text = (
                     f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
