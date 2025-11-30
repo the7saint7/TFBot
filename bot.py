@@ -2215,7 +2215,8 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         placeholder_key = None
         placeholder_state = None
 
-        if not (author_is_admin or author_has_special_power):
+        should_reset_duration = author_is_admin or not author_has_special_power
+        if should_reset_duration:
             guaranteed_duration = timedelta(hours=10)
             state.started_at = now
             state.expires_at = now + guaranteed_duration
