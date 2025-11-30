@@ -245,6 +245,18 @@ def _normalize_folder_token(value: Optional[str]) -> str:
         return ""
     normalized = value.strip().replace("\\", "/").strip("/").lower()
     return normalized
+
+
+def _normalize_special_token(value: Optional[str]) -> str:
+    normalized = _normalize_folder_token(value)
+    if "/" in normalized:
+        normalized = normalized.split("/")[-1]
+    return normalized
+
+
+SPECIAL_REROLL_TOKENS = {
+    token for token in (_normalize_special_token(item) for item in SPECIAL_REROLL_FORMS) if token
+}
 CHARACTER_DIRECTORY_CACHE_TTL = 120.0  # seconds
 
 def _parse_featured_weight_map(raw: str) -> Dict[str, float]:
@@ -285,8 +297,10 @@ INANIMATE_TF_CHANCE = float(os.getenv("TFBOT_INANIMATE_CHANCE", "0"))
 
 
 def _is_special_reroll_name(name: str) -> bool:
-    normalized = _normalize_folder_token(name)
-    return bool(normalized and normalized in {token.lower() for token in SPECIAL_REROLL_FORMS})
+    normalized = _normalize_special_token(name)
+    if not normalized:
+        return False
+    return normalized in SPECIAL_REROLL_TOKENS
 
 
 def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
@@ -2085,6 +2099,17 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 and author_has_special_power
                 and not author_is_admin
                 and _is_special_reroll_name(forced_character.folder or forced_character.name)
+            ):
+                await ctx.reply(
+                    "Ball and Narrator perks can't force someone into Ball or Narrator.",
+                    mention_author=False,
+                )
+                return None
+            if (
+                forced_inanimate is not None
+                and author_has_special_power
+                and not author_is_admin
+                and _is_special_reroll_name(str(forced_inanimate.get("name", "")))
             ):
                 await ctx.reply(
                     "Ball and Narrator perks can't force someone into Ball or Narrator.",
