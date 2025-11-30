@@ -2831,13 +2831,32 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
     )
     target_state: Optional[TransformationState] = None
     if can_target_others and ctx.guild and " " in outfit_name:
-        base_value, candidate = outfit_name.rsplit(" ", 1)
-        candidate = candidate.strip()
-        if candidate:
+        tokens = [token for token in outfit_name.split() if token.strip()]
+        def _assign_target(index: int) -> bool:
+            nonlocal outfit_name, target_state
+            if index < 0 or index >= len(tokens):
+                return False
+            candidate = tokens[index]
             matched_state = _find_state_by_folder(ctx.guild, candidate)
-            if matched_state:
-                target_state = matched_state
-                outfit_name = base_value.strip()
+            if not matched_state:
+                return False
+            target_state = matched_state
+            remaining = tokens[:index] + tokens[index + 1 :]
+            outfit_name = " ".join(remaining).strip()
+            return True
+        if len(tokens) >= 2:
+            mention_index = next(
+                (
+                    idx
+                    for idx, token in enumerate(tokens)
+                    if _extract_user_id_from_token(token) is not None
+                ),
+                None,
+            )
+            if mention_index is not None and _assign_target(mention_index):
+                pass
+            elif _assign_target(len(tokens) - 1):
+                pass
     if target_state and target_state.is_inanimate:
         if ctx.guild:
             await ctx.reply(f"{target_state.character_name} is inanimate and can't change outfits.", mention_author=False)
@@ -2980,13 +2999,32 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
     )
     target_state: Optional[TransformationState] = None
     if accessory_name and can_target_others and ctx.guild and " " in accessory_name:
-        base_value, candidate = accessory_name.rsplit(" ", 1)
-        candidate = candidate.strip()
-        if candidate:
+        tokens = [token for token in accessory_name.split() if token.strip()]
+        def _assign_target(index: int) -> bool:
+            nonlocal accessory_name, target_state
+            if index < 0 or index >= len(tokens):
+                return False
+            candidate = tokens[index]
             matched_state = _find_state_by_folder(ctx.guild, candidate)
-            if matched_state:
-                target_state = matched_state
-                accessory_name = base_value.strip()
+            if not matched_state:
+                return False
+            target_state = matched_state
+            remaining = tokens[:index] + tokens[index + 1 :]
+            accessory_name = " ".join(remaining).strip()
+            return True
+        if len(tokens) >= 2:
+            mention_index = next(
+                (
+                    idx
+                    for idx, token in enumerate(tokens)
+                    if _extract_user_id_from_token(token) is not None
+                ),
+                None,
+            )
+            if mention_index is not None and _assign_target(mention_index):
+                pass
+            elif _assign_target(len(tokens) - 1):
+                pass
     if target_state and target_state.is_inanimate:
         message = f"{target_state.character_name} is inanimate and can't change accessories."
         if ctx.guild:
