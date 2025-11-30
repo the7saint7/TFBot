@@ -2215,18 +2215,16 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         placeholder_key = None
         placeholder_state = None
 
-        should_reset_duration = author_is_admin or not author_has_special_power
-        if should_reset_duration:
-            guaranteed_duration = timedelta(hours=10)
-            state.started_at = now
-            state.expires_at = now + guaranteed_duration
-            state.duration_label = "10 hours"
-            existing_task = revert_tasks.get(key)
-            if existing_task:
-                existing_task.cancel()
-            revert_tasks[key] = asyncio.create_task(
-                _schedule_revert(state, guaranteed_duration.total_seconds())
-            )
+        guaranteed_duration = timedelta(hours=10)
+        state.started_at = now
+        state.expires_at = now + guaranteed_duration
+        state.duration_label = "10 hours"
+        existing_task = revert_tasks.get(key)
+        if existing_task:
+            existing_task.cancel()
+        revert_tasks[key] = asyncio.create_task(
+            _schedule_revert(state, guaranteed_duration.total_seconds())
+        )
 
         persist_states()
 
