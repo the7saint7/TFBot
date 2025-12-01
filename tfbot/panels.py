@@ -2249,7 +2249,8 @@ def render_vn_panel(
 
         canvas = Image.new("RGBA", (avatar_width, avatar_height), (0, 0, 0, 0))
         offset_x = max(0, (avatar_width - cropped.width) // 2)
-        offset_y = max(0, (avatar_height - cropped.height) // 2)
+        # align sprite bottom with panel bottom; keep centered horizontally
+        offset_y = max(0, avatar_height - cropped.height)
         canvas.paste(cropped, (offset_x, offset_y), cropped)
 
         pos_x = avatar_box[0]
