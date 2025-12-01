@@ -354,11 +354,15 @@ def _list_character_directory_names(refresh: bool = False) -> Sequence[str]:
     names: list[str] = []
     if root and root.exists():
         try:
-            names = [
-                child.name
-                for child in sorted(root.iterdir(), key=lambda p: p.name.lower())
-                if child.is_dir()
-            ]
+            filtered: list[str] = []
+            for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+                if not child.is_dir():
+                    continue
+                normalized = _normalize_folder_token(child.name)
+                if normalized not in ALLOWED_CHARACTER_FOLDERS:
+                    continue
+                filtered.append(child.name)
+            names = filtered
         except OSError as exc:
             logger.warning("Failed to read character directories from %s: %s", root, exc)
             names = []
@@ -953,6 +957,7 @@ for character in CHARACTER_POOL:
     folder_token = _normalize_folder_token(character.folder or character.name)
     if folder_token and folder_token not in CHARACTER_BY_FOLDER:
         CHARACTER_BY_FOLDER[folder_token] = character
+ALLOWED_CHARACTER_FOLDERS: set[str] = set(CHARACTER_BY_FOLDER.keys())
 _CHARACTER_FOLDER_OVERRIDES = {
     character.name.strip().lower(): character.folder.strip()
     for character in CHARACTER_POOL
