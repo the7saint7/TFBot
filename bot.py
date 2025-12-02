@@ -45,6 +45,44 @@ if PIL is not None:
     logging.getLogger("PIL").setLevel(logging.ERROR)
 
 
+def _resolve_vn_cache_dir() -> Optional[Path]:
+    cache_setting = os.getenv("TFBOT_VN_CACHE_DIR", "vn_cache").strip()
+    if not cache_setting:
+        return None
+    cache_path = Path(cache_setting)
+    if not cache_path.is_absolute():
+        return (BASE_DIR / cache_path).resolve()
+    return cache_path.resolve()
+
+
+def _clear_vn_cache_directory(startup_logger: logging.Logger) -> None:
+    cache_dir = _resolve_vn_cache_dir()
+    if not cache_dir or not cache_dir.exists():
+        return
+    try:
+        shutil.rmtree(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        startup_logger.info("VN cache cleared at %s.", cache_dir)
+    except OSError as exc:
+        startup_logger.warning("Unable to clear VN cache at %s: %s", cache_dir, exc)
+
+
+def _read_git_head_sha(
+    git_executable: str, repo_dir: Path, startup_logger: logging.Logger
+) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            [git_executable, "-C", str(repo_dir), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, OSError) as exc:
+        startup_logger.debug("Unable to read git HEAD for %s: %s", repo_dir, exc)
+        return None
+
+
 def _sync_character_repo() -> Optional[Path]:
     repo_url = os.getenv("TFBOT_CHARACTERS_REPO", "").strip()
     if not repo_url:
@@ -76,9 +114,11 @@ def _sync_character_repo() -> Optional[Path]:
             repo_dir,
         )
     else:
+        old_head = None
         if repo_git_dir.exists():
             cmd = [git_executable, "-C", str(repo_dir), "pull", "--ff-only"]
             action = "pull"
+            old_head = _read_git_head_sha(git_executable, repo_dir, startup_logger)
         else:
             cmd = [git_executable, "clone", repo_url, str(repo_dir)]
             action = "clone"
@@ -105,6 +145,15 @@ def _sync_character_repo() -> Optional[Path]:
                 output,
             )
             return None
+        updated_assets = action == "clone"
+        if action == "pull":
+            new_head = _read_git_head_sha(git_executable, repo_dir, startup_logger)
+            if old_head and new_head:
+                updated_assets = old_head != new_head
+            else:
+                updated_assets = bool(new_head and not old_head)
+        if updated_assets:
+            _clear_vn_cache_directory(startup_logger)
 
     characters_dir = repo_dir
     if target_subdir:
