@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
-.env
 .env.*
 !.env.example
 tf_state.json
