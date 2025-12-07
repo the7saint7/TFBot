@@ -283,6 +283,10 @@ def load_outfit_selections() -> Dict[str, Dict[str, object]]:
                 outfit_value: Optional[str] = None
                 accessories_value: Dict[str, str] = {}
                 if isinstance(value, dict):
+                    # Preserve all fields from the dict, including suppress_outfit_accessories
+                    # First, copy all fields to preserve flags and other metadata
+                    entry.update(value)
+                    
                     pose_raw = value.get("pose")
                     outfit_raw = value.get("outfit") or value.get("name")
                     accessories_raw = value.get("accessories")
@@ -295,6 +299,8 @@ def load_outfit_selections() -> Dict[str, Dict[str, object]]:
                     elif outfit_raw is not None:
                         outfit_value = str(outfit_raw).strip()
                     if isinstance(accessories_raw, Mapping):
+                        # Rebuild accessories dict with normalized keys
+                        accessories_value = {}
                         for acc_key, acc_value in accessories_raw.items():
                             normalized_key = str(acc_key).strip().lower()
                             if not normalized_key:
@@ -302,17 +308,33 @@ def load_outfit_selections() -> Dict[str, Dict[str, object]]:
                             normalized_value = str(acc_value).strip().lower()
                             if normalized_value == "on":
                                 accessories_value[normalized_key] = "on"
-                elif isinstance(value, str):
-                    outfit_value = value.strip()
-                elif value is not None:
-                    outfit_value = str(value).strip()
-
-                if outfit_value:
+                        # Update the entry with normalized accessories (or remove if empty)
+                        if accessories_value:
+                            entry["accessories"] = accessories_value
+                        elif "accessories" in entry:
+                            entry.pop("accessories")
+                    
+                    # Normalize pose and outfit values
                     if pose_value:
                         entry["pose"] = pose_value
-                    entry["outfit"] = outfit_value
-                    if accessories_value:
-                        entry["accessories"] = accessories_value
+                    elif "pose" in entry and not entry["pose"]:
+                        entry.pop("pose")
+                    if outfit_value:
+                        entry["outfit"] = outfit_value
+                    elif "outfit" not in entry and "name" in entry:
+                        entry["outfit"] = entry["name"]
+                elif isinstance(value, str):
+                    outfit_value = value.strip()
+                    if outfit_value:
+                        entry["outfit"] = outfit_value
+                elif value is not None:
+                    outfit_value = str(value).strip()
+                    if outfit_value:
+                        entry["outfit"] = outfit_value
+
+                # Only add entry if it has at least an outfit or other meaningful data (like suppress_outfit_accessories)
+                # Preserve entries that have the suppress flag even if they don't have an outfit
+                if entry and (outfit_value or len(entry) > 0):
                     normalized[str(key).lower()] = entry
             return normalized
     except json.JSONDecodeError as exc:
@@ -1248,7 +1270,18 @@ def _compose_game_avatar_uncached(
         variant_dir,
         selection_scope,
     )
-    combined_accessory_layers = list(outfit_asset.accessory_layers)
+    
+    # Check if outfit-level accessories should be suppressed (from clearall command)
+    suppress_outfit_accessories = False
+    for lookup_key in _selection_lookup_keys(character_dir, selection_scope):
+        entry = vn_outfit_selection.get(lookup_key)
+        if isinstance(entry, dict) and entry.get("suppress_outfit_accessories"):
+            suppress_outfit_accessories = True
+            break
+    
+    combined_accessory_layers = []
+    if not suppress_outfit_accessories:
+        combined_accessory_layers = list(outfit_asset.accessory_layers)
     combined_accessory_layers.extend(optional_layers)
 
     cache_file: Optional[Path] = None
@@ -1299,6 +1332,7 @@ def _compose_game_avatar_uncached(
             face_path,
         )
 
+    pose_metadata = _get_pose_metadata(config, variant_dir.name)
     facing = str(pose_metadata.get("facing") or config.get("facing") or "left").lower()
     logger.debug("VN sprite: pose %s facing=%s", variant_dir.name, facing)
     if facing != "right":
@@ -1326,6 +1360,16 @@ def _compose_game_avatar_uncached(
 
 def _clear_compose_game_avatar_cache() -> None:
     _COMPOSE_AVATAR_CACHE.clear()
+    # Also clear disk cache to force regeneration when accessories change
+    if VN_CACHE_DIR and VN_CACHE_DIR.exists():
+        try:
+            import shutil
+            for cache_dir in VN_CACHE_DIR.iterdir():
+                if cache_dir.is_dir():
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+            logger.debug("VN sprite: cleared disk cache directory %s", VN_CACHE_DIR)
+        except Exception as exc:
+            logger.warning("VN sprite: failed to clear disk cache %s: %s", VN_CACHE_DIR, exc)
 
 
 compose_game_avatar.cache_clear = _clear_compose_game_avatar_cache  # type: ignore[attr-defined]
@@ -2227,7 +2271,6 @@ def render_vn_panel(
             state.character_name,
             pose_override=gacha_pose_override,
             outfit_override=gacha_outfit_override,
-            selection_scope=selection_scope,
         )
     if avatar_image is not None and avatar_box:
         cropped = _crop_transparent_vertical(avatar_image)
