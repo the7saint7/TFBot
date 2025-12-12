@@ -247,6 +247,7 @@ from tfbot.utils import (
 
 if TYPE_CHECKING:
     from tfbot.gacha import GachaProfile
+    from tfbot.games import GameBoardManager
 
 
 BOT_MODE = os.getenv("TFBOT_MODE", "classic").lower()
@@ -268,6 +269,11 @@ TF_STATS_FILE = Path(os.getenv("TFBOT_STATS_FILE", "tf_stats.json"))
 TF_REROLL_FILE = Path(os.getenv("TFBOT_REROLL_FILE", "tf_reroll.json"))
 ROLEPLAY_FORUM_POST_ID = int_from_env("TFBOT_RP_FORUM_POST_ID", 0)
 ROLEPLAY_STATE_FILE = Path(os.getenv("TFBOT_RP_STATE_FILE", "rp_forum_state.json"))
+GAME_FORUM_CHANNEL_ID = int_from_env("TFBOT_GAME_FORUM_CHANNEL_ID", 0)
+GAME_DM_CHANNEL_ID = int_from_env("TFBOT_GAME_DM_CHANNEL_ID", 0)
+GAME_CONFIG_FILE = Path(os.getenv("TFBOT_GAME_CONFIG_FILE", "games/game_config.json"))
+GAME_ASSETS_DIR = path_from_env("TFBOT_GAME_ASSETS_DIR") or Path("games/assets")
+GAME_BOARD_ENABLED = GAME_FORUM_CHANNEL_ID > 0
 MESSAGE_STYLE = os.getenv(
     "TFBOT_MESSAGE_STYLE",
     "vn" if GACHA_ENABLED else "classic",
@@ -1057,6 +1063,7 @@ class TFBot(commands.Bot):
 
 bot = TFBot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents)
 ROLEPLAY_COG: Optional[RoleplayCog] = None
+GAME_BOARD_MANAGER: Optional["GameBoardManager"] = None
 _SYNCED_APP_COMMAND_GUILDS: set[int] = set()
 
 
@@ -1584,6 +1591,15 @@ if GACHA_ENABLED:
         bot,
         character_pool=CHARACTER_POOL,
         relay_fn=relay_transformed_message,
+    )
+
+if GAME_BOARD_ENABLED:
+    from tfbot.games import GameBoardManager
+
+    GAME_BOARD_MANAGER = GameBoardManager(
+        bot=bot,
+        config_path=GAME_CONFIG_FILE,
+        assets_dir=GAME_ASSETS_DIR,
     )
 async def send_history_message(title: str, description: str) -> None:
     channel = bot.get_channel(current_history_channel_id())
@@ -2502,6 +2518,46 @@ async def slash_reroll_command(
     await reroll_command(ctx, args="")
     if not ctx.responded:
         await interaction.followup.send("No reroll was performed.", ephemeral=True)
+
+
+@bot.tree.command(name="rerollall", description="Reroll everyone at once (admin only).")
+@app_commands.guild_only()
+async def slash_rerollall_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user) or not interaction.guild:
+        await interaction.followup.send("Only admins can use this command.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    for (guild_id, user_id), state in active_transformations.items():
+        if guild_id == interaction.guild.id:
+            member = interaction.guild.get_member(user_id)
+            if member:
+                ctx = InteractionContextAdapter(interaction, bot=bot)
+                ctx._slash_target_member = member
+                ctx._slash_target_folder = None
+                ctx._slash_force_folder = None
+                await reroll_command(ctx, args="")
+    await interaction.followup.send("Rerolled all members.", ephemeral=True)
+
+
+@bot.tree.command(name="rerollnonadmin", description="Reroll everyone that's not admin (admin only).")
+@app_commands.guild_only()
+async def slash_rerollnonadmin_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user) or not interaction.guild:
+        await interaction.followup.send("Only admins can use this command.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    for (guild_id, user_id), state in active_transformations.items():
+        if guild_id == interaction.guild.id:
+            member = interaction.guild.get_member(user_id)
+            if member and not is_admin(member):
+                ctx = InteractionContextAdapter(interaction, bot=bot)
+                ctx._slash_target_member = member
+                ctx._slash_target_folder = None
+                ctx._slash_force_folder = None
+                await reroll_command(ctx, args="")
+    await interaction.followup.send("Rerolled all non-admin members.", ephemeral=True)
 
 
 @bot.tree.command(name="dm", description="Show or assign the RP DM (use inside the RP forum thread).")
@@ -3656,6 +3712,17 @@ async def on_message(message: discord.Message):
     if command_invoked:
         return None
 
+    # Check for game thread FIRST (before other systems)
+    is_game_thread = (
+        GAME_BOARD_MANAGER is not None
+        and isinstance(message.channel, discord.Thread)
+        and GAME_BOARD_MANAGER.is_game_thread(message.channel)
+    )
+    if is_game_thread:
+        handled = await GAME_BOARD_MANAGER.handle_message(message, command_invoked=command_invoked)
+        if handled:
+            return None
+
     is_gacha_channel = (
         GACHA_MANAGER is not None
         and isinstance(message.channel, discord.TextChannel)
@@ -4497,9 +4564,186 @@ async def prefix_tf_35(ctx: commands.Context):
             pass
 
 
+@bot.command(name="rerollall")
+@commands.guild_only()
+async def prefix_rerollall_command(ctx: commands.Context) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_admin(ctx.author) or not ctx.guild:
+        await ctx.reply("Only admins can use this command.", mention_author=False)
+        return
+    await ensure_state_restored()
+    for (guild_id, user_id), state in active_transformations.items():
+        if guild_id == ctx.guild.id:
+            member = ctx.guild.get_member(user_id)
+            if member:
+                await reroll_command(ctx, args=member.mention)
+    await ctx.reply("Rerolled all members.", mention_author=False)
+
+
+@bot.command(name="rerollnonadmin")
+@commands.guild_only()
+async def prefix_rerollnonadmin_command(ctx: commands.Context) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_admin(ctx.author) or not ctx.guild:
+        await ctx.reply("Only admins can use this command.", mention_author=False)
+        return
+    await ensure_state_restored()
+    for (guild_id, user_id), state in active_transformations.items():
+        if guild_id == ctx.guild.id:
+            member = ctx.guild.get_member(user_id)
+            if member and not is_admin(member):
+                await reroll_command(ctx, args=member.mention)
+    await ctx.reply("Rerolled all non-admin members.", mention_author=False)
+
+
+# Game Board Commands
+@bot.command(name="startgame")
+@commands.guild_only()
+async def prefix_startgame_command(ctx: commands.Context, *, game_type: str = "") -> None:
+    """Start a new game (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_startgame(ctx, game_type=game_type)
+
+
+@bot.command(name="endgame")
+@commands.guild_only()
+async def prefix_endgame_command(ctx: commands.Context) -> None:
+    """End the current game (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_endgame(ctx)
+
+
+@bot.command(name="listgames")
+@commands.guild_only()
+async def prefix_listgames_command(ctx: commands.Context) -> None:
+    """List available games."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_listgames(ctx)
+
+
+@bot.command(name="addplayer")
+@commands.guild_only()
+async def prefix_addplayer_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+    """Add a player to the game (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_addplayer(ctx, member=member)
+
+
+@bot.command(name="removeplayer")
+@commands.guild_only()
+async def prefix_removeplayer_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+    """Remove a player from the game (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_removeplayer(ctx, member=member)
+
+
+@bot.command(name="assign")
+@commands.guild_only()
+async def prefix_assign_command(ctx: commands.Context, member: Optional[discord.Member] = None, *, character_name: str = "") -> None:
+    """Assign a character to a player (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_assign(ctx, member=member, character_name=character_name)
+
+
+@bot.command(name="reroll")
+@commands.guild_only()
+async def prefix_reroll_game_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+    """Reroll a player's character (GM only) - game version."""
+    # Check if this is a game thread first
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await GAME_BOARD_MANAGER.command_reroll(ctx, member=member)
+        return
+    # Otherwise fall through to normal reroll command (handled by existing reroll_command)
+
+
+@bot.command(name="swap")
+@commands.guild_only()
+async def prefix_swap_command(ctx: commands.Context, member1: Optional[discord.Member] = None, member2: Optional[discord.Member] = None) -> None:
+    """Swap characters between two players (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_swap(ctx, member1=member1, member2=member2)
+
+
+@bot.command(name="movetoken")
+@commands.guild_only()
+async def prefix_movetoken_command(ctx: commands.Context, member: Optional[discord.Member] = None, *, position: str = "") -> None:
+    """Move a player's token (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_movetoken(ctx, member=member, position=position)
+
+
+@bot.command(name="dice", aliases=["roll"])
+@commands.guild_only()
+async def prefix_dice_command(ctx: commands.Context) -> None:
+    """Roll dice (player command)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_dice(ctx)
+
+
+@bot.command(name="rules")
+@commands.guild_only()
+async def prefix_rules_command(ctx: commands.Context) -> None:
+    """Show game rules (player command)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_rules(ctx)
+
+
+@bot.command(name="help")
+@commands.guild_only()
+async def prefix_help_game_command(ctx: commands.Context) -> None:
+    """Show available player commands - game version."""
+    # Check if this is a game thread first
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await GAME_BOARD_MANAGER.command_help(ctx)
+        return
+    # Otherwise fall through to normal help command
+
+
+@bot.command(name="savegame")
+@commands.guild_only()
+async def prefix_savegame_command(ctx: commands.Context) -> None:
+    """Save the current game state (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_savegame(ctx)
+
+
+@bot.command(name="loadgame")
+@commands.guild_only()
+async def prefix_loadgame_command(ctx: commands.Context, *, state_file: str = "") -> None:
+    """Load a saved game state (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_loadgame(ctx, state_file=state_file)
+
+
 @bot.command(name="bg")
 async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
     """3.5 version of bg command."""
+    # Check if this is a game thread first - completely isolate from global VN system
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        # Game thread - use game-specific bg command (isolated)
+        if not selection.strip():
+            # Show game-specific background list
+            await GAME_BOARD_MANAGER.command_bg_list(ctx)
+            return
+        # Parse game bg command: !bg @user <id> or !bg all <id>
+        parts = selection.strip().split(maxsplit=1)
+        if len(parts) == 2:
+            target_str, bg_id = parts
+            # Try to parse as member mention or "all"
+            member = None
+            if target_str.lower() != "all":
+                # Try to extract member from mention
+                from discord.ext.commands import MemberConverter
+                try:
+                    member = await MemberConverter().convert(ctx, target_str)
+                except:
+                    pass
+            # If member is None, it means "all" was passed
+            await GAME_BOARD_MANAGER.command_bg(ctx, target=member, bg_id=bg_id)
+            return
+        else:
+            # Invalid format
+            await ctx.reply("Usage: `!bg @user <id>` or `!bg all <id>`. Use `!bg` to list available backgrounds.", mention_author=False)
+            return
+    
     try:
         await ctx.message.delete()
     except discord.HTTPException:
@@ -4672,6 +4916,29 @@ async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
 @bot.command(name="outfit")
 async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
     """3.5 version of outfit command."""
+    # Check if this is a game thread first - completely isolate from global VN system
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        # Game thread - use game-specific outfit command (isolated)
+        if not outfit_name.strip():
+            # Show list
+            await GAME_BOARD_MANAGER.command_outfit_list(ctx)
+            return
+        # Parse game outfit command: !outfit @user <outfit>
+        parts = outfit_name.strip().split(maxsplit=1)
+        if len(parts) == 2:
+            target_str, outfit = parts
+            # Try to extract member from mention
+            from discord.ext.commands import MemberConverter
+            try:
+                member = await MemberConverter().convert(ctx, target_str)
+                await GAME_BOARD_MANAGER.command_outfit(ctx, member=member, outfit_name=outfit)
+                return
+            except:
+                pass
+        # If parsing failed, try without member (show list)
+        await GAME_BOARD_MANAGER.command_outfit(ctx, member=None, outfit_name=outfit_name)
+        return
+    
     outfit_name = outfit_name.strip()
     if not outfit_name:
         message = "Usage: `!outfit <outfit>` or `!outfit <pose> <outfit>`"
