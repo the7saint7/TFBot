@@ -1,0 +1,22 @@
+{
+  "name": "Snakes and Ladders",
+  "board_image": "snakes_ladders_board.png",
+  "grid": {
+    "rows": 10,
+    "cols": 10,
+    "tile_width": 60,
+    "tile_height": 60,
+    "start_x": 50,
+    "start_y": 50,
+    "blocked_cells": []
+  },
+  "dice": {
+    "count": 1,
+    "faces": 6
+  },
+  "rules": {
+    "starting_position": "A1",
+    "win_position": "J10"
+  }
+}
+
