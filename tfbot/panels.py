@@ -6,13 +6,18 @@ import io
 import json
 import logging
 import os
+import queue
 import random
 import re
+import shutil
+import subprocess
+import threading
+import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import aiohttp
 import discord
@@ -73,24 +78,12 @@ VN_BACKGROUND_DEFAULT_RELATIVE = Path(_VN_BG_DEFAULT_SETTING) if _VN_BG_DEFAULT_
 
 if _VN_BG_ROOT_SETTING:
     candidate_bg_root = Path(_VN_BG_ROOT_SETTING).expanduser()
-    VN_BACKGROUND_ROOT = candidate_bg_root if candidate_bg_root.exists() else None
+    VN_BACKGROUND_ROOT = candidate_bg_root.resolve() if candidate_bg_root.exists() else None
 elif VN_GAME_ROOT:
     candidate_bg_root = VN_GAME_ROOT / "game" / "images" / "bg"
-    VN_BACKGROUND_ROOT = candidate_bg_root if candidate_bg_root.exists() else None
+    VN_BACKGROUND_ROOT = candidate_bg_root.resolve() if candidate_bg_root.exists() else None
 else:
     VN_BACKGROUND_ROOT = None
-
-if VN_BACKGROUND_ROOT and VN_BACKGROUND_DEFAULT_RELATIVE:
-    VN_BACKGROUND_DEFAULT_PATH = (VN_BACKGROUND_ROOT / VN_BACKGROUND_DEFAULT_RELATIVE).resolve()
-    if not VN_BACKGROUND_DEFAULT_PATH.exists():
-        logger.warning(
-            "VN background: default background %s does not exist under %s",
-            VN_BACKGROUND_DEFAULT_RELATIVE,
-            VN_BACKGROUND_ROOT,
-        )
-        VN_BACKGROUND_DEFAULT_PATH = None
-else:
-    VN_BACKGROUND_DEFAULT_PATH = None
 
 _BG_SELECTION_FILE_SETTING = os.getenv("TFBOT_VN_BG_SELECTIONS", "tf_backgrounds.json").strip()
 VN_BACKGROUND_SELECTION_FILE = (
@@ -106,6 +99,243 @@ if _VN_CACHE_DIR_SETTING:
         VN_CACHE_DIR = _vn_cache_path.resolve()
 else:
     VN_CACHE_DIR = None
+
+# Face cache directory for pre-cached detected faces
+# Must be in the characters_repo git repository
+def _resolve_characters_repo_root() -> Optional[Path]:
+    """
+    Find the characters_repo git repository root.
+    Returns None if characters_repo is not configured or not found.
+    """
+    repo_url = os.getenv("TFBOT_CHARACTERS_REPO", "").strip()
+    if not repo_url:
+        return None
+    
+    repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip()
+    repo_dir_setting = repo_dir_setting or "characters_repo"
+    repo_dir = Path(repo_dir_setting)
+    if not repo_dir.is_absolute():
+        repo_dir = (BASE_DIR / repo_dir).resolve()
+    
+    # Verify it's a git repository
+    repo_git_dir = repo_dir / ".git"
+    if not repo_dir.exists() or not repo_git_dir.exists():
+        return None
+    
+    return repo_dir
+
+def _get_face_cache_dir() -> Optional[Path]:
+    """
+    Get the face cache directory in characters_repo.
+    Returns None if characters_repo is not found (face detection should be aborted).
+    """
+    characters_repo_root = _resolve_characters_repo_root()
+    if characters_repo_root:
+        # Place faces folder at the same level as characters folder in git repo
+        return characters_repo_root / "faces"
+    return None
+
+
+def _get_background_root() -> Optional[Path]:
+    """Return the preferred background root, preferring characters_repo/bg when available."""
+    git_repo_root = _resolve_git_repo_root()
+    if git_repo_root:
+        repo_bg_root = (git_repo_root / "bg").resolve()
+        if repo_bg_root.exists():
+            return repo_bg_root
+    if VN_BACKGROUND_ROOT and VN_BACKGROUND_ROOT.exists():
+        return VN_BACKGROUND_ROOT.resolve()
+    return None
+
+
+@lru_cache(maxsize=4)
+def _compute_default_background_path(root_str: Optional[str]) -> Optional[Path]:
+    if root_str is None or VN_BACKGROUND_DEFAULT_RELATIVE is None:
+        return None
+    root = Path(root_str)
+    candidate = (root / VN_BACKGROUND_DEFAULT_RELATIVE).resolve()
+    if candidate.exists():
+        return candidate
+    logger.warning(
+        "VN background: default background %s does not exist under %s",
+        VN_BACKGROUND_DEFAULT_RELATIVE,
+        root,
+    )
+    return None
+
+
+def _get_background_default_path() -> Optional[Path]:
+    background_root = _get_background_root()
+    root_str = str(background_root.resolve()) if background_root else None
+    return _compute_default_background_path(root_str)
+
+
+# Face cache directory is resolved dynamically via _get_face_cache_dir()
+
+# Face detection margin (hardcoded, not from .env)
+FACE_DETECTION_MARGIN = 0.2  # 20% margin around detected face
+
+# Face detection model path
+_FACE_MODEL_PATH_SETTING = os.getenv("TFBOT_FACE_MODEL_PATH", "model/ssd_anime_face_detect.pth").strip()
+if _FACE_MODEL_PATH_SETTING:
+    _face_model_path = Path(_FACE_MODEL_PATH_SETTING)
+    if not _face_model_path.is_absolute():
+        FACE_MODEL_PATH = (BASE_DIR / _face_model_path).resolve()
+    else:
+        FACE_MODEL_PATH = _face_model_path.resolve()
+else:
+    FACE_MODEL_PATH = (BASE_DIR / "model" / "ssd_anime_face_detect.pth").resolve()
+
+_FACE_GIT_BATCH_WINDOW = max(0.0, float_from_env("TFBOT_FACE_GIT_BATCH_WINDOW", 1.0))
+_FACE_GIT_WORKER: Optional[threading.Thread] = None
+_FACE_GIT_WORKER_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class FaceGitOperation:
+    git_repo_root: Path
+    cache_file: Path
+    character_name: str
+    variant_name: str
+
+
+_FACE_GIT_QUEUE: "queue.Queue[FaceGitOperation]" = queue.Queue()
+
+
+def _ensure_face_git_worker() -> None:
+    """Start the git worker thread if it is not already running."""
+    global _FACE_GIT_WORKER
+    with _FACE_GIT_WORKER_LOCK:
+        if _FACE_GIT_WORKER and _FACE_GIT_WORKER.is_alive():
+            return
+        _FACE_GIT_WORKER = threading.Thread(
+            target=_face_git_worker_loop,
+            name="face-git-worker",
+            daemon=True,
+        )
+        _FACE_GIT_WORKER.start()
+
+
+def _enqueue_face_git_operation(
+    git_repo_root: Path,
+    cache_file: Path,
+    character_name: str,
+    variant_name: str,
+) -> None:
+    """Queue a git add/commit/push operation for a cached face file."""
+    if not git_repo_root.exists():
+        return
+    _ensure_face_git_worker()
+    _FACE_GIT_QUEUE.put(
+        FaceGitOperation(
+            git_repo_root=git_repo_root,
+            cache_file=cache_file,
+            character_name=character_name,
+            variant_name=variant_name,
+        )
+    )
+
+
+def _face_git_worker_loop() -> None:
+    """Worker loop that batches git operations to avoid concurrent pushes."""
+    batch: List[FaceGitOperation] = []
+    while True:
+        operation = _FACE_GIT_QUEUE.get()
+        batch.append(operation)
+        if _FACE_GIT_BATCH_WINDOW > 0:
+            while True:
+                try:
+                    next_op = _FACE_GIT_QUEUE.get(timeout=_FACE_GIT_BATCH_WINDOW)
+                    batch.append(next_op)
+                except queue.Empty:
+                    break
+        try:
+            _process_face_git_batch(batch)
+        finally:
+            for _ in batch:
+                _FACE_GIT_QUEUE.task_done()
+            batch.clear()
+
+
+def _process_face_git_batch(batch: Sequence[FaceGitOperation]) -> None:
+    """Run git operations for all queued face caches."""
+    if not batch:
+        return
+    git_executable = shutil.which("git")
+    if not git_executable:
+        logger.debug("git executable not found; skipping %d face git operations", len(batch))
+        return
+
+    ops_by_repo: Dict[Path, List[FaceGitOperation]] = {}
+    for operation in batch:
+        if not operation.git_repo_root.exists():
+            logger.debug("characters repo missing for git operation: %s", operation.git_repo_root)
+            continue
+        ops_by_repo.setdefault(operation.git_repo_root, []).append(operation)
+
+    for repo_root, operations in ops_by_repo.items():
+        try:
+            _run_face_git_batch_for_repo(git_executable, repo_root, operations)
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "Git operation failed for face cache batch in %s: %s",
+                repo_root,
+                exc.stderr.strip() or exc.stdout.strip() or str(exc),
+            )
+        except Exception as exc:
+            logger.warning("Unexpected error processing face git batch for %s: %s", repo_root, exc, exc_info=True)
+
+
+def _run_face_git_batch_for_repo(
+    git_executable: str,
+    repo_root: Path,
+    operations: Sequence[FaceGitOperation],
+) -> None:
+    """Stage, commit, and push the queued face cache changes for a repository."""
+    staged: List[Tuple[FaceGitOperation, Path]] = []
+    seen_paths: Set[Path] = set()
+    for operation in operations:
+        if not operation.cache_file.exists():
+            logger.debug("Skipping missing face cache file %s", operation.cache_file)
+            continue
+        try:
+            rel_path = operation.cache_file.relative_to(repo_root)
+        except ValueError:
+            logger.debug("Cache file %s not inside repo %s", operation.cache_file, repo_root)
+            continue
+        if rel_path in seen_paths:
+            continue
+        seen_paths.add(rel_path)
+        staged.append((operation, rel_path))
+
+    if not staged:
+        return
+
+    for _, rel_path in staged:
+        cmd = [git_executable, "-C", str(repo_root), "add", str(rel_path)]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    if len(staged) == 1:
+        op = staged[0][0]
+        commit_msg = f"Add face cache for {op.character_name}/{op.variant_name}"
+    else:
+        descriptors = ", ".join(f"{op.character_name}/{op.variant_name}" for op, _ in staged[:5])
+        if len(staged) > 5:
+            descriptors = f"{descriptors} +{len(staged) - 5} more"
+        commit_msg = f"Add face caches for {descriptors}"
+
+    cmd = [git_executable, "-C", str(repo_root), "commit", "-m", commit_msg]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    cmd = [git_executable, "-C", str(repo_root), "push"]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    logger.info(
+        "Pushed %d face cache change(s) to remote for %s",
+        len(staged),
+        repo_root,
+    )
+
 
 VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
 _VN_LAYOUT_FILE_SETTING = os.getenv("TFBOT_VN_LAYOUTS", "vn_layouts.json").strip()
@@ -222,6 +452,7 @@ vn_outfit_selection: Dict[str, Dict[str, object]] = {}
 background_selections: Dict[str, str] = {}
 _vn_config_cache: Dict[str, Dict] = {}
 _VN_BACKGROUND_IMAGES: list[Path] = []
+_VN_BACKGROUND_IMAGES_ROOT: Optional[Path] = None
 
 @lru_cache(maxsize=1)
 def _get_overlay_assets() -> Dict[str, "Image.Image"]:
@@ -283,6 +514,10 @@ def load_outfit_selections() -> Dict[str, Dict[str, object]]:
                 outfit_value: Optional[str] = None
                 accessories_value: Dict[str, str] = {}
                 if isinstance(value, dict):
+                    # Preserve all fields from the dict, including suppress_outfit_accessories
+                    # First, copy all fields to preserve flags and other metadata
+                    entry.update(value)
+                    
                     pose_raw = value.get("pose")
                     outfit_raw = value.get("outfit") or value.get("name")
                     accessories_raw = value.get("accessories")
@@ -295,6 +530,8 @@ def load_outfit_selections() -> Dict[str, Dict[str, object]]:
                     elif outfit_raw is not None:
                         outfit_value = str(outfit_raw).strip()
                     if isinstance(accessories_raw, Mapping):
+                        # Rebuild accessories dict with normalized keys
+                        accessories_value = {}
                         for acc_key, acc_value in accessories_raw.items():
                             normalized_key = str(acc_key).strip().lower()
                             if not normalized_key:
@@ -302,17 +539,33 @@ def load_outfit_selections() -> Dict[str, Dict[str, object]]:
                             normalized_value = str(acc_value).strip().lower()
                             if normalized_value == "on":
                                 accessories_value[normalized_key] = "on"
-                elif isinstance(value, str):
-                    outfit_value = value.strip()
-                elif value is not None:
-                    outfit_value = str(value).strip()
-
-                if outfit_value:
+                        # Update the entry with normalized accessories (or remove if empty)
+                        if accessories_value:
+                            entry["accessories"] = accessories_value
+                        elif "accessories" in entry:
+                            entry.pop("accessories")
+                    
+                    # Normalize pose and outfit values
                     if pose_value:
                         entry["pose"] = pose_value
-                    entry["outfit"] = outfit_value
-                    if accessories_value:
-                        entry["accessories"] = accessories_value
+                    elif "pose" in entry and not entry["pose"]:
+                        entry.pop("pose")
+                    if outfit_value:
+                        entry["outfit"] = outfit_value
+                    elif "outfit" not in entry and "name" in entry:
+                        entry["outfit"] = entry["name"]
+                elif isinstance(value, str):
+                    outfit_value = value.strip()
+                    if outfit_value:
+                        entry["outfit"] = outfit_value
+                elif value is not None:
+                    outfit_value = str(value).strip()
+                    if outfit_value:
+                        entry["outfit"] = outfit_value
+
+                # Only add entry if it has at least an outfit or other meaningful data (like suppress_outfit_accessories)
+                # Preserve entries that have the suppress flag even if they don't have an outfit
+                if entry and (outfit_value or len(entry) > 0):
                     normalized[str(key).lower()] = entry
             return normalized
     except json.JSONDecodeError as exc:
@@ -363,29 +616,34 @@ background_selections = load_background_selections()
 
 
 def _relative_background_path(path: Path) -> Optional[str]:
-    if VN_BACKGROUND_ROOT is None:
+    background_root = _get_background_root()
+    if background_root is None:
         return None
     try:
-        relative = path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
+        relative = path.resolve().relative_to(background_root.resolve())
     except ValueError:
         return None
     return relative.as_posix()
 
 
 def _load_background_images() -> Sequence[Path]:
-    global _VN_BACKGROUND_IMAGES
-    if _VN_BACKGROUND_IMAGES:
-        return _VN_BACKGROUND_IMAGES
-    if VN_BACKGROUND_ROOT and VN_BACKGROUND_ROOT.exists():
+    global _VN_BACKGROUND_IMAGES, _VN_BACKGROUND_IMAGES_ROOT
+    background_root = _get_background_root()
+    if background_root and background_root.exists():
+        if _VN_BACKGROUND_IMAGES and _VN_BACKGROUND_IMAGES_ROOT == background_root:
+            return _VN_BACKGROUND_IMAGES
         try:
             _VN_BACKGROUND_IMAGES = sorted(
-                path for path in VN_BACKGROUND_ROOT.rglob("*.png") if path.is_file()
+                path for path in background_root.rglob("*.png") if path.is_file()
             )
+            _VN_BACKGROUND_IMAGES_ROOT = background_root
         except OSError as exc:
-            logger.warning("VN background: failed to scan directory %s: %s", VN_BACKGROUND_ROOT, exc)
+            logger.warning("VN background: failed to scan directory %s: %s", background_root, exc)
             _VN_BACKGROUND_IMAGES = []
+            _VN_BACKGROUND_IMAGES_ROOT = None
     else:
         _VN_BACKGROUND_IMAGES = []
+        _VN_BACKGROUND_IMAGES_ROOT = None
     return _VN_BACKGROUND_IMAGES
 
 
@@ -394,19 +652,21 @@ def list_background_choices() -> Sequence[Path]:
 
 
 def get_selected_background_path(user_id: int) -> Optional[Path]:
-    if VN_BACKGROUND_ROOT is None:
+    background_root = _get_background_root()
+    if background_root is None:
         return None
     key = str(user_id)
     selected = background_selections.get(key)
     if selected:
-        candidate = (VN_BACKGROUND_ROOT / selected).resolve()
+        candidate = (background_root / selected).resolve()
         if candidate.exists():
             return candidate
         logger.warning("VN background: stored selection %s missing for user %s", selected, user_id)
         background_selections.pop(key, None)
         persist_background_selections()
-    if VN_BACKGROUND_DEFAULT_PATH and VN_BACKGROUND_DEFAULT_PATH.exists():
-        return VN_BACKGROUND_DEFAULT_PATH
+    default_path = _get_background_default_path()
+    if default_path and default_path.exists():
+        return default_path
     backgrounds = _load_background_images()
     if backgrounds:
         return backgrounds[0]
@@ -414,7 +674,8 @@ def get_selected_background_path(user_id: int) -> Optional[Path]:
 
 
 def set_selected_background(user_id: int, background_path: Path) -> bool:
-    if VN_BACKGROUND_ROOT is None:
+    background_root = _get_background_root()
+    if background_root is None:
         return False
     relative = _relative_background_path(background_path)
     if not relative:
@@ -1175,6 +1436,324 @@ def compose_game_avatar(
     return image
 
 
+def _check_face_exists_in_remote(
+    git_repo_root: Path,
+    face_relative_path: Path,
+) -> bool:
+    """
+    Check if a face file exists in the remote git repository.
+    
+    Args:
+        git_repo_root: Git repository root directory
+        face_relative_path: Relative path from repo root (e.g., faces/character/variant/face.png)
+        
+    Returns:
+        True if file exists in remote, False otherwise
+    """
+    git_executable = shutil.which("git")
+    if not git_executable:
+        return False
+    
+    try:
+        # Fetch latest refs from remote (lightweight operation)
+        fetch_cmd = [git_executable, "-C", str(git_repo_root), "fetch", "--quiet"]
+        subprocess.run(fetch_cmd, capture_output=True, check=False, timeout=30)
+        
+        # Check if file exists in remote branch (default to origin/main or origin/master)
+        # Try common branch names
+        for branch in ["origin/main", "origin/master", "origin/HEAD"]:
+            ls_cmd = [
+                git_executable,
+                "-C",
+                str(git_repo_root),
+                "ls-tree",
+                "--name-only",
+                branch,
+                str(face_relative_path),
+            ]
+            result = subprocess.run(ls_cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+        
+        return False
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("Failed to check remote for face %s: %s", face_relative_path, exc)
+        return False
+
+
+def _sync_faces_from_remote(git_repo_root: Path) -> None:
+    """
+    Pull latest changes from remote for the faces directory.
+    
+    Args:
+        git_repo_root: Git repository root directory
+    """
+    git_executable = shutil.which("git")
+    if not git_executable:
+        return
+    
+    try:
+        # Pull latest changes (only fast-forward)
+        pull_cmd = [git_executable, "-C", str(git_repo_root), "pull", "--ff-only", "--quiet"]
+        result = subprocess.run(pull_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            logger.debug("Synced faces from remote")
+        else:
+            logger.debug("Face sync pull returned non-zero: %s", result.stderr.strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("Failed to sync faces from remote: %s", exc)
+
+
+def _cache_character_face_background(
+    character_dir: Path,
+    variant_dir: Path,
+    avatar_image: "Image.Image",
+    git_repo_root: Optional[Path],
+) -> None:
+    """
+    Background thread function to cache face and commit to git.
+    
+    Args:
+        character_dir: Character directory path
+        variant_dir: Variant directory path
+        avatar_image: Fully composed avatar PIL Image (copy for thread safety)
+        git_repo_root: Git repository root directory (characters_repo), or None if not found
+    """
+    if not FACE_MODEL_PATH.exists():
+        return
+    
+    face_cache_dir = _get_face_cache_dir()
+    if face_cache_dir is None:
+        logger.warning(
+            "Face detection background task aborted: characters_repo not found for %s/%s",
+            character_dir.name,
+            variant_dir.name,
+        )
+        return
+    
+    try:
+        from PIL import Image
+        
+        # Create cache path: faces/character_name/variant_name/face.png
+        cache_dir = face_cache_dir / character_dir.name.lower() / variant_dir.name.lower()
+        cache_file = cache_dir / "face.png"
+        
+        # Check if already cached locally
+        if cache_file.exists():
+            logger.debug("Face already cached locally for %s/%s", character_dir.name, variant_dir.name)
+            return
+        
+        # Check if exists in remote git repository
+        if git_repo_root and git_repo_root.exists():
+            face_relative_path = cache_file.relative_to(git_repo_root)
+            if _check_face_exists_in_remote(git_repo_root, face_relative_path):
+                logger.debug("Face exists in remote for %s/%s, pulling...", character_dir.name, variant_dir.name)
+                # Pull the file from remote
+                _sync_faces_from_remote(git_repo_root)
+                # Check again after pull
+                if cache_file.exists():
+                    logger.debug("Face pulled from remote for %s/%s", character_dir.name, variant_dir.name)
+                    return
+        
+        # Import face detection
+        from tfbot.face_detection import detect_faces_in_pil_image
+        
+        # Detect faces in the avatar image
+        faces = detect_faces_in_pil_image(avatar_image, FACE_MODEL_PATH)
+        
+        if faces is None or len(faces) == 0:
+            logger.debug("No face detected for %s/%s", character_dir.name, variant_dir.name)
+            return
+        
+        # Get the first (highest confidence) face
+        face = faces[0]
+        xmin = int(face[0])
+        ymin = int(face[1])
+        xmax = int(face[2])
+        ymax = int(face[3])
+        score = face[4]
+        
+        logger.debug(
+            "Face detected for %s/%s: bbox=(%d,%d,%d,%d) score=%.3f",
+            character_dir.name,
+            variant_dir.name,
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            score,
+        )
+        
+        # Calculate margin
+        face_width = xmax - xmin
+        face_height = ymax - ymin
+        margin_x = int(face_width * FACE_DETECTION_MARGIN)
+        margin_y = int(face_height * FACE_DETECTION_MARGIN)
+        
+        # Expand bounding box with margin, clamped to image bounds
+        img_width, img_height = avatar_image.size
+        crop_xmin = max(0, xmin - margin_x)
+        crop_ymin = max(0, ymin - margin_y)
+        crop_xmax = min(img_width, xmax + margin_x)
+        crop_ymax = min(img_height, ymax + margin_y)
+        
+        # Crop face region with margin
+        face_crop = avatar_image.crop((crop_xmin, crop_ymin, crop_xmax, crop_ymax))
+        
+        # Resize to max 250x250 if larger, maintaining aspect ratio
+        MAX_FACE_SIZE = 250
+        face_width, face_height = face_crop.size
+        if face_width > MAX_FACE_SIZE or face_height > MAX_FACE_SIZE:
+            # Calculate new size maintaining aspect ratio
+            if face_width > face_height:
+                new_width = MAX_FACE_SIZE
+                new_height = int(face_height * (MAX_FACE_SIZE / face_width))
+            else:
+                new_height = MAX_FACE_SIZE
+                new_width = int(face_width * (MAX_FACE_SIZE / face_height))
+            face_crop = face_crop.resize((new_width, new_height), Image.LANCZOS)
+            logger.debug(
+                "Resized face for %s/%s from %dx%d to %dx%d",
+                character_dir.name,
+                variant_dir.name,
+                face_width,
+                face_height,
+                new_width,
+                new_height,
+            )
+        
+        # Save cached face
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            face_crop.save(cache_file, format="PNG")
+            logger.info("Cached face for %s/%s to %s", character_dir.name, variant_dir.name, cache_file)
+        except OSError as exc:
+            logger.warning("Failed to cache face for %s/%s: %s", character_dir.name, variant_dir.name, exc)
+            return
+        
+        # Git operations if in git repo (queued to avoid concurrent pushes)
+        if git_repo_root and git_repo_root.exists():
+            _enqueue_face_git_operation(
+                git_repo_root=git_repo_root,
+                cache_file=cache_file,
+                character_name=character_dir.name,
+                variant_name=variant_dir.name,
+            )
+
+    except ImportError:
+        logger.debug("Face detection not available (missing dependencies)")
+    except Exception as exc:
+        logger.warning("Error caching face for %s/%s: %s", character_dir.name, variant_dir.name, exc, exc_info=True)
+
+
+# Periodic sync state
+_last_face_sync_time: float = 0.0
+_face_sync_interval: float = 86400.0  # 24 hours in seconds
+_face_sync_lock = threading.Lock()
+
+
+def _periodic_face_sync() -> None:
+    """Periodic background task to sync faces from remote git repository."""
+    global _last_face_sync_time
+    
+    git_repo_root = _resolve_characters_repo_root()
+    if not git_repo_root or not git_repo_root.exists():
+        return
+    
+    current_time = time.time()
+    with _face_sync_lock:
+        # Check if enough time has passed since last sync
+        if current_time - _last_face_sync_time < _face_sync_interval:
+            return
+        _last_face_sync_time = current_time
+    
+    logger.debug("Running periodic face sync from remote")
+    _sync_faces_from_remote(git_repo_root)
+
+
+def _cache_character_face(
+    character_dir: Path,
+    variant_dir: Path,
+    avatar_image: "Image.Image",
+) -> None:
+    """
+    Cache the detected face from a character's avatar image in a background thread.
+    Checks if face is already cached locally and remotely, and if not, launches background thread to detect, save, and commit to git.
+    
+    Args:
+        character_dir: Character directory path
+        variant_dir: Variant directory path
+        avatar_image: Fully composed avatar PIL Image
+    """
+    if not FACE_MODEL_PATH.exists():
+        return
+    
+    # Check if characters_repo is available - abort if not
+    face_cache_dir = _get_face_cache_dir()
+    if face_cache_dir is None:
+        logger.warning(
+            "Face detection aborted: characters_repo git repository not found. "
+            "Set TFBOT_CHARACTERS_REPO and ensure characters_repo directory exists with .git folder. "
+            "Face caching requires the characters_repo to be configured and synced."
+        )
+        return
+    
+    git_repo_root = _resolve_characters_repo_root()
+    
+    # Create cache path: faces/character_name/variant_name/face.png
+    cache_dir = face_cache_dir / character_dir.name.lower() / variant_dir.name.lower()
+    cache_file = cache_dir / "face.png"
+    
+    # Check if already cached locally
+    if cache_file.exists():
+        logger.debug("Face already cached locally for %s/%s", character_dir.name, variant_dir.name)
+        return
+    
+    # Check remote if in git repo (quick check before launching thread)
+    if git_repo_root and git_repo_root.exists():
+        face_relative_path = cache_file.relative_to(git_repo_root)
+        if _check_face_exists_in_remote(git_repo_root, face_relative_path):
+            logger.debug("Face exists in remote for %s/%s, syncing...", character_dir.name, variant_dir.name)
+            # Sync from remote in background
+            sync_thread = threading.Thread(
+                target=_sync_faces_from_remote,
+                args=(git_repo_root,),
+                daemon=True,
+                name=f"face-sync-{character_dir.name}-{variant_dir.name}",
+            )
+            sync_thread.start()
+            return
+    
+    # Trigger periodic sync check (non-blocking)
+    try:
+        sync_check_thread = threading.Thread(
+            target=_periodic_face_sync,
+            daemon=True,
+            name="face-sync-check",
+        )
+        sync_check_thread.start()
+    except Exception:
+        pass  # Ignore errors in sync check
+    
+    # Make a copy of the image for thread safety
+    try:
+        from PIL import Image
+        avatar_copy = avatar_image.copy()
+    except Exception:
+        logger.warning("Failed to copy avatar image for face caching")
+        return
+    
+    # Launch background thread to detect and cache face
+    thread = threading.Thread(
+        target=_cache_character_face_background,
+        args=(character_dir, variant_dir, avatar_copy, git_repo_root),
+        daemon=True,
+        name=f"face-cache-{character_dir.name}-{variant_dir.name}",
+    )
+    thread.start()
+    logger.debug("Launched background thread to cache face for %s/%s", character_dir.name, variant_dir.name)
+
+
 def _compose_game_avatar_uncached(
     character_name: str,
     pose_override: Optional[str] = None,
@@ -1248,7 +1827,18 @@ def _compose_game_avatar_uncached(
         variant_dir,
         selection_scope,
     )
-    combined_accessory_layers = list(outfit_asset.accessory_layers)
+    
+    # Check if outfit-level accessories should be suppressed (from clearall command)
+    suppress_outfit_accessories = False
+    for lookup_key in _selection_lookup_keys(character_dir, selection_scope):
+        entry = vn_outfit_selection.get(lookup_key)
+        if isinstance(entry, dict) and entry.get("suppress_outfit_accessories"):
+            suppress_outfit_accessories = True
+            break
+    
+    combined_accessory_layers = []
+    if not suppress_outfit_accessories:
+        combined_accessory_layers = list(outfit_asset.accessory_layers)
     combined_accessory_layers.extend(optional_layers)
 
     cache_file: Optional[Path] = None
@@ -1299,6 +1889,7 @@ def _compose_game_avatar_uncached(
             face_path,
         )
 
+    pose_metadata = _get_pose_metadata(config, variant_dir.name)
     facing = str(pose_metadata.get("facing") or config.get("facing") or "left").lower()
     logger.debug("VN sprite: pose %s facing=%s", variant_dir.name, facing)
     if facing != "right":
@@ -1313,6 +1904,9 @@ def _compose_game_avatar_uncached(
         if limit > 0 and limit < outfit_image.height:
             outfit_image = outfit_image.crop((0, 0, outfit_image.width, limit))
 
+    # Cache detected face if not already cached
+    _cache_character_face(character_dir, variant_dir, outfit_image)
+
     if VN_CACHE_DIR and cache_file:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1326,6 +1920,16 @@ def _compose_game_avatar_uncached(
 
 def _clear_compose_game_avatar_cache() -> None:
     _COMPOSE_AVATAR_CACHE.clear()
+    # Also clear disk cache to force regeneration when accessories change
+    if VN_CACHE_DIR and VN_CACHE_DIR.exists():
+        try:
+            import shutil
+            for cache_dir in VN_CACHE_DIR.iterdir():
+                if cache_dir.is_dir():
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+            logger.debug("VN sprite: cleared disk cache directory %s", VN_CACHE_DIR)
+        except Exception as exc:
+            logger.warning("VN sprite: failed to clear disk cache %s: %s", VN_CACHE_DIR, exc)
 
 
 compose_game_avatar.cache_clear = _clear_compose_game_avatar_cache  # type: ignore[attr-defined]
@@ -2227,7 +2831,6 @@ def render_vn_panel(
             state.character_name,
             pose_override=gacha_pose_override,
             outfit_override=gacha_outfit_override,
-            selection_scope=selection_scope,
         )
     if avatar_image is not None and avatar_box:
         cropped = _crop_transparent_vertical(avatar_image)
