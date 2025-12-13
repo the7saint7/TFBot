@@ -8,6 +8,10 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
+import threading
+import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from functools import lru_cache
@@ -106,6 +110,57 @@ if _VN_CACHE_DIR_SETTING:
         VN_CACHE_DIR = _vn_cache_path.resolve()
 else:
     VN_CACHE_DIR = None
+
+# Face cache directory for pre-cached detected faces
+# Try to locate git repo root and place faces folder there
+def _resolve_git_repo_root() -> Optional[Path]:
+    """Find the git repository root that contains the characters folder."""
+    if VN_ASSET_ROOT is None:
+        return None
+    
+    # Check if VN_ASSET_ROOT is inside a git repo
+    current = VN_ASSET_ROOT.resolve()
+    while current != current.parent:
+        git_dir = current / ".git"
+        if git_dir.exists():
+            return current
+        current = current.parent
+    
+    return None
+
+def _get_face_cache_dir() -> Path:
+    """Get the face cache directory, resolving git repo root if available."""
+    git_repo_root = _resolve_git_repo_root()
+    if git_repo_root:
+        # Place faces folder at the same level as characters folder in git repo
+        return git_repo_root / "faces"
+    else:
+        # Fallback to local face_cache if not in git repo
+        _FACE_CACHE_DIR_SETTING = os.getenv("TFBOT_FACE_CACHE_DIR", "face_cache").strip()
+        if _FACE_CACHE_DIR_SETTING:
+            _face_cache_path = Path(_FACE_CACHE_DIR_SETTING)
+            if not _face_cache_path.is_absolute():
+                return (BASE_DIR / _face_cache_path).resolve()
+            else:
+                return _face_cache_path.resolve()
+        else:
+            return (BASE_DIR / "face_cache").resolve()
+
+# Face cache directory is resolved dynamically via _get_face_cache_dir()
+
+# Face detection margin (hardcoded, not from .env)
+FACE_DETECTION_MARGIN = 0.2  # 20% margin around detected face
+
+# Face detection model path
+_FACE_MODEL_PATH_SETTING = os.getenv("TFBOT_FACE_MODEL_PATH", "model/ssd_anime_face_detect.pth").strip()
+if _FACE_MODEL_PATH_SETTING:
+    _face_model_path = Path(_FACE_MODEL_PATH_SETTING)
+    if not _face_model_path.is_absolute():
+        FACE_MODEL_PATH = (BASE_DIR / _face_model_path).resolve()
+    else:
+        FACE_MODEL_PATH = _face_model_path.resolve()
+else:
+    FACE_MODEL_PATH = (BASE_DIR / "model" / "ssd_anime_face_detect.pth").resolve()
 
 VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
 _VN_LAYOUT_FILE_SETTING = os.getenv("TFBOT_VN_LAYOUTS", "vn_layouts.json").strip()
@@ -1197,6 +1252,338 @@ def compose_game_avatar(
     return image
 
 
+def _check_face_exists_in_remote(
+    git_repo_root: Path,
+    face_relative_path: Path,
+) -> bool:
+    """
+    Check if a face file exists in the remote git repository.
+    
+    Args:
+        git_repo_root: Git repository root directory
+        face_relative_path: Relative path from repo root (e.g., faces/character/variant/face.png)
+        
+    Returns:
+        True if file exists in remote, False otherwise
+    """
+    git_executable = shutil.which("git")
+    if not git_executable:
+        return False
+    
+    try:
+        # Fetch latest refs from remote (lightweight operation)
+        fetch_cmd = [git_executable, "-C", str(git_repo_root), "fetch", "--quiet"]
+        subprocess.run(fetch_cmd, capture_output=True, check=False, timeout=30)
+        
+        # Check if file exists in remote branch (default to origin/main or origin/master)
+        # Try common branch names
+        for branch in ["origin/main", "origin/master", "origin/HEAD"]:
+            ls_cmd = [
+                git_executable,
+                "-C",
+                str(git_repo_root),
+                "ls-tree",
+                "--name-only",
+                branch,
+                str(face_relative_path),
+            ]
+            result = subprocess.run(ls_cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+        
+        return False
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("Failed to check remote for face %s: %s", face_relative_path, exc)
+        return False
+
+
+def _sync_faces_from_remote(git_repo_root: Path) -> None:
+    """
+    Pull latest changes from remote for the faces directory.
+    
+    Args:
+        git_repo_root: Git repository root directory
+    """
+    git_executable = shutil.which("git")
+    if not git_executable:
+        return
+    
+    try:
+        # Pull latest changes (only fast-forward)
+        pull_cmd = [git_executable, "-C", str(git_repo_root), "pull", "--ff-only", "--quiet"]
+        result = subprocess.run(pull_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            logger.debug("Synced faces from remote")
+        else:
+            logger.debug("Face sync pull returned non-zero: %s", result.stderr.strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("Failed to sync faces from remote: %s", exc)
+
+
+def _cache_character_face_background(
+    character_dir: Path,
+    variant_dir: Path,
+    avatar_image: "Image.Image",
+    git_repo_root: Optional[Path],
+) -> None:
+    """
+    Background thread function to cache face and commit to git.
+    
+    Args:
+        character_dir: Character directory path
+        variant_dir: Variant directory path
+        avatar_image: Fully composed avatar PIL Image (copy for thread safety)
+        git_repo_root: Git repository root directory, or None if not in git repo
+    """
+    face_cache_dir = _get_face_cache_dir()
+    if not FACE_MODEL_PATH.exists():
+        return
+    
+    try:
+        from PIL import Image
+        
+        # Create cache path: faces/character_name/variant_name/face.png
+        cache_dir = face_cache_dir / character_dir.name.lower() / variant_dir.name.lower()
+        cache_file = cache_dir / "face.png"
+        
+        # Check if already cached locally
+        if cache_file.exists():
+            logger.debug("Face already cached locally for %s/%s", character_dir.name, variant_dir.name)
+            return
+        
+        # Check if exists in remote git repository
+        if git_repo_root and git_repo_root.exists():
+            face_relative_path = cache_file.relative_to(git_repo_root)
+            if _check_face_exists_in_remote(git_repo_root, face_relative_path):
+                logger.debug("Face exists in remote for %s/%s, pulling...", character_dir.name, variant_dir.name)
+                # Pull the file from remote
+                _sync_faces_from_remote(git_repo_root)
+                # Check again after pull
+                if cache_file.exists():
+                    logger.debug("Face pulled from remote for %s/%s", character_dir.name, variant_dir.name)
+                    return
+        
+        # Import face detection
+        from tfbot.face_detection import detect_faces_in_pil_image
+        
+        # Detect faces in the avatar image
+        faces = detect_faces_in_pil_image(avatar_image, FACE_MODEL_PATH)
+        
+        if faces is None or len(faces) == 0:
+            logger.debug("No face detected for %s/%s", character_dir.name, variant_dir.name)
+            return
+        
+        # Get the first (highest confidence) face
+        face = faces[0]
+        xmin = int(face[0])
+        ymin = int(face[1])
+        xmax = int(face[2])
+        ymax = int(face[3])
+        score = face[4]
+        
+        logger.debug(
+            "Face detected for %s/%s: bbox=(%d,%d,%d,%d) score=%.3f",
+            character_dir.name,
+            variant_dir.name,
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            score,
+        )
+        
+        # Calculate margin
+        face_width = xmax - xmin
+        face_height = ymax - ymin
+        margin_x = int(face_width * FACE_DETECTION_MARGIN)
+        margin_y = int(face_height * FACE_DETECTION_MARGIN)
+        
+        # Expand bounding box with margin, clamped to image bounds
+        img_width, img_height = avatar_image.size
+        crop_xmin = max(0, xmin - margin_x)
+        crop_ymin = max(0, ymin - margin_y)
+        crop_xmax = min(img_width, xmax + margin_x)
+        crop_ymax = min(img_height, ymax + margin_y)
+        
+        # Crop face region with margin
+        face_crop = avatar_image.crop((crop_xmin, crop_ymin, crop_xmax, crop_ymax))
+        
+        # Resize to max 250x250 if larger, maintaining aspect ratio
+        MAX_FACE_SIZE = 250
+        face_width, face_height = face_crop.size
+        if face_width > MAX_FACE_SIZE or face_height > MAX_FACE_SIZE:
+            # Calculate new size maintaining aspect ratio
+            if face_width > face_height:
+                new_width = MAX_FACE_SIZE
+                new_height = int(face_height * (MAX_FACE_SIZE / face_width))
+            else:
+                new_height = MAX_FACE_SIZE
+                new_width = int(face_width * (MAX_FACE_SIZE / face_height))
+            face_crop = face_crop.resize((new_width, new_height), Image.LANCZOS)
+            logger.debug(
+                "Resized face for %s/%s from %dx%d to %dx%d",
+                character_dir.name,
+                variant_dir.name,
+                face_width,
+                face_height,
+                new_width,
+                new_height,
+            )
+        
+        # Save cached face
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            face_crop.save(cache_file, format="PNG")
+            logger.info("Cached face for %s/%s to %s", character_dir.name, variant_dir.name, cache_file)
+        except OSError as exc:
+            logger.warning("Failed to cache face for %s/%s: %s", character_dir.name, variant_dir.name, exc)
+            return
+        
+        # Git operations if in git repo
+        if git_repo_root and git_repo_root.exists():
+            git_executable = shutil.which("git")
+            if git_executable:
+                try:
+                    # Get relative path from repo root
+                    rel_path = cache_file.relative_to(git_repo_root)
+                    
+                    # Stage the file
+                    cmd = [git_executable, "-C", str(git_repo_root), "add", str(rel_path)]
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    logger.debug("Staged face file: %s", rel_path)
+                    
+                    # Commit with message
+                    commit_msg = f"Add face cache for {character_dir.name}/{variant_dir.name}"
+                    cmd = [git_executable, "-C", str(git_repo_root), "commit", "-m", commit_msg]
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    logger.info("Committed face cache: %s", commit_msg)
+                    
+                    # Push to remote
+                    cmd = [git_executable, "-C", str(git_repo_root), "push"]
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    logger.info("Pushed face cache to remote for %s/%s", character_dir.name, variant_dir.name)
+                    
+                except subprocess.CalledProcessError as exc:
+                    logger.warning(
+                        "Git operation failed for face cache %s/%s: %s",
+                        character_dir.name,
+                        variant_dir.name,
+                        exc.stderr.strip() or exc.stdout.strip() or str(exc),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Error in git operations for face cache %s/%s: %s",
+                        character_dir.name,
+                        variant_dir.name,
+                        exc,
+                        exc_info=True,
+                    )
+            
+    except ImportError:
+        logger.debug("Face detection not available (missing dependencies)")
+    except Exception as exc:
+        logger.warning("Error caching face for %s/%s: %s", character_dir.name, variant_dir.name, exc, exc_info=True)
+
+
+# Periodic sync state
+_last_face_sync_time: float = 0.0
+_face_sync_interval: float = 86400.0  # 24 hours in seconds
+_face_sync_lock = threading.Lock()
+
+
+def _periodic_face_sync() -> None:
+    """Periodic background task to sync faces from remote git repository."""
+    global _last_face_sync_time
+    
+    git_repo_root = _resolve_git_repo_root()
+    if not git_repo_root or not git_repo_root.exists():
+        return
+    
+    current_time = time.time()
+    with _face_sync_lock:
+        # Check if enough time has passed since last sync
+        if current_time - _last_face_sync_time < _face_sync_interval:
+            return
+        _last_face_sync_time = current_time
+    
+    logger.debug("Running periodic face sync from remote")
+    _sync_faces_from_remote(git_repo_root)
+
+
+def _cache_character_face(
+    character_dir: Path,
+    variant_dir: Path,
+    avatar_image: "Image.Image",
+) -> None:
+    """
+    Cache the detected face from a character's avatar image in a background thread.
+    Checks if face is already cached locally and remotely, and if not, launches background thread to detect, save, and commit to git.
+    
+    Args:
+        character_dir: Character directory path
+        variant_dir: Variant directory path
+        avatar_image: Fully composed avatar PIL Image
+    """
+    if not FACE_MODEL_PATH.exists():
+        return
+    
+    face_cache_dir = _get_face_cache_dir()
+    git_repo_root = _resolve_git_repo_root()
+    
+    # Create cache path: faces/character_name/variant_name/face.png
+    cache_dir = face_cache_dir / character_dir.name.lower() / variant_dir.name.lower()
+    cache_file = cache_dir / "face.png"
+    
+    # Check if already cached locally
+    if cache_file.exists():
+        logger.debug("Face already cached locally for %s/%s", character_dir.name, variant_dir.name)
+        return
+    
+    # Check remote if in git repo (quick check before launching thread)
+    if git_repo_root and git_repo_root.exists():
+        face_relative_path = cache_file.relative_to(git_repo_root)
+        if _check_face_exists_in_remote(git_repo_root, face_relative_path):
+            logger.debug("Face exists in remote for %s/%s, syncing...", character_dir.name, variant_dir.name)
+            # Sync from remote in background
+            sync_thread = threading.Thread(
+                target=_sync_faces_from_remote,
+                args=(git_repo_root,),
+                daemon=True,
+                name=f"face-sync-{character_dir.name}-{variant_dir.name}",
+            )
+            sync_thread.start()
+            return
+    
+    # Trigger periodic sync check (non-blocking)
+    try:
+        sync_check_thread = threading.Thread(
+            target=_periodic_face_sync,
+            daemon=True,
+            name="face-sync-check",
+        )
+        sync_check_thread.start()
+    except Exception:
+        pass  # Ignore errors in sync check
+    
+    # Make a copy of the image for thread safety
+    try:
+        from PIL import Image
+        avatar_copy = avatar_image.copy()
+    except Exception:
+        logger.warning("Failed to copy avatar image for face caching")
+        return
+    
+    # Launch background thread to detect and cache face
+    thread = threading.Thread(
+        target=_cache_character_face_background,
+        args=(character_dir, variant_dir, avatar_copy, git_repo_root),
+        daemon=True,
+        name=f"face-cache-{character_dir.name}-{variant_dir.name}",
+    )
+    thread.start()
+    logger.debug("Launched background thread to cache face for %s/%s", character_dir.name, variant_dir.name)
+
+
 def _compose_game_avatar_uncached(
     character_name: str,
     pose_override: Optional[str] = None,
@@ -1346,6 +1733,9 @@ def _compose_game_avatar_uncached(
         limit = min(sprite_height_limit, outfit_image.height)
         if limit > 0 and limit < outfit_image.height:
             outfit_image = outfit_image.crop((0, 0, outfit_image.width, limit))
+
+    # Cache detected face if not already cached
+    _cache_character_face(character_dir, variant_dir, outfit_image)
 
     if VN_CACHE_DIR and cache_file:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
