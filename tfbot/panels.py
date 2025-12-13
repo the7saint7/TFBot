@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import queue
 import random
 import re
 import shutil
@@ -16,7 +17,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import aiohttp
 import discord
@@ -161,6 +162,157 @@ if _FACE_MODEL_PATH_SETTING:
         FACE_MODEL_PATH = _face_model_path.resolve()
 else:
     FACE_MODEL_PATH = (BASE_DIR / "model" / "ssd_anime_face_detect.pth").resolve()
+
+_FACE_GIT_BATCH_WINDOW = max(0.0, float_from_env("TFBOT_FACE_GIT_BATCH_WINDOW", 1.0))
+_FACE_GIT_WORKER: Optional[threading.Thread] = None
+_FACE_GIT_WORKER_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class FaceGitOperation:
+    git_repo_root: Path
+    cache_file: Path
+    character_name: str
+    variant_name: str
+
+
+_FACE_GIT_QUEUE: "queue.Queue[FaceGitOperation]" = queue.Queue()
+
+
+def _ensure_face_git_worker() -> None:
+    """Start the git worker thread if it is not already running."""
+    global _FACE_GIT_WORKER
+    with _FACE_GIT_WORKER_LOCK:
+        if _FACE_GIT_WORKER and _FACE_GIT_WORKER.is_alive():
+            return
+        _FACE_GIT_WORKER = threading.Thread(
+            target=_face_git_worker_loop,
+            name="face-git-worker",
+            daemon=True,
+        )
+        _FACE_GIT_WORKER.start()
+
+
+def _enqueue_face_git_operation(
+    git_repo_root: Path,
+    cache_file: Path,
+    character_name: str,
+    variant_name: str,
+) -> None:
+    """Queue a git add/commit/push operation for a cached face file."""
+    if not git_repo_root.exists():
+        return
+    _ensure_face_git_worker()
+    _FACE_GIT_QUEUE.put(
+        FaceGitOperation(
+            git_repo_root=git_repo_root,
+            cache_file=cache_file,
+            character_name=character_name,
+            variant_name=variant_name,
+        )
+    )
+
+
+def _face_git_worker_loop() -> None:
+    """Worker loop that batches git operations to avoid concurrent pushes."""
+    batch: List[FaceGitOperation] = []
+    while True:
+        operation = _FACE_GIT_QUEUE.get()
+        batch.append(operation)
+        if _FACE_GIT_BATCH_WINDOW > 0:
+            while True:
+                try:
+                    next_op = _FACE_GIT_QUEUE.get(timeout=_FACE_GIT_BATCH_WINDOW)
+                    batch.append(next_op)
+                except queue.Empty:
+                    break
+        try:
+            _process_face_git_batch(batch)
+        finally:
+            for _ in batch:
+                _FACE_GIT_QUEUE.task_done()
+            batch.clear()
+
+
+def _process_face_git_batch(batch: Sequence[FaceGitOperation]) -> None:
+    """Run git operations for all queued face caches."""
+    if not batch:
+        return
+    git_executable = shutil.which("git")
+    if not git_executable:
+        logger.debug("git executable not found; skipping %d face git operations", len(batch))
+        return
+
+    ops_by_repo: Dict[Path, List[FaceGitOperation]] = {}
+    for operation in batch:
+        if not operation.git_repo_root.exists():
+            logger.debug("characters repo missing for git operation: %s", operation.git_repo_root)
+            continue
+        ops_by_repo.setdefault(operation.git_repo_root, []).append(operation)
+
+    for repo_root, operations in ops_by_repo.items():
+        try:
+            _run_face_git_batch_for_repo(git_executable, repo_root, operations)
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "Git operation failed for face cache batch in %s: %s",
+                repo_root,
+                exc.stderr.strip() or exc.stdout.strip() or str(exc),
+            )
+        except Exception as exc:
+            logger.warning("Unexpected error processing face git batch for %s: %s", repo_root, exc, exc_info=True)
+
+
+def _run_face_git_batch_for_repo(
+    git_executable: str,
+    repo_root: Path,
+    operations: Sequence[FaceGitOperation],
+) -> None:
+    """Stage, commit, and push the queued face cache changes for a repository."""
+    staged: List[Tuple[FaceGitOperation, Path]] = []
+    seen_paths: Set[Path] = set()
+    for operation in operations:
+        if not operation.cache_file.exists():
+            logger.debug("Skipping missing face cache file %s", operation.cache_file)
+            continue
+        try:
+            rel_path = operation.cache_file.relative_to(repo_root)
+        except ValueError:
+            logger.debug("Cache file %s not inside repo %s", operation.cache_file, repo_root)
+            continue
+        if rel_path in seen_paths:
+            continue
+        seen_paths.add(rel_path)
+        staged.append((operation, rel_path))
+
+    if not staged:
+        return
+
+    for _, rel_path in staged:
+        cmd = [git_executable, "-C", str(repo_root), "add", str(rel_path)]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    if len(staged) == 1:
+        op = staged[0][0]
+        commit_msg = f"Add face cache for {op.character_name}/{op.variant_name}"
+    else:
+        descriptors = ", ".join(f"{op.character_name}/{op.variant_name}" for op, _ in staged[:5])
+        if len(staged) > 5:
+            descriptors = f"{descriptors} +{len(staged) - 5} more"
+        commit_msg = f"Add face caches for {descriptors}"
+
+    cmd = [git_executable, "-C", str(repo_root), "commit", "-m", commit_msg]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    cmd = [git_executable, "-C", str(repo_root), "push"]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    logger.info(
+        "Pushed %d face cache change(s) to remote for %s",
+        len(staged),
+        repo_root,
+    )
+
 
 VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
 _VN_LAYOUT_FILE_SETTING = os.getenv("TFBOT_VN_LAYOUTS", "vn_layouts.json").strip()
@@ -1447,46 +1599,15 @@ def _cache_character_face_background(
             logger.warning("Failed to cache face for %s/%s: %s", character_dir.name, variant_dir.name, exc)
             return
         
-        # Git operations if in git repo
+        # Git operations if in git repo (queued to avoid concurrent pushes)
         if git_repo_root and git_repo_root.exists():
-            git_executable = shutil.which("git")
-            if git_executable:
-                try:
-                    # Get relative path from repo root
-                    rel_path = cache_file.relative_to(git_repo_root)
-                    
-                    # Stage the file
-                    cmd = [git_executable, "-C", str(git_repo_root), "add", str(rel_path)]
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    logger.debug("Staged face file: %s", rel_path)
-                    
-                    # Commit with message
-                    commit_msg = f"Add face cache for {character_dir.name}/{variant_dir.name}"
-                    cmd = [git_executable, "-C", str(git_repo_root), "commit", "-m", commit_msg]
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    logger.info("Committed face cache: %s", commit_msg)
-                    
-                    # Push to remote
-                    cmd = [git_executable, "-C", str(git_repo_root), "push"]
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    logger.info("Pushed face cache to remote for %s/%s", character_dir.name, variant_dir.name)
-                    
-                except subprocess.CalledProcessError as exc:
-                    logger.warning(
-                        "Git operation failed for face cache %s/%s: %s",
-                        character_dir.name,
-                        variant_dir.name,
-                        exc.stderr.strip() or exc.stdout.strip() or str(exc),
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Error in git operations for face cache %s/%s: %s",
-                        character_dir.name,
-                        variant_dir.name,
-                        exc,
-                        exc_info=True,
-                    )
-            
+            _enqueue_face_git_operation(
+                git_repo_root=git_repo_root,
+                cache_file=cache_file,
+                character_name=character_dir.name,
+                variant_name=variant_dir.name,
+            )
+
     except ImportError:
         logger.debug("Face detection not available (missing dependencies)")
     except Exception as exc:

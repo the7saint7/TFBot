@@ -1139,10 +1139,22 @@ def _resolve_accessory_key_input(accessory_name: str, accessories: Mapping[str, 
 
 
 def _selection_scope_for_channel(channel: Optional[discord.abc.GuildChannel]) -> Optional[str]:
-    if ROLEPLAY_COG is None or channel is None:
+    """Get selection scope for a channel. Returns scope string that includes guild ID for isolation."""
+    if channel is None:
         return None
-    if ROLEPLAY_COG.is_roleplay_post(channel):
+    
+    guild_id = channel.guild.id if hasattr(channel, 'guild') and channel.guild else None
+    
+    # Check for roleplay post first
+    if ROLEPLAY_COG is not None and ROLEPLAY_COG.is_roleplay_post(channel):
+        if guild_id:
+            return f"rp:{guild_id}"
         return "rp"
+    
+    # For regular channels, include guild ID to isolate instances
+    if guild_id:
+        return f"guild:{guild_id}"
+    
     return None
 
 
@@ -1593,6 +1605,48 @@ if GACHA_ENABLED:
         relay_fn=relay_transformed_message,
     )
 
+# Help command function - defined before registration
+async def prefix_help_game_command(ctx: commands.Context, *, command: Optional[str] = None) -> None:
+    """Show available player commands - game version, gacha, or default help."""
+    # Check if this is a game thread first
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await GAME_BOARD_MANAGER.command_help(ctx)
+        return
+    
+    # Check if we're in gacha channel and gacha is enabled
+    if GACHA_MANAGER and isinstance(ctx.channel, discord.TextChannel) and ctx.channel.id == GACHA_MANAGER.channel_id:
+        await GACHA_MANAGER.command_help(ctx)
+        return
+    
+    # Fall back to default help command system
+    if bot.help_command:
+        bot.help_command.context = ctx
+        try:
+            if command:
+                cmd = bot.get_command(command)
+                if cmd:
+                    await bot.help_command.send_command_help(cmd)
+                else:
+                    await bot.help_command.send_error_message(f"Command '{command}' not found.")
+            else:
+                await bot.help_command.send_bot_help(bot.cogs)
+        finally:
+            bot.help_command.context = None
+
+# Register help command conditionally (after gacha registers its commands)
+# Our help command handles game threads, gacha channels, and default help
+def _register_help_command():
+    """Register unified help command that handles game threads, gacha, and default help."""
+    # Remove any existing help command (from gacha or default)
+    existing_help = bot.get_command("help")
+    if existing_help:
+        bot.remove_command(existing_help.name)
+    
+    # Register our unified help command
+    help_cmd = commands.command(name="help")(prefix_help_game_command)
+    help_cmd = commands.guild_only()(help_cmd)
+    bot.add_command(help_cmd)
+
 if GAME_BOARD_ENABLED:
     from tfbot.games import GameBoardManager
 
@@ -1601,6 +1655,11 @@ if GAME_BOARD_ENABLED:
         config_path=GAME_CONFIG_FILE,
         assets_dir=GAME_ASSETS_DIR,
     )
+
+# Register help command after gacha (if enabled) has registered its commands
+# This ensures our unified help command replaces any existing help command
+_register_help_command()
+
 async def send_history_message(title: str, description: str) -> None:
     channel = bot.get_channel(current_history_channel_id())
     if channel is None:
@@ -2020,6 +2079,17 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
+    
+    # Check if this is a game thread - if so, apply game-specific restrictions
+    game_state = None
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        game_state = GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
+        if game_state:
+            # In game threads, only GM can reroll
+            if not GAME_BOARD_MANAGER._is_gm(author, game_state):
+                await ctx.reply("Only the GM can reroll characters in game threads.", mention_author=False)
+                return None
+    
     roleplay_dm_override = (
         ROLEPLAY_COG is not None
         and ROLEPLAY_COG.is_roleplay_post(ctx.channel)
@@ -2468,30 +2538,41 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 response_text = (
                     f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
                 )
-        special_hint = _format_special_reroll_hint(new_name, new_folder)
-        if special_hint:
-            response_text = f"{response_text}\n{special_hint}"
-        emoji_prefix = _get_magic_emoji(guild)
-        try:
-            await ctx.channel.send(
-                f"{emoji_prefix} {response_text}",
-                allowed_mentions=discord.AllowedMentions(users=[target_member]),
+        # Suppress messages if this is a bulk reroll (from rerollall)
+        suppress_messages = getattr(ctx, "_suppress_reroll_messages", False)
+        
+        if not suppress_messages:
+            special_hint = _format_special_reroll_hint(new_name, new_folder)
+            if special_hint:
+                response_text = f"{response_text}\n{special_hint}"
+            emoji_prefix = _get_magic_emoji(guild)
+            try:
+                await ctx.channel.send(
+                    f"{emoji_prefix} {response_text}",
+                    allowed_mentions=discord.AllowedMentions(users=[target_member]),
+                )
+            except discord.HTTPException as exc:
+                logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
+
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
+
+            summary_message = f"{target_member.display_name} has been rerolled into **{new_name}**."
+            if forced_mode:
+                summary_message += f" ({TFBOT_NAME} insisted on this one.)"
+            await ctx.send(
+                summary_message,
+                delete_after=10,
             )
-        except discord.HTTPException as exc:
-            logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
-
-        try:
-            await ctx.message.delete()
-        except discord.HTTPException:
-            pass
-
-        summary_message = f"{target_member.display_name} has been rerolled into **{new_name}**."
-        if forced_mode:
-            summary_message += f" ({TFBOT_NAME} insisted on this one.)"
-        await ctx.send(
-            summary_message,
-            delete_after=10,
-        )
+        
+        # Sync game state after reroll completes (if in game thread)
+        if game_state and target_member and ctx.guild and GAME_BOARD_MANAGER:
+            if target_member.id in game_state.players:
+                game_state.players[target_member.id].character_name = new_name
+                await GAME_BOARD_MANAGER._save_game_state(game_state)
+                await GAME_BOARD_MANAGER._log_action(game_state, f"{target_member.display_name} character rerolled to {new_name}")
     finally:
         cleanup_placeholder()
 
@@ -2528,16 +2609,29 @@ async def slash_rerollall_command(interaction: discord.Interaction) -> None:
         await interaction.followup.send("Only admins can use this command.", ephemeral=True)
         return
     await ensure_state_restored()
+    
+    # Get members who can view this channel (those "in" the channel)
+    channel_member_ids = set()
+    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+        for member in interaction.guild.members:
+            if interaction.channel.permissions_for(member).view_channel:
+                channel_member_ids.add(member.id)
+    
+    rerolled_count = 0
+    # Set flag to suppress individual reroll messages
     for (guild_id, user_id), state in active_transformations.items():
-        if guild_id == interaction.guild.id:
+        if guild_id == interaction.guild.id and user_id in channel_member_ids:
             member = interaction.guild.get_member(user_id)
             if member:
                 ctx = InteractionContextAdapter(interaction, bot=bot)
                 ctx._slash_target_member = member
                 ctx._slash_target_folder = None
                 ctx._slash_force_folder = None
+                ctx._suppress_reroll_messages = True
                 await reroll_command(ctx, args="")
-    await interaction.followup.send("Rerolled all members.", ephemeral=True)
+                rerolled_count += 1
+    
+    await interaction.followup.send("Rerolled Everyone", ephemeral=False)
 
 
 @bot.tree.command(name="rerollnonadmin", description="Reroll everyone that's not admin (admin only).")
@@ -2548,16 +2642,29 @@ async def slash_rerollnonadmin_command(interaction: discord.Interaction) -> None
         await interaction.followup.send("Only admins can use this command.", ephemeral=True)
         return
     await ensure_state_restored()
+    
+    # Get members who can view this channel (those "in" the channel)
+    channel_member_ids = set()
+    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+        for member in interaction.guild.members:
+            if interaction.channel.permissions_for(member).view_channel:
+                channel_member_ids.add(member.id)
+    
+    rerolled_count = 0
+    # Set flag to suppress individual reroll messages
     for (guild_id, user_id), state in active_transformations.items():
-        if guild_id == interaction.guild.id:
+        if guild_id == interaction.guild.id and user_id in channel_member_ids:
             member = interaction.guild.get_member(user_id)
             if member and not is_admin(member):
                 ctx = InteractionContextAdapter(interaction, bot=bot)
                 ctx._slash_target_member = member
                 ctx._slash_target_folder = None
                 ctx._slash_force_folder = None
+                ctx._suppress_reroll_messages = True
                 await reroll_command(ctx, args="")
-    await interaction.followup.send("Rerolled all non-admin members.", ephemeral=True)
+                rerolled_count += 1
+    
+    await interaction.followup.send(f"Rerolled {rerolled_count} non-admin member(s) in this channel.", ephemeral=False)
 
 
 @bot.tree.command(name="dm", description="Show or assign the RP DM (use inside the RP forum thread).")
@@ -4001,6 +4108,17 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
+    
+    # Check if this is a game thread - if so, apply game-specific restrictions
+    game_state = None
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        game_state = GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
+        if game_state:
+            # In game threads, only GM can reroll
+            if not GAME_BOARD_MANAGER._is_gm(author, game_state):
+                await ctx.reply("Only the GM can reroll characters in game threads.", mention_author=False)
+                return None
+    
     author_is_admin = is_admin(author)
 
     guild = ctx.guild
@@ -4421,6 +4539,13 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
         summary_message,
         delete_after=10,
     )
+    
+    # Sync game state after reroll completes (if in game thread)
+    if game_state and target_member and ctx.guild and GAME_BOARD_MANAGER:
+        if target_member.id in game_state.players:
+            game_state.players[target_member.id].character_name = new_name
+            await GAME_BOARD_MANAGER._save_game_state(game_state)
+            await GAME_BOARD_MANAGER._log_action(game_state, f"{target_member.display_name} character rerolled to {new_name}")
 
 
 @bot.command(name="tf", aliases=["TF"])
@@ -4571,12 +4696,30 @@ async def prefix_rerollall_command(ctx: commands.Context) -> None:
         await ctx.reply("Only admins can use this command.", mention_author=False)
         return
     await ensure_state_restored()
-    for (guild_id, user_id), state in active_transformations.items():
-        if guild_id == ctx.guild.id:
-            member = ctx.guild.get_member(user_id)
-            if member:
-                await reroll_command(ctx, args=member.mention)
-    await ctx.reply("Rerolled all members.", mention_author=False)
+    
+    # Get members who can view this channel (those "in" the channel)
+    channel_member_ids = set()
+    if isinstance(ctx.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+        for member in ctx.guild.members:
+            if ctx.channel.permissions_for(member).view_channel:
+                channel_member_ids.add(member.id)
+    
+    rerolled_count = 0
+    # Set flag to suppress individual reroll messages
+    ctx._suppress_reroll_messages = True
+    try:
+        for (guild_id, user_id), state in active_transformations.items():
+            if guild_id == ctx.guild.id and user_id in channel_member_ids:
+                member = ctx.guild.get_member(user_id)
+                if member:
+                    await reroll_command(ctx, args=member.mention)
+                    rerolled_count += 1
+    finally:
+        # Clean up the flag
+        if hasattr(ctx, "_suppress_reroll_messages"):
+            del ctx._suppress_reroll_messages
+    
+    await ctx.reply("Rerolled Everyone", mention_author=False)
 
 
 @bot.command(name="rerollnonadmin")
@@ -4586,12 +4729,30 @@ async def prefix_rerollnonadmin_command(ctx: commands.Context) -> None:
         await ctx.reply("Only admins can use this command.", mention_author=False)
         return
     await ensure_state_restored()
-    for (guild_id, user_id), state in active_transformations.items():
-        if guild_id == ctx.guild.id:
-            member = ctx.guild.get_member(user_id)
-            if member and not is_admin(member):
-                await reroll_command(ctx, args=member.mention)
-    await ctx.reply("Rerolled all non-admin members.", mention_author=False)
+    
+    # Get members who can view this channel (those "in" the channel)
+    channel_member_ids = set()
+    if isinstance(ctx.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+        for member in ctx.guild.members:
+            if ctx.channel.permissions_for(member).view_channel:
+                channel_member_ids.add(member.id)
+    
+    rerolled_count = 0
+    # Set flag to suppress individual reroll messages
+    ctx._suppress_reroll_messages = True
+    try:
+        for (guild_id, user_id), state in active_transformations.items():
+            if guild_id == ctx.guild.id and user_id in channel_member_ids:
+                member = ctx.guild.get_member(user_id)
+                if member and not is_admin(member):
+                    await reroll_command(ctx, args=member.mention)
+                    rerolled_count += 1
+    finally:
+        # Clean up the flag
+        if hasattr(ctx, "_suppress_reroll_messages"):
+            del ctx._suppress_reroll_messages
+    
+    await ctx.reply(f"Rerolled {rerolled_count} non-admin member(s) in this channel.", mention_author=False)
 
 
 # Game Board Commands
@@ -4643,60 +4804,252 @@ async def prefix_assign_command(ctx: commands.Context, member: Optional[discord.
         await GAME_BOARD_MANAGER.command_assign(ctx, member=member, character_name=character_name)
 
 
-@bot.command(name="reroll")
-@commands.guild_only()
-async def prefix_reroll_game_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-    """Reroll a player's character - uses existing reroll logic, with GM-only restriction in game threads."""
-    # Check if this is a game thread first
-    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        # In game threads, only GM can reroll
-        game_state = GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
-        if game_state:
-            if not GAME_BOARD_MANAGER._is_gm(ctx.author, game_state):
-                await ctx.reply("Only the GM can reroll characters in game threads.", mention_author=False)
-                return
-            
-            if not member:
-                await ctx.reply("Usage: `!reroll @user`", mention_author=False)
-                return
-            
-            if member.id not in game_state.players:
-                await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
-                return
-        
-        # Call the existing reroll_command with member mention
-        args_str = member.mention if member else ""
-        old_state = find_active_transformation(member.id, ctx.guild.id) if member and ctx.guild else None
-        old_character = old_state.character_name if old_state else None
-        
-        # Call existing reroll function
-        await reroll_command(ctx, args=args_str)
-        
-        # Sync game state after reroll completes
-        if game_state and member and ctx.guild:
-            new_state = find_active_transformation(member.id, ctx.guild.id)
-            if new_state and new_state.character_name:
-                # Update game state with new character
-                game_state.players[member.id].character_name = new_state.character_name
-                await GAME_BOARD_MANAGER._save_game_state(game_state)
-                await GAME_BOARD_MANAGER._log_action(game_state, f"{member.display_name} character rerolled to {new_state.character_name}")
-        return
-    
-    # Otherwise fall through to normal reroll command (handled by existing reroll_command)
-    # Parse member from args if not provided
-    if not member:
-        # Try to parse from args if reroll_command expects it
-        await reroll_command(ctx, args="")
-    else:
-        await reroll_command(ctx, args=member.mention)
-
-
 @bot.command(name="swap")
 @commands.guild_only()
-async def prefix_swap_command(ctx: commands.Context, member1: Optional[discord.Member] = None, member2: Optional[discord.Member] = None) -> None:
-    """Swap characters between two players (GM only)."""
-    if GAME_BOARD_MANAGER:
-        await GAME_BOARD_MANAGER.command_swap(ctx, member1=member1, member2=member2)
+async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
+    """Swap characters between two players or characters.
+    
+    Usage: !swap character1 character2
+    Or: !swap @user1 @user2
+    """
+    await ensure_state_restored()
+    
+    # Check if this is a game thread - if so, delegate to gameboard manager
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        # Parse arguments for gameboard mode (expects @user1 @user2)
+        tokens = [token for token in args.split() if token.strip()]
+        member1 = None
+        member2 = None
+        
+        if tokens:
+            user_id1 = _extract_user_id_from_token(tokens[0])
+            if user_id1 and ctx.guild:
+                member1 = ctx.guild.get_member(user_id1)
+        if len(tokens) > 1:
+            user_id2 = _extract_user_id_from_token(tokens[1])
+            if user_id2 and ctx.guild:
+                member2 = ctx.guild.get_member(user_id2)
+        
+        if member1 and member2:
+            await GAME_BOARD_MANAGER.command_swap(ctx, member1=member1, member2=member2)
+        else:
+            await ctx.reply("Usage: `!swap @user1 @user2`", mention_author=False)
+        return
+    
+    # Normal VN mode swap - swap transformations between two characters/users
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    
+    # Check permission: admin, ball, or narrator only
+    author_is_admin = is_admin(ctx.author)
+    author_state = find_active_transformation(ctx.author.id, ctx.guild.id)
+    author_has_special_access = _has_special_reroll_access(author_state)
+    
+    if not author_is_admin and not author_has_special_access:
+        await ctx.reply("Only admins, Ball, or Narrator can use this command.", mention_author=False)
+        return
+    
+    tokens = [token for token in args.split() if token.strip()]
+    if len(tokens) < 2:
+        await ctx.reply("Usage: `!swap character1 character2` or `!swap @user1 @user2`", mention_author=False)
+        return
+    
+    token1 = tokens[0]
+    token2 = tokens[1]
+    
+    # Find state1 - can be by character name/folder or user mention
+    state1 = None
+    user1_id = None
+    if ctx.guild:
+        user_id1 = _extract_user_id_from_token(token1)
+        if user_id1:
+            # Token is a user mention
+            state1 = active_transformations.get(state_key(ctx.guild.id, user_id1))
+            user1_id = user_id1
+        else:
+            # Token is a character name/folder
+            state1 = _find_state_by_folder(ctx.guild, token1)
+            if state1:
+                user1_id = state1.user_id
+    
+    # Find state2 - can be by character name/folder or user mention
+    state2 = None
+    user2_id = None
+    if ctx.guild:
+        user_id2 = _extract_user_id_from_token(token2)
+        if user_id2:
+            # Token is a user mention
+            state2 = active_transformations.get(state_key(ctx.guild.id, user_id2))
+            user2_id = user_id2
+        else:
+            # Token is a character name/folder
+            state2 = _find_state_by_folder(ctx.guild, token2)
+            if state2:
+                user2_id = state2.user_id
+    
+    if not state1 or not state2:
+        await ctx.reply("Could not find both active transformations. Both characters/users must be currently transformed.", mention_author=False)
+        return
+    
+    if not user1_id or not user2_id:
+        await ctx.reply("Could not determine users for swap.", mention_author=False)
+        return
+    
+    if user1_id == user2_id:
+        await ctx.reply("Cannot swap a character with itself.", mention_author=False)
+        return
+    
+    # Get members for display
+    member1 = ctx.guild.get_member(user1_id)
+    member2 = ctx.guild.get_member(user2_id)
+    
+    if not member1 or not member2:
+        await ctx.reply("Could not find both members.", mention_author=False)
+        return
+    
+    # Swap character data between the two states
+    # Keep user-specific fields (user_id, guild_id, started_at, expires_at, original_nick, original_display_name, avatar_applied)
+    # Swap character-specific fields (character_name, character_folder, character_avatar_path, character_message, is_inanimate, inanimate_responses)
+    
+    char1_name = state1.character_name
+    char1_folder = state1.character_folder
+    char1_avatar = state1.character_avatar_path
+    char1_message = state1.character_message
+    char1_inanimate = state1.is_inanimate
+    char1_responses = state1.inanimate_responses
+    
+    char2_name = state2.character_name
+    char2_folder = state2.character_folder
+    char2_avatar = state2.character_avatar_path
+    char2_message = state2.character_message
+    char2_inanimate = state2.is_inanimate
+    char2_responses = state2.inanimate_responses
+    
+    # Create new states with swapped character data
+    new_state1 = TransformationState(
+        user_id=user1_id,
+        guild_id=state1.guild_id,
+        character_name=char2_name,
+        character_folder=char2_folder,
+        character_avatar_path=char2_avatar,
+        character_message=char2_message,
+        original_nick=state1.original_nick,
+        started_at=state1.started_at,
+        expires_at=state1.expires_at,
+        duration_label=state1.duration_label,
+        avatar_applied=state1.avatar_applied,
+        original_display_name=state1.original_display_name,
+        is_inanimate=char2_inanimate,
+        inanimate_responses=char2_responses,
+    )
+    
+    new_state2 = TransformationState(
+        user_id=user2_id,
+        guild_id=state2.guild_id,
+        character_name=char1_name,
+        character_folder=char1_folder,
+        character_avatar_path=char1_avatar,
+        character_message=char1_message,
+        original_nick=state2.original_nick,
+        started_at=state2.started_at,
+        expires_at=state2.expires_at,
+        duration_label=state2.duration_label,
+        avatar_applied=state2.avatar_applied,
+        original_display_name=state2.original_display_name,
+        is_inanimate=char1_inanimate,
+        inanimate_responses=char1_responses,
+    )
+    
+    # Update active_transformations
+    key1 = state_key(ctx.guild.id, user1_id)
+    key2 = state_key(ctx.guild.id, user2_id)
+    active_transformations[key1] = new_state1
+    active_transformations[key2] = new_state2
+    
+    # Update revert tasks if they exist
+    if key1 in revert_tasks:
+        # Cancel old task
+        revert_tasks[key1].cancel()
+        # Create new task with same expiration
+        delay1 = max((new_state1.expires_at - utc_now()).total_seconds(), 0)
+        revert_tasks[key1] = asyncio.create_task(_schedule_revert(new_state1, delay1))
+    
+    if key2 in revert_tasks:
+        # Cancel old task
+        revert_tasks[key2].cancel()
+        # Create new task with same expiration
+        delay2 = max((new_state2.expires_at - utc_now()).total_seconds(), 0)
+        revert_tasks[key2] = asyncio.create_task(_schedule_revert(new_state2, delay2))
+    
+    # Persist states
+    persist_states()
+    
+    # Send confirmation message
+    author_name = ctx.author.display_name
+    character1_name = member1.display_name
+    character2_name = member2.display_name
+    
+    await ctx.reply(
+        f"Thanks to {author_name}, {character1_name} swapped bodies with {character2_name}.",
+        mention_author=False,
+    )
+
+
+@bot.tree.command(name="swap", description="Swap characters between two players or characters (admin, ball, or narrator only).")
+@app_commands.describe(
+    character1="First character/user to swap (character name or @mention).",
+    character2="Second character/user to swap (character name or @mention).",
+)
+@app_commands.guild_only()
+async def slash_swap_command(
+    interaction: discord.Interaction,
+    character1: str,
+    character2: str,
+) -> None:
+    """Swap characters between two players or characters."""
+    await interaction.response.defer(thinking=True)
+    
+    # Check if this is a game thread - if so, delegate to gameboard manager
+    if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
+        # For gameboard mode, we expect user mentions
+        if not interaction.guild:
+            await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+            return
+        
+        user_id1 = _extract_user_id_from_token(character1)
+        user_id2 = _extract_user_id_from_token(character2)
+        
+        if not user_id1 or not user_id2:
+            await interaction.followup.send("Usage: `/swap @user1 @user2`", ephemeral=True)
+            return
+        
+        member1 = interaction.guild.get_member(user_id1)
+        member2 = interaction.guild.get_member(user_id2)
+        
+        if member1 and member2:
+            ctx = InteractionContextAdapter(interaction, bot=bot)
+            await GAME_BOARD_MANAGER.command_swap(ctx, member1=member1, member2=member2)
+        else:
+            await interaction.followup.send("Could not find both members.", ephemeral=True)
+        return
+    
+    # Normal VN mode - use the prefix command logic
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    
+    # Check permission: admin, ball, or narrator only
+    author_is_admin = is_admin(interaction.user)
+    author_state = find_active_transformation(interaction.user.id, interaction.guild.id)
+    author_has_special_access = _has_special_reroll_access(author_state)
+    
+    if not author_is_admin and not author_has_special_access:
+        await interaction.followup.send("Only admins, Ball, or Narrator can use this command.", ephemeral=True)
+        return
+    
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    await prefix_swap_command(ctx, args=f"{character1} {character2}")
 
 
 @bot.command(name="movetoken")
@@ -4723,15 +5076,6 @@ async def prefix_rules_command(ctx: commands.Context) -> None:
         await GAME_BOARD_MANAGER.command_rules(ctx)
 
 
-@bot.command(name="help")
-@commands.guild_only()
-async def prefix_help_game_command(ctx: commands.Context) -> None:
-    """Show available player commands - game version."""
-    # Check if this is a game thread first
-    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        await GAME_BOARD_MANAGER.command_help(ctx)
-        return
-    # Otherwise fall through to normal help command
 
 
 @bot.command(name="savegame")
