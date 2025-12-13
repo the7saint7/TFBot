@@ -78,24 +78,12 @@ VN_BACKGROUND_DEFAULT_RELATIVE = Path(_VN_BG_DEFAULT_SETTING) if _VN_BG_DEFAULT_
 
 if _VN_BG_ROOT_SETTING:
     candidate_bg_root = Path(_VN_BG_ROOT_SETTING).expanduser()
-    VN_BACKGROUND_ROOT = candidate_bg_root if candidate_bg_root.exists() else None
+    VN_BACKGROUND_ROOT = candidate_bg_root.resolve() if candidate_bg_root.exists() else None
 elif VN_GAME_ROOT:
     candidate_bg_root = VN_GAME_ROOT / "game" / "images" / "bg"
-    VN_BACKGROUND_ROOT = candidate_bg_root if candidate_bg_root.exists() else None
+    VN_BACKGROUND_ROOT = candidate_bg_root.resolve() if candidate_bg_root.exists() else None
 else:
     VN_BACKGROUND_ROOT = None
-
-if VN_BACKGROUND_ROOT and VN_BACKGROUND_DEFAULT_RELATIVE:
-    VN_BACKGROUND_DEFAULT_PATH = (VN_BACKGROUND_ROOT / VN_BACKGROUND_DEFAULT_RELATIVE).resolve()
-    if not VN_BACKGROUND_DEFAULT_PATH.exists():
-        logger.warning(
-            "VN background: default background %s does not exist under %s",
-            VN_BACKGROUND_DEFAULT_RELATIVE,
-            VN_BACKGROUND_ROOT,
-        )
-        VN_BACKGROUND_DEFAULT_PATH = None
-else:
-    VN_BACKGROUND_DEFAULT_PATH = None
 
 _BG_SELECTION_FILE_SETTING = os.getenv("TFBOT_VN_BG_SELECTIONS", "tf_backgrounds.json").strip()
 VN_BACKGROUND_SELECTION_FILE = (
@@ -146,6 +134,41 @@ def _get_face_cache_dir() -> Optional[Path]:
         # Place faces folder at the same level as characters folder in git repo
         return characters_repo_root / "faces"
     return None
+
+
+def _get_background_root() -> Optional[Path]:
+    """Return the preferred background root, preferring characters_repo/bg when available."""
+    git_repo_root = _resolve_git_repo_root()
+    if git_repo_root:
+        repo_bg_root = (git_repo_root / "bg").resolve()
+        if repo_bg_root.exists():
+            return repo_bg_root
+    if VN_BACKGROUND_ROOT and VN_BACKGROUND_ROOT.exists():
+        return VN_BACKGROUND_ROOT.resolve()
+    return None
+
+
+@lru_cache(maxsize=4)
+def _compute_default_background_path(root_str: Optional[str]) -> Optional[Path]:
+    if root_str is None or VN_BACKGROUND_DEFAULT_RELATIVE is None:
+        return None
+    root = Path(root_str)
+    candidate = (root / VN_BACKGROUND_DEFAULT_RELATIVE).resolve()
+    if candidate.exists():
+        return candidate
+    logger.warning(
+        "VN background: default background %s does not exist under %s",
+        VN_BACKGROUND_DEFAULT_RELATIVE,
+        root,
+    )
+    return None
+
+
+def _get_background_default_path() -> Optional[Path]:
+    background_root = _get_background_root()
+    root_str = str(background_root.resolve()) if background_root else None
+    return _compute_default_background_path(root_str)
+
 
 # Face cache directory is resolved dynamically via _get_face_cache_dir()
 
@@ -429,6 +452,7 @@ vn_outfit_selection: Dict[str, Dict[str, object]] = {}
 background_selections: Dict[str, str] = {}
 _vn_config_cache: Dict[str, Dict] = {}
 _VN_BACKGROUND_IMAGES: list[Path] = []
+_VN_BACKGROUND_IMAGES_ROOT: Optional[Path] = None
 
 @lru_cache(maxsize=1)
 def _get_overlay_assets() -> Dict[str, "Image.Image"]:
@@ -592,29 +616,34 @@ background_selections = load_background_selections()
 
 
 def _relative_background_path(path: Path) -> Optional[str]:
-    if VN_BACKGROUND_ROOT is None:
+    background_root = _get_background_root()
+    if background_root is None:
         return None
     try:
-        relative = path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
+        relative = path.resolve().relative_to(background_root.resolve())
     except ValueError:
         return None
     return relative.as_posix()
 
 
 def _load_background_images() -> Sequence[Path]:
-    global _VN_BACKGROUND_IMAGES
-    if _VN_BACKGROUND_IMAGES:
-        return _VN_BACKGROUND_IMAGES
-    if VN_BACKGROUND_ROOT and VN_BACKGROUND_ROOT.exists():
+    global _VN_BACKGROUND_IMAGES, _VN_BACKGROUND_IMAGES_ROOT
+    background_root = _get_background_root()
+    if background_root and background_root.exists():
+        if _VN_BACKGROUND_IMAGES and _VN_BACKGROUND_IMAGES_ROOT == background_root:
+            return _VN_BACKGROUND_IMAGES
         try:
             _VN_BACKGROUND_IMAGES = sorted(
-                path for path in VN_BACKGROUND_ROOT.rglob("*.png") if path.is_file()
+                path for path in background_root.rglob("*.png") if path.is_file()
             )
+            _VN_BACKGROUND_IMAGES_ROOT = background_root
         except OSError as exc:
-            logger.warning("VN background: failed to scan directory %s: %s", VN_BACKGROUND_ROOT, exc)
+            logger.warning("VN background: failed to scan directory %s: %s", background_root, exc)
             _VN_BACKGROUND_IMAGES = []
+            _VN_BACKGROUND_IMAGES_ROOT = None
     else:
         _VN_BACKGROUND_IMAGES = []
+        _VN_BACKGROUND_IMAGES_ROOT = None
     return _VN_BACKGROUND_IMAGES
 
 
@@ -623,19 +652,21 @@ def list_background_choices() -> Sequence[Path]:
 
 
 def get_selected_background_path(user_id: int) -> Optional[Path]:
-    if VN_BACKGROUND_ROOT is None:
+    background_root = _get_background_root()
+    if background_root is None:
         return None
     key = str(user_id)
     selected = background_selections.get(key)
     if selected:
-        candidate = (VN_BACKGROUND_ROOT / selected).resolve()
+        candidate = (background_root / selected).resolve()
         if candidate.exists():
             return candidate
         logger.warning("VN background: stored selection %s missing for user %s", selected, user_id)
         background_selections.pop(key, None)
         persist_background_selections()
-    if VN_BACKGROUND_DEFAULT_PATH and VN_BACKGROUND_DEFAULT_PATH.exists():
-        return VN_BACKGROUND_DEFAULT_PATH
+    default_path = _get_background_default_path()
+    if default_path and default_path.exists():
+        return default_path
     backgrounds = _load_background_images()
     if backgrounds:
         return backgrounds[0]
@@ -643,7 +674,8 @@ def get_selected_background_path(user_id: int) -> Optional[Path]:
 
 
 def set_selected_background(user_id: int, background_path: Path) -> bool:
-    if VN_BACKGROUND_ROOT is None:
+    background_root = _get_background_root()
+    if background_root is None:
         return False
     relative = _relative_background_path(background_path)
     if not relative:
