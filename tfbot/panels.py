@@ -112,39 +112,39 @@ else:
     VN_CACHE_DIR = None
 
 # Face cache directory for pre-cached detected faces
-# Try to locate git repo root and place faces folder there
-def _resolve_git_repo_root() -> Optional[Path]:
-    """Find the git repository root that contains the characters folder."""
-    if VN_ASSET_ROOT is None:
+# Must be in the characters_repo git repository
+def _resolve_characters_repo_root() -> Optional[Path]:
+    """
+    Find the characters_repo git repository root.
+    Returns None if characters_repo is not configured or not found.
+    """
+    repo_url = os.getenv("TFBOT_CHARACTERS_REPO", "").strip()
+    if not repo_url:
         return None
     
-    # Check if VN_ASSET_ROOT is inside a git repo
-    current = VN_ASSET_ROOT.resolve()
-    while current != current.parent:
-        git_dir = current / ".git"
-        if git_dir.exists():
-            return current
-        current = current.parent
+    repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip()
+    repo_dir_setting = repo_dir_setting or "characters_repo"
+    repo_dir = Path(repo_dir_setting)
+    if not repo_dir.is_absolute():
+        repo_dir = (BASE_DIR / repo_dir).resolve()
     
-    return None
+    # Verify it's a git repository
+    repo_git_dir = repo_dir / ".git"
+    if not repo_dir.exists() or not repo_git_dir.exists():
+        return None
+    
+    return repo_dir
 
-def _get_face_cache_dir() -> Path:
-    """Get the face cache directory, resolving git repo root if available."""
-    git_repo_root = _resolve_git_repo_root()
-    if git_repo_root:
+def _get_face_cache_dir() -> Optional[Path]:
+    """
+    Get the face cache directory in characters_repo.
+    Returns None if characters_repo is not found (face detection should be aborted).
+    """
+    characters_repo_root = _resolve_characters_repo_root()
+    if characters_repo_root:
         # Place faces folder at the same level as characters folder in git repo
-        return git_repo_root / "faces"
-    else:
-        # Fallback to local face_cache if not in git repo
-        _FACE_CACHE_DIR_SETTING = os.getenv("TFBOT_FACE_CACHE_DIR", "face_cache").strip()
-        if _FACE_CACHE_DIR_SETTING:
-            _face_cache_path = Path(_FACE_CACHE_DIR_SETTING)
-            if not _face_cache_path.is_absolute():
-                return (BASE_DIR / _face_cache_path).resolve()
-            else:
-                return _face_cache_path.resolve()
-        else:
-            return (BASE_DIR / "face_cache").resolve()
+        return characters_repo_root / "faces"
+    return None
 
 # Face cache directory is resolved dynamically via _get_face_cache_dir()
 
@@ -1333,10 +1333,18 @@ def _cache_character_face_background(
         character_dir: Character directory path
         variant_dir: Variant directory path
         avatar_image: Fully composed avatar PIL Image (copy for thread safety)
-        git_repo_root: Git repository root directory, or None if not in git repo
+        git_repo_root: Git repository root directory (characters_repo), or None if not found
     """
-    face_cache_dir = _get_face_cache_dir()
     if not FACE_MODEL_PATH.exists():
+        return
+    
+    face_cache_dir = _get_face_cache_dir()
+    if face_cache_dir is None:
+        logger.warning(
+            "Face detection background task aborted: characters_repo not found for %s/%s",
+            character_dir.name,
+            variant_dir.name,
+        )
         return
     
     try:
@@ -1495,7 +1503,7 @@ def _periodic_face_sync() -> None:
     """Periodic background task to sync faces from remote git repository."""
     global _last_face_sync_time
     
-    git_repo_root = _resolve_git_repo_root()
+    git_repo_root = _resolve_characters_repo_root()
     if not git_repo_root or not git_repo_root.exists():
         return
     
@@ -1527,8 +1535,17 @@ def _cache_character_face(
     if not FACE_MODEL_PATH.exists():
         return
     
+    # Check if characters_repo is available - abort if not
     face_cache_dir = _get_face_cache_dir()
-    git_repo_root = _resolve_git_repo_root()
+    if face_cache_dir is None:
+        logger.warning(
+            "Face detection aborted: characters_repo git repository not found. "
+            "Set TFBOT_CHARACTERS_REPO and ensure characters_repo directory exists with .git folder. "
+            "Face caching requires the characters_repo to be configured and synced."
+        )
+        return
+    
+    git_repo_root = _resolve_characters_repo_root()
     
     # Create cache path: faces/character_name/variant_name/face.png
     cache_dir = face_cache_dir / character_dir.name.lower() / variant_dir.name.lower()
