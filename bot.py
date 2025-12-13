@@ -11,11 +11,11 @@ import subprocess
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
- 
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union
+
 import aiohttp
 import discord
 from discord import app_commands
@@ -2065,6 +2065,7 @@ async def secret_reset_command(ctx: commands.Context):
 
 @bot.tree.command(name="synreset", description="Reset all active transformations in this server.")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_synreset_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     ctx = InteractionContextAdapter(interaction, bot=bot)
@@ -2585,6 +2586,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 )
 @app_commands.autocomplete(who_character=_character_name_autocomplete, to_character=_character_name_autocomplete)
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_reroll_command(
     interaction: discord.Interaction,
     who_member: Optional[discord.Member] = None,
@@ -2603,6 +2605,7 @@ async def slash_reroll_command(
 
 @bot.tree.command(name="rerollall", description="Reroll everyone at once (admin only).")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_rerollall_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user) or not interaction.guild:
@@ -2636,6 +2639,7 @@ async def slash_rerollall_command(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="rerollnonadmin", description="Reroll everyone that's not admin (admin only).")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_rerollnonadmin_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user) or not interaction.guild:
@@ -2670,6 +2674,7 @@ async def slash_rerollnonadmin_command(interaction: discord.Interaction) -> None
 @bot.tree.command(name="dm", description="Show or assign the RP DM (use inside the RP forum thread).")
 @app_commands.describe(member="Member to assign as the DM (leave blank to view current).")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_dm_command(
     interaction: discord.Interaction,
     member: Optional[discord.Member] = None,
@@ -2686,6 +2691,7 @@ async def slash_dm_command(
 @bot.tree.command(name="rename", description="RP: rename a participant for VN panels.")
 @app_commands.describe(member="Player to rename", new_name="New VN display name")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_rename_command(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -2704,6 +2710,7 @@ async def slash_rename_command(
 @bot.tree.command(name="unload", description="RP: remove a player's RP assignment/alias.")
 @app_commands.describe(member="Player to unload (mention) or type 'all'. Leave blank for instructions.")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_unload_command(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -2720,6 +2727,7 @@ async def slash_unload_command(
 
 @bot.tree.command(name="unloadall", description="RP: unload every participant in the RP thread (DM only).")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_unload_all_command(
     interaction: discord.Interaction,
 ) -> None:
@@ -2759,6 +2767,97 @@ def _is_authorized_guild(ctx_guild: Optional[discord.Guild]) -> bool:
     if not allowed_guilds:
         return True
     return ctx_guild.id in allowed_guilds
+
+
+def _is_allowed_command_channel(
+    channel: Optional[Union[discord.abc.GuildChannel, discord.Thread]]
+) -> bool:
+    if channel is None:
+        return False
+    if ROLEPLAY_COG and ROLEPLAY_COG.is_roleplay_post(channel):
+        return True
+    if (
+        GACHA_CHANNEL_ID
+        and isinstance(channel, discord.TextChannel)
+        and channel.id == GACHA_CHANNEL_ID
+    ):
+        return True
+    if TF_CHANNEL_ID and isinstance(channel, discord.TextChannel) and channel.id == TF_CHANNEL_ID:
+        return True
+    if isinstance(channel, discord.Thread):
+        if GAME_BOARD_MANAGER and GAME_BOARD_MANAGER.is_game_thread(channel):
+            return True
+        parent = channel.parent
+        if parent and TF_CHANNEL_ID and parent.id == TF_CHANNEL_ID:
+            return True
+        if parent and GACHA_CHANNEL_ID and parent.id == GACHA_CHANNEL_ID:
+            return True
+    return False
+
+
+def _command_channel_error_message() -> str:
+    hints: List[str] = []
+    if TF_CHANNEL_ID:
+        hints.append(f"<#{TF_CHANNEL_ID}>")
+    if GACHA_CHANNEL_ID and GACHA_CHANNEL_ID != TF_CHANNEL_ID:
+        hints.append(f"<#{GACHA_CHANNEL_ID}>")
+    if GAME_BOARD_MANAGER:
+        hints.append("an active game thread")
+    if ROLEPLAY_COG:
+        hints.append("an RP forum thread")
+    if not hints:
+        return "Rolls are only supported in configured TF or game channels."
+    if len(hints) == 1:
+        return f"Rolls are only supported in {hints[0]}."
+    return f"Rolls are only supported in {', '.join(hints[:-1])}, or {hints[-1]}."
+
+
+def _extract_command_channel(
+    channel_obj: Any,
+) -> Optional[Union[discord.abc.GuildChannel, discord.Thread]]:
+    if isinstance(channel_obj, (discord.abc.GuildChannel, discord.Thread)):
+        return channel_obj
+    return None
+
+
+async def _ensure_command_channel_for_ctx(ctx: commands.Context) -> bool:
+    channel = _extract_command_channel(ctx.channel)
+    if _is_allowed_command_channel(channel):
+        return True
+    await ctx.reply(_command_channel_error_message(), mention_author=False)
+    return False
+
+
+async def _ensure_command_channel_for_interaction(interaction: discord.Interaction) -> bool:
+    channel = _extract_command_channel(interaction.channel)
+    if _is_allowed_command_channel(channel):
+        return True
+    message = _command_channel_error_message()
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    return False
+
+
+def guard_prefix_command_channel(func):
+    @wraps(func)
+    async def wrapper(ctx: commands.Context, *args, **kwargs):
+        if not await _ensure_command_channel_for_ctx(ctx):
+            return None
+        return await func(ctx, *args, **kwargs)
+
+    return wrapper
+
+
+def guard_slash_command_channel(func):
+    @wraps(func)
+    async def wrapper(interaction: discord.Interaction, *args, **kwargs):
+        if not await _ensure_command_channel_for_interaction(interaction):
+            return None
+        return await func(interaction, *args, **kwargs)
+
+    return wrapper
 
 
 async def tf_stats_command(ctx: commands.Context):
@@ -2911,6 +3010,7 @@ async def tf_stats_command(ctx: commands.Context):
 
 @bot.tree.command(name="tf", description="DM your transformation statistics.")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_tf_command(interaction: discord.Interaction) -> None:
     logger.debug("Slash /tf invoked by %s in guild %s channel %s", interaction.user, getattr(interaction.guild, "id", None), getattr(interaction.channel, "id", None))
     if not _is_authorized_guild(interaction.guild):
@@ -3133,6 +3233,7 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
 @bot.tree.command(name="bg", description="Select or manage VN backgrounds.")
 @app_commands.describe(selection="Background number (append a folder or member to target them).")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_bg_command(
     interaction: discord.Interaction,
     selection: Optional[str] = None,
@@ -3309,6 +3410,7 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
 @app_commands.describe(outfit="Provide the outfit or `pose outfit`. Admins may append a target folder.")
 @app_commands.autocomplete(outfit=_outfit_autocomplete)
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_outfit_command(
     interaction: discord.Interaction,
     outfit: str,
@@ -3553,6 +3655,7 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
 @app_commands.describe(accessory="Select an accessory to toggle. Leave blank to list them.")
 @app_commands.autocomplete(accessory=_accessory_autocomplete)
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_accessories_command(
     interaction: discord.Interaction,
     accessory: Optional[str] = None,
@@ -3741,6 +3844,7 @@ async def _handle_slash_say(
 )
 @app_commands.autocomplete(character=_character_name_autocomplete)
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_say_command(
     interaction: discord.Interaction,
     character: str,
@@ -3752,6 +3856,7 @@ async def slash_say_command(
 @bot.tree.command(name="n", description="RP Narrator shortcut (RP forum DM/owner only).")
 @app_commands.describe(text="What the Narrator should say.")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_narrator_shortcut(
     interaction: discord.Interaction,
     text: str,
@@ -3769,6 +3874,7 @@ async def slash_narrator_shortcut(
 @bot.tree.command(name="b", description=f"RP {TFBOT_NAME}'s Ball shortcut (RP forum DM/owner only).")
 @app_commands.describe(text=f"What {TFBOT_NAME}'s Ball should say.")
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_ball_shortcut(
     interaction: discord.Interaction,
     text: str,
@@ -4055,6 +4161,7 @@ def _format_special_reroll_hint_35(character_name: str) -> Optional[str]:
 # 3.5 PREFIX COMMANDS - Exact implementations from 3.5
 @bot.command(name="synreset", hidden=True)
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_synreset_35(ctx: commands.Context):
     """3.5 version of synreset command."""
     author = ctx.author
@@ -4102,6 +4209,7 @@ def _actor_has_narrator_power_35(member: Optional[discord.Member]) -> bool:
 
 @bot.command(name="reroll")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
     """3.5 version of reroll command."""
     author = ctx.author
@@ -4549,6 +4657,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
 
 
 @bot.command(name="tf", aliases=["TF"])
+@guard_prefix_command_channel
 async def prefix_tf_35(ctx: commands.Context):
     """3.5 version of tf stats command."""
     guild_id = ctx.guild.id if ctx.guild else None
@@ -4691,6 +4800,7 @@ async def prefix_tf_35(ctx: commands.Context):
 
 @bot.command(name="rerollall")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_rerollall_command(ctx: commands.Context) -> None:
     if not isinstance(ctx.author, discord.Member) or not is_admin(ctx.author) or not ctx.guild:
         await ctx.reply("Only admins can use this command.", mention_author=False)
@@ -4724,6 +4834,7 @@ async def prefix_rerollall_command(ctx: commands.Context) -> None:
 
 @bot.command(name="rerollnonadmin")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_rerollnonadmin_command(ctx: commands.Context) -> None:
     if not isinstance(ctx.author, discord.Member) or not is_admin(ctx.author) or not ctx.guild:
         await ctx.reply("Only admins can use this command.", mention_author=False)
@@ -4758,6 +4869,7 @@ async def prefix_rerollnonadmin_command(ctx: commands.Context) -> None:
 # Game Board Commands
 @bot.command(name="startgame")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_startgame_command(ctx: commands.Context, *, game_type: str = "") -> None:
     """Start a new game (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -4766,6 +4878,7 @@ async def prefix_startgame_command(ctx: commands.Context, *, game_type: str = ""
 
 @bot.command(name="endgame")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_endgame_command(ctx: commands.Context) -> None:
     """End the current game (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -4774,6 +4887,7 @@ async def prefix_endgame_command(ctx: commands.Context) -> None:
 
 @bot.command(name="listgames")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_listgames_command(ctx: commands.Context) -> None:
     """List available games."""
     if GAME_BOARD_MANAGER:
@@ -4782,6 +4896,7 @@ async def prefix_listgames_command(ctx: commands.Context) -> None:
 
 @bot.command(name="addplayer")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_addplayer_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
     """Add a player to the game (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -4790,6 +4905,7 @@ async def prefix_addplayer_command(ctx: commands.Context, member: Optional[disco
 
 @bot.command(name="removeplayer")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_removeplayer_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
     """Remove a player from the game (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -4798,6 +4914,7 @@ async def prefix_removeplayer_command(ctx: commands.Context, member: Optional[di
 
 @bot.command(name="assign")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_assign_command(ctx: commands.Context, member: Optional[discord.Member] = None, *, character_name: str = "") -> None:
     """Assign a character to a player (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -4806,6 +4923,7 @@ async def prefix_assign_command(ctx: commands.Context, member: Optional[discord.
 
 @bot.command(name="swap")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     """Swap characters between two players or characters.
     
@@ -4990,6 +5108,7 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     character2="Second character/user to swap (character name or @mention).",
 )
 @app_commands.guild_only()
+@guard_slash_command_channel
 async def slash_swap_command(
     interaction: discord.Interaction,
     character1: str,
@@ -5157,6 +5276,7 @@ async def slash_swap_command(
 
 @bot.command(name="movetoken")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_movetoken_command(ctx: commands.Context, member: Optional[discord.Member] = None, *, position: str = "") -> None:
     """Move a player's token (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -5165,6 +5285,7 @@ async def prefix_movetoken_command(ctx: commands.Context, member: Optional[disco
 
 @bot.command(name="dice")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_dice_command(ctx: commands.Context) -> None:
     """Roll dice (player command)."""
     if GAME_BOARD_MANAGER:
@@ -5172,6 +5293,7 @@ async def prefix_dice_command(ctx: commands.Context) -> None:
 
 
 @bot.command(name="roll")
+@guard_prefix_command_channel
 async def prefix_roll_command(ctx: commands.Context, *, args: str = "") -> None:
     """Route roll requests to the right subsystem."""
     if GACHA_MANAGER is not None:
@@ -5204,6 +5326,7 @@ async def prefix_roll_command(ctx: commands.Context, *, args: str = "") -> None:
 
 @bot.command(name="rules")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_rules_command(ctx: commands.Context) -> None:
     """Show game rules (player command)."""
     if GAME_BOARD_MANAGER:
@@ -5214,6 +5337,7 @@ async def prefix_rules_command(ctx: commands.Context) -> None:
 
 @bot.command(name="savegame")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_savegame_command(ctx: commands.Context) -> None:
     """Save the current game state (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -5222,6 +5346,7 @@ async def prefix_savegame_command(ctx: commands.Context) -> None:
 
 @bot.command(name="loadgame")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_loadgame_command(ctx: commands.Context, *, state_file: str = "") -> None:
     """Load a saved game state (GM only)."""
     if GAME_BOARD_MANAGER:
@@ -5229,6 +5354,7 @@ async def prefix_loadgame_command(ctx: commands.Context, *, state_file: str = ""
 
 
 @bot.command(name="bg")
+@guard_prefix_command_channel
 async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
     """3.5 version of bg command."""
     # Check if this is a game thread first - completely isolate from global VN system
@@ -5429,6 +5555,7 @@ async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
 
 
 @bot.command(name="outfit")
+@guard_prefix_command_channel
 async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
     """3.5 version of outfit command."""
     # Check if this is a game thread first - completely isolate from global VN system
@@ -5585,6 +5712,7 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
 
 @bot.command(name="say")
 @commands.guild_only()
+@guard_prefix_command_channel
 async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
     """3.5 version of say command."""
     await ensure_state_restored()
@@ -5705,12 +5833,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
