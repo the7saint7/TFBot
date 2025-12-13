@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
-
+ 
 import aiohttp
 import discord
 from discord import app_commands
@@ -4859,34 +4859,22 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     token2 = tokens[1]
     
     # Find state1 - can be by character name/folder or user mention
+    # Use _find_state_by_token which is more comprehensive (searches by name, folder, mention, display name)
     state1 = None
     user1_id = None
     if ctx.guild:
-        user_id1 = _extract_user_id_from_token(token1)
-        if user_id1:
-            # Token is a user mention
-            state1 = active_transformations.get(state_key(ctx.guild.id, user_id1))
-            user1_id = user_id1
-        else:
-            # Token is a character name/folder
-            state1 = _find_state_by_folder(ctx.guild, token1)
-            if state1:
-                user1_id = state1.user_id
+        state1 = _find_state_by_token(ctx.guild, token1)
+        if state1:
+            user1_id = state1.user_id
     
     # Find state2 - can be by character name/folder or user mention
+    # Use _find_state_by_token which is more comprehensive (searches by name, folder, mention, display name)
     state2 = None
     user2_id = None
     if ctx.guild:
-        user_id2 = _extract_user_id_from_token(token2)
-        if user_id2:
-            # Token is a user mention
-            state2 = active_transformations.get(state_key(ctx.guild.id, user_id2))
-            user2_id = user_id2
-        else:
-            # Token is a character name/folder
-            state2 = _find_state_by_folder(ctx.guild, token2)
-            if state2:
-                user2_id = state2.user_id
+        state2 = _find_state_by_token(ctx.guild, token2)
+        if state2:
+            user2_id = state2.user_id
     
     if not state1 or not state2:
         await ctx.reply("Could not find both active transformations. Both characters/users must be currently transformed.", mention_author=False)
@@ -5048,8 +5036,123 @@ async def slash_swap_command(
         await interaction.followup.send("Only admins, Ball, or Narrator can use this command.", ephemeral=True)
         return
     
-    ctx = InteractionContextAdapter(interaction, bot=bot)
-    await prefix_swap_command(ctx, args=f"{character1} {character2}")
+    # Use the same logic as prefix command but adapted for slash
+    await ensure_state_restored()
+    
+    # Find state1 and state2 using the same comprehensive search
+    state1 = None
+    user1_id = None
+    if interaction.guild:
+        state1 = _find_state_by_token(interaction.guild, character1)
+        if state1:
+            user1_id = state1.user_id
+    
+    state2 = None
+    user2_id = None
+    if interaction.guild:
+        state2 = _find_state_by_token(interaction.guild, character2)
+        if state2:
+            user2_id = state2.user_id
+    
+    if not state1 or not state2:
+        await interaction.followup.send("Could not find both active transformations. Both characters/users must be currently transformed.", ephemeral=True)
+        return
+    
+    if not user1_id or not user2_id:
+        await interaction.followup.send("Could not determine users for swap.", ephemeral=True)
+        return
+    
+    if user1_id == user2_id:
+        await interaction.followup.send("Cannot swap a character with itself.", ephemeral=True)
+        return
+    
+    # Get members for display
+    member1 = interaction.guild.get_member(user1_id)
+    member2 = interaction.guild.get_member(user2_id)
+    
+    if not member1 or not member2:
+        await interaction.followup.send("Could not find both members.", ephemeral=True)
+        return
+    
+    # Swap character data between the two states
+    char1_name = state1.character_name
+    char1_folder = state1.character_folder
+    char1_avatar = state1.character_avatar_path
+    char1_message = state1.character_message
+    char1_inanimate = state1.is_inanimate
+    char1_responses = state1.inanimate_responses
+    
+    char2_name = state2.character_name
+    char2_folder = state2.character_folder
+    char2_avatar = state2.character_avatar_path
+    char2_message = state2.character_message
+    char2_inanimate = state2.is_inanimate
+    char2_responses = state2.inanimate_responses
+    
+    # Create new states with swapped character data
+    new_state1 = TransformationState(
+        user_id=user1_id,
+        guild_id=state1.guild_id,
+        character_name=char2_name,
+        character_folder=char2_folder,
+        character_avatar_path=char2_avatar,
+        character_message=char2_message,
+        original_nick=state1.original_nick,
+        started_at=state1.started_at,
+        expires_at=state1.expires_at,
+        duration_label=state1.duration_label,
+        avatar_applied=state1.avatar_applied,
+        original_display_name=state1.original_display_name,
+        is_inanimate=char2_inanimate,
+        inanimate_responses=char2_responses,
+    )
+    
+    new_state2 = TransformationState(
+        user_id=user2_id,
+        guild_id=state2.guild_id,
+        character_name=char1_name,
+        character_folder=char1_folder,
+        character_avatar_path=char1_avatar,
+        character_message=char1_message,
+        original_nick=state2.original_nick,
+        started_at=state2.started_at,
+        expires_at=state2.expires_at,
+        duration_label=state2.duration_label,
+        avatar_applied=state2.avatar_applied,
+        original_display_name=state2.original_display_name,
+        is_inanimate=char1_inanimate,
+        inanimate_responses=char1_responses,
+    )
+    
+    # Update active_transformations
+    key1 = state_key(interaction.guild.id, user1_id)
+    key2 = state_key(interaction.guild.id, user2_id)
+    active_transformations[key1] = new_state1
+    active_transformations[key2] = new_state2
+    
+    # Update revert tasks if they exist
+    if key1 in revert_tasks:
+        revert_tasks[key1].cancel()
+        delay1 = max((new_state1.expires_at - utc_now()).total_seconds(), 0)
+        revert_tasks[key1] = asyncio.create_task(_schedule_revert(new_state1, delay1))
+    
+    if key2 in revert_tasks:
+        revert_tasks[key2].cancel()
+        delay2 = max((new_state2.expires_at - utc_now()).total_seconds(), 0)
+        revert_tasks[key2] = asyncio.create_task(_schedule_revert(new_state2, delay2))
+    
+    # Persist states
+    persist_states()
+    
+    # Send confirmation message
+    author_name = interaction.user.display_name
+    character1_name = member1.display_name
+    character2_name = member2.display_name
+    
+    await interaction.followup.send(
+        f"Thanks to {author_name}, {character1_name} swapped bodies with {character2_name}.",
+        ephemeral=False,
+    )
 
 
 @bot.command(name="movetoken")
