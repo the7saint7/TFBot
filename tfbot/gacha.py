@@ -1824,10 +1824,6 @@ class GachaManager:
         async def gacha_unequip(ctx: commands.Context) -> None:
             await self.command_unequip(ctx)
 
-        @commands.command(name="roll")
-        async def gacha_roll(ctx: commands.Context, roll_type: str = "", *extra: str) -> None:
-            await self.command_roll(ctx, roll_type.lower(), " ".join(extra).strip())
-
         @commands.command(name="frogtrade")
         async def gacha_frogtrade(ctx: commands.Context, amount: Optional[int] = None) -> None:
             await self.command_frogtrade(ctx, amount)
@@ -1865,7 +1861,6 @@ class GachaManager:
         self._register_command(gacha_status)
         self._register_command(gacha_changeto)
         self._register_command(gacha_unequip)
-        self._register_command(gacha_roll)
         self._register_command(gacha_frogtrade)
         self._register_command(gacha_givecoins)
         self._register_command(gacha_givecharacter)
@@ -2594,4 +2589,3 @@ def setup_gacha_mode(
 
 
 __all__ = ["GachaManager", "setup_gacha_mode"]
-

@@ -5163,12 +5163,43 @@ async def prefix_movetoken_command(ctx: commands.Context, member: Optional[disco
         await GAME_BOARD_MANAGER.command_movetoken(ctx, member=member, position=position)
 
 
-@bot.command(name="dice", aliases=["roll"])
+@bot.command(name="dice")
 @commands.guild_only()
 async def prefix_dice_command(ctx: commands.Context) -> None:
     """Roll dice (player command)."""
     if GAME_BOARD_MANAGER:
         await GAME_BOARD_MANAGER.command_dice(ctx)
+
+
+@bot.command(name="roll")
+async def prefix_roll_command(ctx: commands.Context, *, args: str = "") -> None:
+    """Route roll requests to the right subsystem."""
+    if GACHA_MANAGER is not None:
+        in_gacha_channel = ctx.guild is None or (
+            isinstance(ctx.channel, discord.TextChannel) and ctx.channel.id == GACHA_MANAGER.channel_id
+        )
+        if in_gacha_channel:
+            roll_type = ""
+            extra = ""
+            if args:
+                parts = args.split()
+                roll_type = parts[0].lower()
+                extra = " ".join(parts[1:]).strip()
+            await GACHA_MANAGER.command_roll(ctx, roll_type, extra)
+            return
+
+    if (
+        GAME_BOARD_MANAGER
+        and isinstance(ctx.channel, discord.Thread)
+        and GAME_BOARD_MANAGER.is_game_thread(ctx.channel)
+    ):
+        await GAME_BOARD_MANAGER.command_dice(ctx)
+        return
+
+    await ctx.reply(
+        "Rolls are only supported in the gacha channel or inside active game threads.",
+        mention_author=False,
+    )
 
 
 @bot.command(name="rules")
@@ -5674,7 +5705,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
