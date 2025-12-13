@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,8 @@ except ImportError:
     PIL = None
 
 BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 logging.basicConfig(
     level=os.getenv("TFBOT_LOG_LEVEL", "INFO"),
