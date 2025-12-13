@@ -22,6 +22,7 @@ Environment variables (via `.env` or your shell) control runtime behavior:
 | `TFBOT_PREFIX` | Command prefix for future bot commands | `!` |
 | `TFBOT_LOG_LEVEL` | Python logging level | `INFO` |
 | `TFBOT_HISTORY_CHANNEL_ID` | Channel that receives TF audit logs | `1432196317722972262` |
+| `TF_CHARACTER_INFO_FORUM_CHANNEL_ID` | Forum channel that gets wiped and repopulated with character info posts on startup | _(optional)_ |
 | `TFBOT_ARCHIVE_CHANNEL_ID` | Channel where intercepted originals are archived before deletion | _(optional)_ |
 | `TFBOT_STATE_FILE` | Path for persisting active TF records | `tf_state.json` |
 | `TFBOT_MAGIC_EMOJI_NAME` | Custom emoji name to prefix TF narration (falls back to `:name:` if missing) | `magic_emoji` |
