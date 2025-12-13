@@ -83,6 +83,80 @@ def _read_git_head_sha(
         return None
 
 
+def _detect_upstream_ref(
+    git_executable: str, repo_dir: Path, startup_logger: logging.Logger
+) -> Optional[str]:
+    commands = [
+        [
+            git_executable,
+            "-C",
+            str(repo_dir),
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{u}",
+        ],
+        [
+            git_executable,
+            "-C",
+            str(repo_dir),
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+        ],
+    ]
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            ref = result.stdout.strip()
+            if not ref:
+                continue
+            if ref.startswith("refs/remotes/"):
+                ref = ref.split("refs/remotes/", 1)[1]
+            startup_logger.debug("Detected upstream ref %s via `%s`.", ref, " ".join(cmd))
+            return ref
+        except subprocess.CalledProcessError as exc:
+            startup_logger.debug("Unable to detect upstream ref via `%s`: %s", " ".join(cmd), exc.stderr or exc.stdout)
+    return None
+
+
+def _hard_sync_existing_repo(
+    git_executable: str, repo_dir: Path, startup_logger: logging.Logger
+) -> bool:
+    upstream_ref = _detect_upstream_ref(git_executable, repo_dir, startup_logger)
+    if upstream_ref is None:
+        startup_logger.warning(
+            "Cannot determine upstream branch for %s; skipping hard reset.",
+            repo_dir,
+        )
+        return False
+    commands = [
+        [git_executable, "-C", str(repo_dir), "fetch", "--all", "--tags", "--prune"],
+        [git_executable, "-C", str(repo_dir), "reset", "--hard", upstream_ref],
+        [git_executable, "-C", str(repo_dir), "clean", "-fd"],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            output = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            startup_logger.warning(
+                "Failed to run `%s` while syncing characters repo: %s",
+                " ".join(cmd),
+                output,
+            )
+            return False
+    startup_logger.info(
+        "Characters repo hard-reset to %s via fetch/reset/clean.",
+        upstream_ref,
+    )
+    return True
+
+
 def _sync_character_repo() -> Optional[Path]:
     repo_url = os.getenv("TFBOT_CHARACTERS_REPO", "").strip()
     if not repo_url:
@@ -116,37 +190,48 @@ def _sync_character_repo() -> Optional[Path]:
     else:
         old_head = None
         if repo_git_dir.exists():
-            cmd = [git_executable, "-C", str(repo_dir), "pull", "--ff-only"]
-            action = "pull"
+            action = "sync"
             old_head = _read_git_head_sha(git_executable, repo_dir, startup_logger)
-        else:
+            synced = _hard_sync_existing_repo(git_executable, repo_dir, startup_logger)
+            if not synced:
+                startup_logger.warning(
+                    "Characters repo at %s could not be synced; deleting and recloning.",
+                    repo_dir,
+                )
+                try:
+                    shutil.rmtree(repo_dir)
+                except OSError as exc:
+                    startup_logger.warning("Failed to remove %s for reclone: %s", repo_dir, exc)
+                    return None
+                action = "clone"
+        if not repo_git_dir.exists():
             cmd = [git_executable, "clone", repo_url, str(repo_dir)]
             action = "clone"
-        startup_logger.info("Characters repo %s starting via `%s`.", action, " ".join(cmd))
-        try:
-            result = subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            output = result.stdout.strip() or result.stderr.strip()
-            if output:
-                startup_logger.info("Characters repo %sed via `%s`: %s", action, " ".join(cmd), output)
-            else:
-                startup_logger.info("Characters repo %sed via `%s`.", action, " ".join(cmd))
-        except subprocess.CalledProcessError as exc:
-            output = exc.stderr.strip() or exc.stdout.strip() or str(exc)
-            startup_logger.warning(
-                "Failed to %s characters repo %s (cmd=%s): %s",
-                action,
-                repo_url,
-                " ".join(cmd),
-                output,
-            )
-            return None
+        if action == "clone":
+            startup_logger.info("Characters repo clone starting via `%s`.", " ".join(cmd))
+            try:
+                result = subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                output = result.stdout.strip() or result.stderr.strip()
+                if output:
+                    startup_logger.info("Characters repo cloned via `%s`: %s", " ".join(cmd), output)
+                else:
+                    startup_logger.info("Characters repo cloned via `%s`.", " ".join(cmd))
+            except subprocess.CalledProcessError as exc:
+                output = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+                startup_logger.warning(
+                    "Failed to clone characters repo %s (cmd=%s): %s",
+                    repo_url,
+                    " ".join(cmd),
+                    output,
+                )
+                return None
         updated_assets = action == "clone"
-        if action == "pull":
+        if action == "sync":
             new_head = _read_git_head_sha(git_executable, repo_dir, startup_logger)
             if old_head and new_head:
                 updated_assets = old_head != new_head
@@ -171,6 +256,29 @@ def _sync_character_repo() -> Optional[Path]:
 _characters_repo_path = _sync_character_repo()
 if _characters_repo_path:
     os.environ["TFBOT_VN_ASSET_ROOT"] = str(_characters_repo_path)
+
+
+def _resolve_character_faces_root() -> Optional[Path]:
+    repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip() or "characters_repo"
+    repo_dir = Path(repo_dir_setting)
+    if not repo_dir.is_absolute():
+        repo_dir = (BASE_DIR / repo_dir).resolve()
+    candidates: list[Path] = []
+    if repo_dir.exists():
+        candidates.append(repo_dir / "faces")
+    fallback_repo = (BASE_DIR / "characters_repo").resolve()
+    if fallback_repo.exists():
+        candidates.append(fallback_repo / "faces")
+    fallback_faces = (BASE_DIR / "faces").resolve()
+    if fallback_faces.exists():
+        candidates.append(fallback_faces)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+CHARACTER_FACES_ROOT = _resolve_character_faces_root()
 
 from tf_characters import TF_CHARACTERS as _DEFAULT_CHARACTER_DATA
 from ai_rewriter import AI_REWRITE_ENABLED, rewrite_message_for_character
@@ -258,6 +366,10 @@ CLASSIC_ENABLED = BOT_MODE != "gacha" and TF_CHANNEL_ID > 0
 
 if BOT_MODE == "gacha" and not GACHA_ENABLED:
     raise RuntimeError("TFBOT_GACHA_CHANNEL_ID is required when running in gacha mode.")
+
+CHARACTER_INFO_FORUM_CHANNEL_ID = int_from_env("TF_CHARACTER_INFO_FORUM_CHANNEL_ID", 0)
+CHARACTER_INFO_FORUM_ENABLED = CHARACTER_INFO_FORUM_CHANNEL_ID > 0
+CHARACTER_INFO_FORUM_ACTION_DELAY = 0.25
 if not CLASSIC_ENABLED and not GACHA_ENABLED:
     raise RuntimeError("Configure at least TFBOT_CHANNEL_ID or TFBOT_GACHA_CHANNEL_ID.")
 TF_HISTORY_CHANNEL_ID = int_from_env("TFBOT_HISTORY_CHANNEL_ID", 1432196317722972262)
@@ -1043,6 +1155,8 @@ set_character_directory_overrides(_CHARACTER_FOLDER_OVERRIDES)
 GACHA_MANAGER = None
 _CHARACTER_DIRECTORY_CACHE: list[str] = []
 _CHARACTER_DIRECTORY_CACHE_EXPIRY: float = 0.0
+_CHARACTER_INFO_FORUM_LOCK = asyncio.Lock()
+_THREAD_TITLE_PATTERN = re.compile(r"^(?P<name>.+?)\s*\((?P<folder>.+?)\)$")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
@@ -1995,6 +2109,365 @@ async def log_channel_access() -> None:
                     perms.mention_everyone,
                 )
 
+
+def _is_allowed_command_channel(
+    channel: Optional[Union[discord.abc.GuildChannel, discord.Thread]]
+) -> bool:
+    if channel is None:
+        return False
+    if ROLEPLAY_COG and ROLEPLAY_COG.is_roleplay_post(channel):
+        return True
+    if (
+        GACHA_CHANNEL_ID
+        and isinstance(channel, discord.TextChannel)
+        and channel.id == GACHA_CHANNEL_ID
+    ):
+        return True
+    if TF_CHANNEL_ID and isinstance(channel, discord.TextChannel) and channel.id == TF_CHANNEL_ID:
+        return True
+    if isinstance(channel, discord.Thread):
+        if GAME_BOARD_MANAGER and GAME_BOARD_MANAGER.is_game_thread(channel):
+            return True
+        parent = channel.parent
+        if parent and TF_CHANNEL_ID and parent.id == TF_CHANNEL_ID:
+            return True
+        if parent and GACHA_CHANNEL_ID and parent.id == GACHA_CHANNEL_ID:
+            return True
+    return False
+
+
+def _command_channel_error_message() -> str:
+    hints: List[str] = []
+    if TF_CHANNEL_ID:
+        hints.append(f"<#{TF_CHANNEL_ID}>")
+    if GACHA_CHANNEL_ID and GACHA_CHANNEL_ID != TF_CHANNEL_ID:
+        hints.append(f"<#{GACHA_CHANNEL_ID}>")
+    if GAME_BOARD_MANAGER:
+        hints.append("an active game thread")
+    if ROLEPLAY_COG:
+        hints.append("an RP forum thread")
+    if not hints:
+        return "Rolls are only supported in configured TF or game channels."
+    if len(hints) == 1:
+        return f"Rolls are only supported in {hints[0]}."
+    return f"Rolls are only supported in {', '.join(hints[:-1])}, or {hints[-1]}."
+
+
+def _extract_command_channel(
+    channel_obj: Any,
+) -> Optional[Union[discord.abc.GuildChannel, discord.Thread]]:
+    if isinstance(channel_obj, (discord.abc.GuildChannel, discord.Thread)):
+        return channel_obj
+    return None
+
+
+async def _ensure_command_channel_for_ctx(ctx: commands.Context) -> bool:
+    channel = _extract_command_channel(ctx.channel)
+    if _is_allowed_command_channel(channel):
+        return True
+    await ctx.reply(_command_channel_error_message(), mention_author=False)
+    return False
+
+
+async def _ensure_command_channel_for_interaction(interaction: discord.Interaction) -> bool:
+    channel = _extract_command_channel(interaction.channel)
+    if _is_allowed_command_channel(channel):
+        return True
+    message = _command_channel_error_message()
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    return False
+
+
+def guard_prefix_command_channel(func):
+    @wraps(func)
+    async def wrapper(ctx: commands.Context, *args, **kwargs):
+        if not await _ensure_command_channel_for_ctx(ctx):
+            return None
+        return await func(ctx, *args, **kwargs)
+
+    return wrapper
+
+
+def guard_slash_command_channel(func):
+    @wraps(func)
+    async def wrapper(interaction: discord.Interaction, *args, **kwargs):
+        if not await _ensure_command_channel_for_interaction(interaction):
+            return None
+        return await func(interaction, *args, **kwargs)
+
+    return wrapper
+
+
+def _find_character_face_path(folder_name: Optional[str]) -> Optional[Path]:
+    if not folder_name or CHARACTER_FACES_ROOT is None:
+        return None
+    normalized = folder_name.strip()
+    candidate_names = [normalized]
+    lowered = normalized.lower()
+    if lowered != normalized:
+        candidate_names.append(lowered)
+    checked: set[Path] = set()
+    for candidate in candidate_names:
+        folder_dir = (CHARACTER_FACES_ROOT / candidate).resolve()
+        if folder_dir in checked or not folder_dir.exists():
+            continue
+        checked.add(folder_dir)
+        variant_dirs = sorted(
+            (entry for entry in folder_dir.iterdir() if entry.is_dir()),
+            key=lambda path: path.name.lower(),
+        )
+        for variant_dir in variant_dirs:
+            face_candidate = variant_dir / "face.png"
+            if face_candidate.exists():
+                return face_candidate
+            png_candidates = sorted(variant_dir.glob("*.png"))
+            if png_candidates:
+                return png_candidates[0]
+        direct_pngs = sorted(folder_dir.glob("*.png"))
+        if direct_pngs:
+            return direct_pngs[0]
+    return None
+
+
+def _render_pose_outfit_tree(pose_map: Mapping[str, Sequence[str]]) -> str:
+    if not pose_map:
+        return "- No pose or outfit data found."
+    lines: list[str] = []
+    for pose_name in sorted(pose_map.keys()):
+        outfits = pose_map[pose_name]
+        lines.append(f"- **{pose_name}**")
+        if outfits:
+            for outfit_name in sorted(outfits):
+                lines.append(f"  - {outfit_name}")
+        else:
+            lines.append("  - (no outfits listed)")
+    return "\n".join(lines)
+
+
+def _build_character_info_post(character: TFCharacter) -> Tuple[str, Optional[Path]]:
+    folder_token = (character.folder or character.name).strip()
+    pose_map = list_pose_outfits(character.name)
+    tree_text = _render_pose_outfit_tree(pose_map)
+    lines = [
+        f"Folder: `{folder_token}`",
+        "",
+        "**Poses & Outfits**",
+        tree_text,
+    ]
+    content = "\n".join(lines).strip()
+    face_path = _find_character_face_path(folder_token)
+    return content, face_path
+
+
+def _character_from_thread_title(title: str) -> Optional[TFCharacter]:
+    normalized = title.strip()
+    if not normalized:
+        return None
+    match = _THREAD_TITLE_PATTERN.match(normalized)
+    lookup_names: list[str] = []
+    folder_candidate = None
+    if match:
+        folder_candidate = _normalize_folder_token(match.group("folder"))
+        name_candidate = match.group("name").strip().lower()
+        if name_candidate:
+            lookup_names.append(name_candidate)
+    else:
+        lookup_names.append(normalized.lower())
+    for key in lookup_names:
+        character = CHARACTER_BY_NAME.get(key)
+        if character:
+            return character
+    if folder_candidate:
+        return CHARACTER_BY_FOLDER.get(folder_candidate)
+    return None
+
+
+async def _iter_forum_threads(channel: discord.ForumChannel, forum_logger: logging.Logger):
+    seen: set[int] = set()
+    for thread in channel.threads:
+        if thread.id in seen:
+            continue
+        seen.add(thread.id)
+        yield thread
+
+    try:
+        async for archived in channel.archived_threads(limit=None):
+            if archived.id in seen:
+                continue
+            seen.add(archived.id)
+            yield archived
+    except discord.HTTPException as exc:
+        forum_logger.warning(
+            "Failed to fetch archived threads for forum %s: %s",
+            channel.id,
+            exc,
+        )
+
+
+async def _purge_character_forum(channel: discord.ForumChannel, forum_logger: logging.Logger) -> int:
+    deleted = 0
+    async for thread in _iter_forum_threads(channel, forum_logger):
+        try:
+            await thread.delete()
+            deleted += 1
+        except discord.HTTPException as exc:
+            forum_logger.warning("Failed to delete thread %s in forum %s: %s", thread.id, channel.id, exc)
+        finally:
+            await asyncio.sleep(CHARACTER_INFO_FORUM_ACTION_DELAY)
+    return deleted
+
+
+async def _create_character_forum_posts(channel: discord.ForumChannel, forum_logger: logging.Logger) -> int:
+    created = 0
+    for character in sorted(CHARACTER_POOL, key=lambda char: char.name.lower(), reverse=True):
+        folder_token = (character.folder or character.name).strip()
+        title = f"{character.name} ({folder_token})"
+        content, face_path = _build_character_info_post(character)
+        kwargs: dict[str, Any] = {
+            "name": title,
+            "content": content or "No pose or outfit data found.",
+        }
+        file_handle = None
+        face_file = None
+        if face_path:
+            try:
+                file_handle = face_path.open("rb")
+                face_file = discord.File(file_handle, filename=f"{folder_token}_face.png")
+                kwargs["file"] = face_file
+            except OSError as exc:
+                forum_logger.warning("Failed to open face image for %s at %s: %s", character.name, face_path, exc)
+        try:
+            await channel.create_thread(**kwargs)
+            created += 1
+        except discord.HTTPException as exc:
+            forum_logger.warning("Failed to create info post for %s: %s", character.name, exc)
+        finally:
+            if file_handle:
+                file_handle.close()
+            await asyncio.sleep(CHARACTER_INFO_FORUM_ACTION_DELAY)
+    return created
+
+
+async def _refresh_existing_character_posts(
+    channel: discord.ForumChannel, forum_logger: logging.Logger
+) -> Tuple[int, int]:
+    inspected = 0
+    updated = 0
+    async for thread in _iter_forum_threads(channel, forum_logger):
+        inspected += 1
+        character = _character_from_thread_title(thread.name or "")
+        if character is None:
+            continue
+        try:
+            first_message = None
+            async for message in thread.history(limit=1, oldest_first=True):
+                first_message = message
+                break
+        except discord.HTTPException as exc:
+            forum_logger.warning("Failed to fetch first post for thread %s: %s", thread.id, exc)
+            continue
+        if first_message is None:
+            continue
+        expected_content, face_path = _build_character_info_post(character)
+        current_content = (first_message.content or "").strip()
+        needs_content = current_content != expected_content
+        folder_token = (character.folder or character.name).strip()
+        desired_face_name = f"{folder_token}_face.png"
+        has_face_attachment = any(
+            attachment.filename.lower() == desired_face_name.lower() for attachment in first_message.attachments
+        )
+        attachments_param: list[Union[discord.Attachment, discord.File]] = list(first_message.attachments)
+        file_handle: Optional[io.BufferedReader] = None
+        face_added = False
+        if face_path and not has_face_attachment:
+            try:
+                file_handle = face_path.open("rb")
+                attachments_param.append(discord.File(file_handle, filename=desired_face_name))
+                face_added = True
+            except OSError as exc:
+                forum_logger.warning("Failed to open face image for %s at %s: %s", character.name, face_path, exc)
+        edit_kwargs: dict[str, Any] = {}
+        if needs_content:
+            edit_kwargs["content"] = expected_content
+        if face_added:
+            edit_kwargs["attachments"] = attachments_param
+        if not edit_kwargs:
+            if file_handle:
+                file_handle.close()
+            continue
+        try:
+            await first_message.edit(**edit_kwargs)
+            updated += 1
+            await asyncio.sleep(CHARACTER_INFO_FORUM_ACTION_DELAY)
+        except discord.HTTPException as exc:
+            forum_logger.warning("Failed to refresh info post for %s (%s): %s", character.name, thread.id, exc)
+        finally:
+            if file_handle:
+                file_handle.close()
+    return inspected, updated
+
+
+async def _get_character_info_forum_channel(
+    forum_logger: logging.Logger,
+) -> Optional[discord.ForumChannel]:
+    if not CHARACTER_INFO_FORUM_ENABLED:
+        return None
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CHARACTER_INFO_FORUM_CHANNEL_ID)
+    if channel is None:
+        try:
+            fetched_channel = await bot.fetch_channel(CHARACTER_INFO_FORUM_CHANNEL_ID)
+        except discord.HTTPException as exc:
+            forum_logger.warning(
+                "Unable to fetch character info forum channel %s: %s",
+                CHARACTER_INFO_FORUM_CHANNEL_ID,
+                exc,
+            )
+            return None
+        channel = fetched_channel
+    if not isinstance(channel, discord.ForumChannel):
+        forum_logger.warning(
+            "Configured character info forum channel %s is not a forum. Feature disabled.",
+            CHARACTER_INFO_FORUM_CHANNEL_ID,
+        )
+        return None
+    return channel
+
+
+async def _refresh_character_info_forum() -> Tuple[int, int]:
+    forum_logger = logging.getLogger("tfbot.character_forum")
+    channel = await _get_character_info_forum_channel(forum_logger)
+    if channel is None:
+        return (0, 0)
+    forum_logger.info("Refreshing character info forum %s with %d characters.", channel.id, len(CHARACTER_POOL))
+    deleted = await _purge_character_forum(channel, forum_logger)
+    created = await _create_character_forum_posts(channel, forum_logger)
+    forum_logger.info(
+        "Character info forum refresh complete for channel %s (deleted=%s, created=%s).",
+        channel.id,
+        deleted,
+        created,
+    )
+    return deleted, created
+
+
+async def _refresh_character_info_posts_only() -> Tuple[int, int]:
+    forum_logger = logging.getLogger("tfbot.character_forum")
+    channel = await _get_character_info_forum_channel(forum_logger)
+    if channel is None:
+        return (0, 0)
+    inspected, updated = await _refresh_existing_character_posts(channel, forum_logger)
+    forum_logger.info(
+        "Character info forum existing posts refreshed (inspected=%s, updated=%s).",
+        inspected,
+        updated,
+    )
+    return inspected, updated
+
+
 def current_history_channel_id() -> int:
     return TF_HISTORY_CHANNEL_ID
 
@@ -2072,6 +2545,86 @@ async def slash_synreset_command(interaction: discord.Interaction) -> None:
     await secret_reset_command(ctx)
     if not ctx.responded:
         await interaction.followup.send("TF reset completed.", ephemeral=True)
+
+
+@bot.command(name="resetinfo")
+async def reset_character_info_forum_command(ctx: commands.Context, confirmation: str = ""):
+    author = ctx.author
+    if not isinstance(author, discord.Member):
+        await ctx.reply("Run this command inside a server.", mention_author=False)
+        return
+    if not is_admin(author):
+        await ctx.reply("You lack permission to run this command.", mention_author=False)
+        return
+    if confirmation.strip().lower() != "confirm":
+        await ctx.reply(
+            "This will delete and recreate every info post. Run `!resetinfo confirm` to proceed.",
+            mention_author=False,
+        )
+        return
+    if not CHARACTER_INFO_FORUM_ENABLED:
+        await ctx.reply(
+            "TF_CHARACTER_INFO_FORUM_CHANNEL_ID is not configured on this bot.",
+            mention_author=False,
+        )
+        return
+    if _CHARACTER_INFO_FORUM_LOCK.locked():
+        await ctx.reply("A character info refresh is already in progress. Please wait.", mention_author=False)
+        return
+    await ctx.reply(
+        "Refreshing the character info forum... this may take a couple of minutes.",
+        mention_author=False,
+    )
+    async with _CHARACTER_INFO_FORUM_LOCK:
+        deleted, created = await _refresh_character_info_forum()
+    logger.info(
+        "Character info forum reset completed by %s (%s): deleted=%s created=%s",
+        author.display_name,
+        author.id,
+        deleted,
+        created,
+    )
+    await ctx.send(
+        f"Character info forum refresh finished. Deleted {deleted} posts and created {created} posts.",
+        mention_author=False,
+    )
+
+
+@bot.command(name="refreshinfo")
+async def refresh_character_info_forum_posts_command(ctx: commands.Context):
+    author = ctx.author
+    if not isinstance(author, discord.Member):
+        await ctx.reply("Run this command inside a server.", mention_author=False)
+        return
+    if not is_admin(author):
+        await ctx.reply("You lack permission to run this command.", mention_author=False)
+        return
+    if not CHARACTER_INFO_FORUM_ENABLED:
+        await ctx.reply(
+            "TF_CHARACTER_INFO_FORUM_CHANNEL_ID is not configured on this bot.",
+            mention_author=False,
+        )
+        return
+    if _CHARACTER_INFO_FORUM_LOCK.locked():
+        await ctx.reply("A character info refresh is already in progress. Please wait.", mention_author=False)
+        return
+    await ctx.reply(
+        "Refreshing existing character info posts...",
+        mention_author=False,
+    )
+    async with _CHARACTER_INFO_FORUM_LOCK:
+        inspected, updated = await _refresh_character_info_posts_only()
+    logger.info(
+        "Character info forum refresh-only completed by %s (%s): inspected=%s updated=%s",
+        author.display_name,
+        author.id,
+        inspected,
+        updated,
+    )
+    await ctx.send(
+        f"Character info forum refresh finished. Updated {updated} of {inspected} posts.",
+        mention_author=False,
+    )
 
 
 async def reroll_command(ctx: commands.Context, *, args: str = ""):
@@ -2767,97 +3320,6 @@ def _is_authorized_guild(ctx_guild: Optional[discord.Guild]) -> bool:
     if not allowed_guilds:
         return True
     return ctx_guild.id in allowed_guilds
-
-
-def _is_allowed_command_channel(
-    channel: Optional[Union[discord.abc.GuildChannel, discord.Thread]]
-) -> bool:
-    if channel is None:
-        return False
-    if ROLEPLAY_COG and ROLEPLAY_COG.is_roleplay_post(channel):
-        return True
-    if (
-        GACHA_CHANNEL_ID
-        and isinstance(channel, discord.TextChannel)
-        and channel.id == GACHA_CHANNEL_ID
-    ):
-        return True
-    if TF_CHANNEL_ID and isinstance(channel, discord.TextChannel) and channel.id == TF_CHANNEL_ID:
-        return True
-    if isinstance(channel, discord.Thread):
-        if GAME_BOARD_MANAGER and GAME_BOARD_MANAGER.is_game_thread(channel):
-            return True
-        parent = channel.parent
-        if parent and TF_CHANNEL_ID and parent.id == TF_CHANNEL_ID:
-            return True
-        if parent and GACHA_CHANNEL_ID and parent.id == GACHA_CHANNEL_ID:
-            return True
-    return False
-
-
-def _command_channel_error_message() -> str:
-    hints: List[str] = []
-    if TF_CHANNEL_ID:
-        hints.append(f"<#{TF_CHANNEL_ID}>")
-    if GACHA_CHANNEL_ID and GACHA_CHANNEL_ID != TF_CHANNEL_ID:
-        hints.append(f"<#{GACHA_CHANNEL_ID}>")
-    if GAME_BOARD_MANAGER:
-        hints.append("an active game thread")
-    if ROLEPLAY_COG:
-        hints.append("an RP forum thread")
-    if not hints:
-        return "Rolls are only supported in configured TF or game channels."
-    if len(hints) == 1:
-        return f"Rolls are only supported in {hints[0]}."
-    return f"Rolls are only supported in {', '.join(hints[:-1])}, or {hints[-1]}."
-
-
-def _extract_command_channel(
-    channel_obj: Any,
-) -> Optional[Union[discord.abc.GuildChannel, discord.Thread]]:
-    if isinstance(channel_obj, (discord.abc.GuildChannel, discord.Thread)):
-        return channel_obj
-    return None
-
-
-async def _ensure_command_channel_for_ctx(ctx: commands.Context) -> bool:
-    channel = _extract_command_channel(ctx.channel)
-    if _is_allowed_command_channel(channel):
-        return True
-    await ctx.reply(_command_channel_error_message(), mention_author=False)
-    return False
-
-
-async def _ensure_command_channel_for_interaction(interaction: discord.Interaction) -> bool:
-    channel = _extract_command_channel(interaction.channel)
-    if _is_allowed_command_channel(channel):
-        return True
-    message = _command_channel_error_message()
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
-    return False
-
-
-def guard_prefix_command_channel(func):
-    @wraps(func)
-    async def wrapper(ctx: commands.Context, *args, **kwargs):
-        if not await _ensure_command_channel_for_ctx(ctx):
-            return None
-        return await func(ctx, *args, **kwargs)
-
-    return wrapper
-
-
-def guard_slash_command_channel(func):
-    @wraps(func)
-    async def wrapper(interaction: discord.Interaction, *args, **kwargs):
-        if not await _ensure_command_channel_for_interaction(interaction):
-            return None
-        return await func(interaction, *args, **kwargs)
-
-    return wrapper
 
 
 async def tf_stats_command(ctx: commands.Context):
