@@ -138,9 +138,9 @@ def _get_face_cache_dir() -> Optional[Path]:
 
 def _get_background_root() -> Optional[Path]:
     """Return the preferred background root, preferring characters_repo/bg when available."""
-    git_repo_root = _resolve_git_repo_root()
-    if git_repo_root:
-        repo_bg_root = (git_repo_root / "bg").resolve()
+    characters_repo_root = _resolve_characters_repo_root()
+    if characters_repo_root:
+        repo_bg_root = (characters_repo_root / "bg").resolve()
         if repo_bg_root.exists():
             return repo_bg_root
     if VN_BACKGROUND_ROOT and VN_BACKGROUND_ROOT.exists():
