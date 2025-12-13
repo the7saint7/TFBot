@@ -4646,12 +4646,49 @@ async def prefix_assign_command(ctx: commands.Context, member: Optional[discord.
 @bot.command(name="reroll")
 @commands.guild_only()
 async def prefix_reroll_game_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-    """Reroll a player's character (GM only) - game version."""
+    """Reroll a player's character - uses existing reroll logic, with GM-only restriction in game threads."""
     # Check if this is a game thread first
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        await GAME_BOARD_MANAGER.command_reroll(ctx, member=member)
+        # In game threads, only GM can reroll
+        game_state = GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
+        if game_state:
+            if not GAME_BOARD_MANAGER._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can reroll characters in game threads.", mention_author=False)
+                return
+            
+            if not member:
+                await ctx.reply("Usage: `!reroll @user`", mention_author=False)
+                return
+            
+            if member.id not in game_state.players:
+                await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
+                return
+        
+        # Call the existing reroll_command with member mention
+        args_str = member.mention if member else ""
+        old_state = find_active_transformation(member.id, ctx.guild.id) if member and ctx.guild else None
+        old_character = old_state.character_name if old_state else None
+        
+        # Call existing reroll function
+        await reroll_command(ctx, args=args_str)
+        
+        # Sync game state after reroll completes
+        if game_state and member and ctx.guild:
+            new_state = find_active_transformation(member.id, ctx.guild.id)
+            if new_state and new_state.character_name:
+                # Update game state with new character
+                game_state.players[member.id].character_name = new_state.character_name
+                await GAME_BOARD_MANAGER._save_game_state(game_state)
+                await GAME_BOARD_MANAGER._log_action(game_state, f"{member.display_name} character rerolled to {new_state.character_name}")
         return
+    
     # Otherwise fall through to normal reroll command (handled by existing reroll_command)
+    # Parse member from args if not provided
+    if not member:
+        # Try to parse from args if reroll_command expects it
+        await reroll_command(ctx, args="")
+    else:
+        await reroll_command(ctx, args=member.mention)
 
 
 @bot.command(name="swap")

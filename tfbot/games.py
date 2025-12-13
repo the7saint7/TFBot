@@ -597,36 +597,6 @@ class GameBoardManager:
         await ctx.reply(f"Assigned {character_name} to {member.mention}.", mention_author=False)
         await self._log_action(game_state, f"{member.display_name} assigned character: {character_name}")
 
-    async def command_reroll(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-        """Randomly reroll a player's character (GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
-        
-        game_state = self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can reroll characters.", mention_author=False)
-            return
-        
-        if not member:
-            await ctx.reply("Usage: `!reroll @user`", mention_author=False)
-            return
-        
-        if member.id not in game_state.players:
-            await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
-            return
-        
-        # TODO: Get character pool and randomly select
-        # For now, just clear the character
-        old_char = game_state.players[member.id].character_name
-        game_state.players[member.id].character_name = None
-        await self._save_game_state(game_state)
-        await ctx.reply(f"Rerolled {member.mention}'s character (was: {old_char}).", mention_author=False)
-        await self._log_action(game_state, f"{member.display_name} character rerolled")
 
     async def command_swap(self, ctx: commands.Context, member1: Optional[discord.Member] = None, member2: Optional[discord.Member] = None) -> None:
         """Swap characters between two players (GM only)."""
