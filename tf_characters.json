@@ -1,0 +1,105 @@
+[
+  {
+    "name": "Student Transfer",
+    "file": "characters_ST",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Special",
+    "file": "characters_Special",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Shorts",
+    "file": "characters_Shorts",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Katrina's Notebook",
+    "file": "characters_KatrinasNotebook",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Potion #6",
+    "file": "characters_Potion6",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Revenge",
+    "file": "characters_Revenge",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - NovelAI",
+    "file": "characters_NovelAI",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - VR Experiment",
+    "file": "characters_VRExperiment",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Aftermath",
+    "file": "characters_Aftermath",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Other",
+    "file": "characters_Other",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Social Experiment",
+    "file": "characters_SocialExperiment",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - Fusion",
+    "file": "characters_Fusion",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "ST - Scenarios - SpringBreak",
+    "file": "characters_SpringBreak",
+    "enable_BunniBot": true,
+    "enable_VNBot": true
+  },
+  {
+    "name": "Press Switch",
+    "file": "characters_PressSwitch",
+    "enable_BunniBot": true,
+    "enable_VNBot": false
+  },
+  {
+    "name": "Uma Musume",
+    "file": "characters_UmaMusume",
+    "enable_BunniBot": true,
+    "enable_VNBot": false
+  },
+  {
+    "name": "Halloween",
+    "file": "characters_Halloween",
+    "enable_BunniBot": false,
+    "enable_VNBot": false
+  },
+  {
+    "name": "Inanimate",
+    "file": "characters_Inanimate",
+    "enable_BunniBot": false,
+    "enable_VNBot": true
+  }
+]
+

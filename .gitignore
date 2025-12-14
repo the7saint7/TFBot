@@ -5,7 +5,7 @@ __pycache__/
 *.log
 .env
 .env.*
-tf_characters.py
+characters_repo
 tf_state.json
 tf_stats.json
 transform_replies.json
