@@ -3,9 +3,13 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
-.env
-.env.*
-tf_characters.py
+# Ignore all .env files except .env.example
+.env*
+!.env.example
+# Explicitly ignore these specific .env files
+.env (Live)
+.env (Test)
+characters_repo/
 tf_state.json
 tf_stats.json
 transform_replies.json

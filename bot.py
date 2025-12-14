@@ -2687,6 +2687,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     can_force_reroll = author_is_admin or author_has_special_power
     
     # Check cooldown EARLY - before any other processing
+    # If on cooldown, return immediately without processing anything
     if not (author_is_admin or author_has_special_power):
         last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
         if last_reroll_at is not None:
@@ -2708,7 +2709,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     f"You've already used your reroll. You can reroll again in {when_text}.",
                     mention_author=False,
                 )
-                return None
+                return  # Exit immediately - don't process anything
     
     target_member: Optional[discord.Member] = None
     target_is_admin = False
@@ -4628,10 +4629,9 @@ def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
     """Check if a state has special reroll access (Ball/Narrator)."""
     if state is None:
         return False
-    name = (state.character_name or "").strip()
-    if not name:
-        return False
-    return _is_special_reroll_name(name)
+    # Use folder OR name to match the earlier definition at line 483
+    token = state.character_folder or state.character_name
+    return _is_special_reroll_name(token)
 
 
 def _format_special_reroll_hint_35(character_name: str) -> Optional[str]:
@@ -4726,6 +4726,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
     can_force_reroll = author_is_admin or author_has_special_reroll
     
     # Check cooldown EARLY - before any other processing
+    # If on cooldown, return immediately without processing query
     if not author_is_admin and not author_has_special_reroll:
         last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
         if last_reroll_at is not None:
@@ -4747,8 +4748,9 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
                     f"You've already used your reroll. You can reroll again in {when_text}.",
                     mention_author=False,
                 )
-                return None
+                return  # Exit immediately - don't process query at all
     
+    # Only process query if not on cooldown
     target_member: Optional[discord.Member] = None
     target_is_admin = False
     state: Optional[TransformationState] = None
@@ -4763,13 +4765,8 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
         first_token_input = parts[0]
         first_token = first_token_input.lower()
         first_token_variants = _token_variants(first_token_input)
+        # DON'T check can_force_reroll here - wait until after state is resolved
         if len(parts) > 1:
-            if not can_force_reroll:
-                await ctx.reply(
-                    "Only admins or Narrator TFs can force a reroll into a specific form.",
-                    mention_author=False,
-                )
-                return None
             forced_token = parts[1].lower()
 
         def _state_matches(state: TransformationState) -> bool:
@@ -4827,6 +4824,21 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
                 return None
             if target_member is None:
                 _, target_member = await fetch_member(state.guild_id, state.user_id)
+        
+        # NOW that state is fully resolved, re-check author_state and permissions
+        # This ensures we have the most up-to-date state with folder populated
+        author_state = find_active_transformation(author.id, guild.id)
+        author_has_special_reroll = _has_special_reroll_access(author_state)
+        can_force_reroll = author_is_admin or author_has_special_reroll
+        
+        # NOW check if they can force reroll (after state is resolved)
+        if forced_token and not can_force_reroll:
+            await ctx.reply(
+                "Only admins or Narrator TFs can force a reroll into a specific form.",
+                mention_author=False,
+            )
+            return None
+        
         if target_member is None:
             await ctx.reply(
                 f"Unable to locate the member transformed into {state.character_name}.",
