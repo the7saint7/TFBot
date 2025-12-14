@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import traceback
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -261,28 +262,6 @@ if _characters_repo_path:
     os.environ["TFBOT_VN_ASSET_ROOT"] = str(_characters_repo_path)
 
 
-def _ensure_tf_characters_imported() -> None:
-    try:
-        import tf_characters  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        pass
-    module_path = BASE_DIR / "tf_characters.py"
-    if not module_path.exists():
-        raise ModuleNotFoundError(
-            "tf_characters module not found and tf_characters.py is missing. Ensure the dataset file exists.",
-        )
-    spec = importlib.util.spec_from_file_location("tf_characters", module_path)
-    if spec is None or spec.loader is None:
-        raise ModuleNotFoundError("Unable to load tf_characters module from tf_characters.py.")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[call-arg]
-    sys.modules["tf_characters"] = module
-
-
-_ensure_tf_characters_imported()
-
-
 def _resolve_character_faces_root() -> Optional[Path]:
     repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip() or "characters_repo"
     repo_dir = Path(repo_dir_setting)
@@ -305,7 +284,22 @@ def _resolve_character_faces_root() -> Optional[Path]:
 
 CHARACTER_FACES_ROOT = _resolve_character_faces_root()
 
-from tf_characters import TF_CHARACTERS as _DEFAULT_CHARACTER_DATA
+try:
+    from tf_characters import TF_CHARACTERS as _DEFAULT_CHARACTER_DATA
+except ModuleNotFoundError:
+    module_path = BASE_DIR / "tf_characters.py"
+    if not module_path.exists():
+        raise
+    spec = importlib.util.spec_from_file_location("tf_characters", module_path)
+    if spec is None or spec.loader is None:
+        raise
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["tf_characters"] = module
+    spec.loader.exec_module(module)  # type: ignore[arg-type]
+    data = getattr(module, "TF_CHARACTERS", None)
+    if not isinstance(data, list):
+        raise RuntimeError("tf_characters.py does not define a TF_CHARACTERS list.")
+    _DEFAULT_CHARACTER_DATA = data
 from ai_rewriter import AI_REWRITE_ENABLED, rewrite_message_for_character
 from tfbot.models import (
     OutfitAsset,
@@ -1064,11 +1058,25 @@ def _resolve_avatar_root() -> Optional[Path]:
     return root
 
 
+_CHARACTER_DATASET_LOADS = 0
+_CHARACTER_DATASET_STACKS: list[tuple[int, str]] = []
+
+
 def _load_character_dataset() -> Sequence[Dict[str, str]]:
+    global _CHARACTER_DATASET_LOADS
+    _CHARACTER_DATASET_LOADS += 1
+    logger.info("Character dataset load invoked (count=%s).", _CHARACTER_DATASET_LOADS)
+    if _CHARACTER_DATASET_LOADS > 1:
+        stack_snippet = "".join(traceback.format_stack(limit=8))
+        _CHARACTER_DATASET_STACKS.append((_CHARACTER_DATASET_LOADS, stack_snippet))
     if CHARACTER_DATA_FILE_SETTING:
         dataset_path = Path(CHARACTER_DATA_FILE_SETTING).expanduser()
         if not dataset_path.is_absolute():
             dataset_path = (BASE_DIR / dataset_path).resolve()
+        default_path = (BASE_DIR / "tf_characters.py").resolve()
+        if dataset_path == default_path:
+            logger.debug("TFBOT_CHARACTERS_FILE points to default tf_characters.py; using built-in dataset.")
+            return _DEFAULT_CHARACTER_DATA
         if dataset_path.exists():
             suffix = dataset_path.suffix.lower()
             if suffix == ".py":
@@ -1159,6 +1167,11 @@ def _build_character_pool(
         raise RuntimeError("TF character dataset is empty. Populate tf_characters.py.")
     return pool
 
+
+if _CHARACTER_DATASET_STACKS:
+    for count, stack in _CHARACTER_DATASET_STACKS:
+        logger.warning("Character dataset reload #%s stack:\n%s", count, stack)
+    _CHARACTER_DATASET_STACKS.clear()
 
 _CHARACTER_DATASET = _load_character_dataset()
 CHARACTER_POOL = _build_character_pool(_CHARACTER_DATASET, CHARACTER_AVATAR_ROOT)

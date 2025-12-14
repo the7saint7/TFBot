@@ -14,7 +14,16 @@ def _format_message(message: str) -> str:
     """Replace {BOT_NAME} placeholder with actual bot name."""
     return message.replace("{BOT_NAME}", BOT_NAME)
 
-TF_CHARACTERS = []
+# Shared cache for loaded characters so repeated imports don't reprocess packs
+_PACK_CACHE_KEY = f"tf_characters::{BOT_NAME}"
+TF_CHARACTERS: list[dict] = []
+
+if _PACK_CACHE_KEY in globals():
+    cached_chars = globals().get(_PACK_CACHE_KEY)
+    if isinstance(cached_chars, list) and cached_chars:
+        TF_CHARACTERS = cached_chars.copy()
+else:
+    globals()[_PACK_CACHE_KEY] = TF_CHARACTERS
 
 # Load pack configuration from JSON
 _config_path = Path(__file__).parent / "tf_characters.json"
