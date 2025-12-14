@@ -64,6 +64,8 @@ def serialize_state(state: TransformationState) -> Dict[str, object]:
         "avatar_applied": state.avatar_applied,
         "is_inanimate": state.is_inanimate,
         "inanimate_responses": list(state.inanimate_responses),
+        "form_owner_user_id": state.form_owner_user_id,
+        "identity_display_name": state.identity_display_name,
     }
 
 
@@ -87,6 +89,8 @@ def deserialize_state(payload: Dict[str, object]) -> TransformationState:
         avatar_applied=bool(payload.get("avatar_applied", False)),
         is_inanimate=bool(payload.get("is_inanimate", False)),
         inanimate_responses=tuple(payload.get("inanimate_responses", ())),
+        form_owner_user_id=payload.get("form_owner_user_id"),
+        identity_display_name=payload.get("identity_display_name"),
     )
 
 

@@ -44,6 +44,8 @@ class TransformationState:
     original_display_name: str = ""
     is_inanimate: bool = False
     inanimate_responses: Tuple[str, ...] = field(default_factory=tuple)
+    form_owner_user_id: Optional[int] = None
+    identity_display_name: Optional[str] = None
 
 
 @dataclass

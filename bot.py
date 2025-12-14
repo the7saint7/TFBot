@@ -326,6 +326,7 @@ from tfbot.state import (
     revert_tasks,
     state_key,
 )
+from tfbot.swaps import SwapTransition, ensure_form_owner, unswap_chain
 from tfbot.legacy_embed import build_legacy_embed
 from tfbot.history import publish_history_snapshot
 from tfbot.panels import (
@@ -744,7 +745,7 @@ def _build_roleplay_state(
         guild_id = guild.id
     elif actor.guild:
         guild_id = actor.guild.id
-    return TransformationState(
+    state = TransformationState(
         user_id=actor.id,
         guild_id=guild_id,
         character_name=character.name,
@@ -760,6 +761,8 @@ def _build_roleplay_state(
         is_inanimate=False,
         inanimate_responses=tuple(),
     )
+    ensure_form_owner(state)
+    return state
 
 
 def _build_inanimate_roleplay_state(
@@ -778,7 +781,7 @@ def _build_inanimate_roleplay_state(
     if not responses:
         message = str(entry.get("message") or "").strip()
         responses = (message,) if message else tuple()
-    return TransformationState(
+    state = TransformationState(
         user_id=actor.id,
         guild_id=guild_id,
         character_name=str(entry.get("name") or "Mysterious Relic"),
@@ -794,11 +797,13 @@ def _build_inanimate_roleplay_state(
         is_inanimate=True,
         inanimate_responses=responses,
     )
+    ensure_form_owner(state)
+    return state
 
 
 def _build_placeholder_state(member: discord.Member, guild: discord.Guild) -> TransformationState:
     now = utc_now()
-    return TransformationState(
+    state = TransformationState(
         user_id=member.id,
         guild_id=guild.id,
         character_name="",
@@ -814,6 +819,8 @@ def _build_placeholder_state(member: discord.Member, guild: discord.Guild) -> Tr
         is_inanimate=False,
         inanimate_responses=tuple(),
     )
+    ensure_form_owner(state)
+    return state
 
 
 def _token_active(token: str) -> bool:
@@ -1444,6 +1451,54 @@ async def _schedule_revert(state: TransformationState, delay: float) -> None:
         logger.exception("Unexpected error while reverting TF for user %s", state.user_id)
 
 
+async def _announce_swap_cascade(
+    guild_id: int,
+    transitions: Sequence[SwapTransition],
+    *,
+    reason: str,
+    channel: Optional[discord.abc.Messageable] = None,
+) -> None:
+    guild = bot.get_guild(guild_id)
+    lines: List[str] = []
+    for transition in transitions:
+        member_name = None
+        if guild:
+            member = guild.get_member(transition.user_id)
+            if member:
+                member_name = member.display_name
+        member_name = member_name or f"User {transition.user_id}"
+        lines.append(f"- {member_name}: {transition.before_form} -> {transition.after_form}")
+    summary = "\n".join(lines) if lines else "No participants."
+    description = f"{reason}\n{summary}"
+    await send_history_message("Swap Chain Reset", description)
+    if channel:
+        try:
+            await channel.send(
+                f"Swap chain reset: {reason}\n{summary}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Failed to announce swap cascade in channel %s: %s",
+                getattr(channel, "id", "unknown"),
+                exc,
+            )
+
+
+async def _unswap_and_announce(
+    guild_id: int,
+    trigger_user_id: int,
+    *,
+    reason: str,
+    channel: Optional[discord.abc.Messageable] = None,
+) -> bool:
+    transitions = unswap_chain(guild_id, trigger_user_id)
+    if not transitions:
+        return False
+    await _announce_swap_cascade(guild_id, transitions, reason=reason, channel=channel)
+    return True
+
+
 async def revert_transformation(state: TransformationState, *, expired: bool) -> None:
     key = state_key(state.guild_id, state.user_id)
     current = active_transformations.get(key)
@@ -1457,6 +1512,12 @@ async def revert_transformation(state: TransformationState, *, expired: bool) ->
             state.original_display_name = member_profile_name(member)
     else:
         logger.warning("Could not locate member %s in guild %s to revert TF", state.user_id, state.guild_id)
+
+    await _unswap_and_announce(
+        state.guild_id,
+        state.user_id,
+        reason=f"{member.display_name if member else f'User {state.user_id}'}: {reason}",
+    )
 
     task = revert_tasks.pop(key, None)
     if task:
@@ -1701,11 +1762,7 @@ async def relay_transformed_message(
                 reply_context.author,
                 reply_context.text[:120],
             )
-        character_display_name = state.character_name
-        if ROLEPLAY_COG and message.guild and ROLEPLAY_COG.is_roleplay_post(message.channel):
-            override_display = ROLEPLAY_COG.resolve_display_name(message.guild.id, message.author.id)
-            if override_display:
-                character_display_name = override_display
+        character_display_name = _resolve_character_display_name(message.guild, message.author.id, state)
         vn_file = render_vn_panel(
             state=state,
             message_content=cleaned_content,
@@ -1963,6 +2020,23 @@ def _format_character_message(
     return f"{lead_line}\n{summary_line}"
 
 
+def _resolve_character_display_name(
+    guild: Optional[discord.Guild],
+    member_id: int,
+    state: TransformationState,
+) -> str:
+    if ROLEPLAY_COG and guild:
+        try:
+            override_display = ROLEPLAY_COG.resolve_display_name(guild.id, member_id)
+        except Exception:  # pragma: no cover - defensive
+            override_display = None
+        if override_display:
+            return override_display
+    if state.identity_display_name:
+        return state.identity_display_name
+    return state.character_name
+
+
 async def handle_transformation(message: discord.Message) -> Optional[TransformationState]:
     if not message.guild:
         logger.debug("Skipping TF outside of guild context.")
@@ -2083,6 +2157,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         is_inanimate=inanimate_form is not None,
         inanimate_responses=inanimate_responses,
     )
+    ensure_form_owner(state)
     active_transformations[key] = state
     persist_states()
 
@@ -2280,6 +2355,26 @@ def guard_slash_command_channel(func):
         return await func(interaction, *args, **kwargs)
 
     return wrapper
+
+
+async def _safe_defer_interaction(
+    interaction: discord.Interaction,
+    *,
+    thinking: bool = True,
+) -> bool:
+    """Attempt to defer an interaction, tolerating already-expired interactions."""
+    if interaction.response.is_done():
+        return True
+    try:
+        await interaction.response.defer(thinking=thinking)
+        return True
+    except discord.NotFound as exc:
+        logger.warning(
+            "Interaction %s expired before defer could be sent: %s",
+            getattr(interaction, "id", "unknown"),
+            exc,
+        )
+        return False
 
 
 def _find_character_face_path(folder_name: Optional[str]) -> Optional[Path]:
@@ -3011,6 +3106,20 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         if current_state is None or current_state != state:
             await ctx.reply(
                 "Unable to locate the transformation for this member.",
+                mention_author=False,
+            )
+            return None
+
+        await _unswap_and_announce(
+            guild.id,
+            target_member.id,
+            reason=f"{target_member.display_name}'s swap chain reset before reroll.",
+            channel=ctx.channel,
+        )
+        state = active_transformations.get(key)
+        if state is None:
+            await ctx.reply(
+                "Their transformation reset during the swap cleanup. Try again if they are still transformed.",
                 mention_author=False,
             )
             return None
@@ -4336,11 +4445,7 @@ async def _handle_slash_say(
 
     files: list[discord.File] = []
     payload: dict = {}
-    character_display_name = target_state.character_name
-    if ROLEPLAY_COG and guild_channel and ROLEPLAY_COG.is_roleplay_post(guild_channel):
-        override_display = ROLEPLAY_COG.resolve_display_name(guild.id, actor.id)
-        if override_display:
-            character_display_name = override_display
+    character_display_name = _resolve_character_display_name(guild, actor.id, target_state)
 
     if MESSAGE_STYLE == "vn" and not target_state.is_inanimate:
         vn_file = render_vn_panel(
@@ -5591,6 +5696,11 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     char2_inanimate = state2.is_inanimate
     char2_responses = state2.inanimate_responses
     
+    owner1 = state1.form_owner_user_id or user1_id
+    owner2 = state2.form_owner_user_id or user2_id
+    identity1 = state1.identity_display_name or state1.character_name
+    identity2 = state2.identity_display_name or state2.character_name
+
     # Create new states with swapped character data
     new_state1 = TransformationState(
         user_id=user1_id,
@@ -5607,8 +5717,10 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         original_display_name=state1.original_display_name,
         is_inanimate=char2_inanimate,
         inanimate_responses=char2_responses,
+        form_owner_user_id=owner2,
+        identity_display_name=identity1,
     )
-    
+
     new_state2 = TransformationState(
         user_id=user2_id,
         guild_id=state2.guild_id,
@@ -5624,6 +5736,8 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         original_display_name=state2.original_display_name,
         is_inanimate=char1_inanimate,
         inanimate_responses=char1_responses,
+        form_owner_user_id=owner1,
+        identity_display_name=identity2,
     )
     
     # Update active_transformations
@@ -5674,7 +5788,8 @@ async def slash_swap_command(
     character2: str,
 ) -> None:
     """Swap characters between two players or characters."""
-    await interaction.response.defer(thinking=True)
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
     
     # Check if this is a game thread - if so, delegate to gameboard manager
     if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
@@ -5767,6 +5882,11 @@ async def slash_swap_command(
     char2_inanimate = state2.is_inanimate
     char2_responses = state2.inanimate_responses
     
+    owner1 = state1.form_owner_user_id or user1_id
+    owner2 = state2.form_owner_user_id or user2_id
+    identity1 = state1.identity_display_name or state1.character_name
+    identity2 = state2.identity_display_name or state2.character_name
+    
     # Create new states with swapped character data
     new_state1 = TransformationState(
         user_id=user1_id,
@@ -5783,8 +5903,10 @@ async def slash_swap_command(
         original_display_name=state1.original_display_name,
         is_inanimate=char2_inanimate,
         inanimate_responses=char2_responses,
+        form_owner_user_id=owner2,
+        identity_display_name=identity1,
     )
-    
+
     new_state2 = TransformationState(
         user_id=user2_id,
         guild_id=state2.guild_id,
@@ -5800,6 +5922,8 @@ async def slash_swap_command(
         original_display_name=state2.original_display_name,
         is_inanimate=char1_inanimate,
         inanimate_responses=char1_responses,
+        form_owner_user_id=owner1,
+        identity_display_name=identity2,
     )
     
     # Update active_transformations
@@ -6339,10 +6463,11 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
     files: list[discord.File] = []
     payload: dict = {}
     if MESSAGE_STYLE == "vn":
+        character_display_name = _resolve_character_display_name(ctx.guild, target_state.user_id, target_state)
         vn_file = render_vn_panel(
             state=target_state,
             message_content=cleaned_content,
-            character_display_name=target_state.character_name,
+            character_display_name=character_display_name,
             original_name=original_name,
             attachment_id=str(ctx.message.id),
             formatted_segments=formatted_segments,

@@ -15,6 +15,7 @@ from discord.ext import commands
 from .models import TransformationState
 from .interactions import InteractionContextAdapter
 from .state import active_transformations, persist_states, revert_tasks, state_key
+from .swaps import unswap_chain
 from .utils import is_admin, member_profile_name, utc_now
 
 logger = logging.getLogger("tfbot.roleplay")
@@ -176,6 +177,34 @@ class RoleplayCog(commands.Cog):
     async def _set_dm(self, member: discord.Member) -> None:
         self.dm_user_id = member.id
         await self._save_state()
+
+    async def _announce_swap_reset(
+        self,
+        guild: discord.Guild,
+        channel: Optional[discord.abc.Messageable],
+        *,
+        user_id: int,
+        reason: str,
+    ) -> bool:
+        if channel is None:
+            return False
+        transitions = unswap_chain(guild.id, user_id)
+        if not transitions:
+            return False
+        lines: list[str] = []
+        for transition in transitions:
+            member = guild.get_member(transition.user_id)
+            display = member_profile_name(member) if member else f"User {transition.user_id}"
+            lines.append(f"- {display}: {transition.before_form} -> {transition.after_form}")
+        summary = "\n".join(lines) if lines else "No participants."
+        try:
+            await channel.send(
+                f"Swap chain reset: {reason}\n{summary}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.warning("Failed to announce swap reset in RP channel %s", getattr(channel, "id", "unknown"))
+        return True
 
     #
     # Reroll helpers
@@ -443,6 +472,12 @@ class RoleplayCog(commands.Cog):
                 g_id, u_id = key
                 if g_id != guild_id:
                     continue
+                await self._announce_swap_reset(
+                    ctx.guild,
+                    ctx.channel,
+                    user_id=u_id,
+                    reason="RP unload (all)",
+                )
                 if await self._clear_active_transformation(g_id, u_id):
                     tf_removed += 1
             await ctx.reply(
@@ -457,6 +492,12 @@ class RoleplayCog(commands.Cog):
         except commands.BadArgument:
             await ctx.send(f"I couldn't find `{target_arg}` in this server.")
             return
+        await self._announce_swap_reset(
+            ctx.guild,
+            ctx.channel,
+            user_id=resolved_member.id,
+            reason=f"RP unload for {member_profile_name(resolved_member)}",
+        )
         assignment_removed = await self._unload_assignment(ctx.guild.id, resolved_member.id)
         tf_removed = await self._clear_active_transformation(ctx.guild.id, resolved_member.id)
         if assignment_removed or tf_removed:

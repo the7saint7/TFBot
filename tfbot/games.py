@@ -18,6 +18,7 @@ from .game_models import GameConfig, GamePlayer, GameState
 from .game_board import render_game_board, validate_coordinate
 from .utils import is_admin, int_from_env, path_from_env
 from .models import TransformationState
+from .swaps import ensure_form_owner
 
 logger = logging.getLogger("tfbot.games")
 
@@ -204,7 +205,7 @@ class GameBoardManager:
             return None
         
         now = datetime.utcnow()
-        return TransformationState(
+        state = TransformationState(
             user_id=user_id,
             guild_id=guild_id,
             character_name=character_name,
@@ -220,6 +221,8 @@ class GameBoardManager:
             is_inanimate=False,
             inanimate_responses=tuple(),
         )
+        ensure_form_owner(state)
+        return state
 
     def _get_game_background_path(self, background_id: Optional[int]) -> Optional[Path]:
         """Get background path from background_id index."""
@@ -1026,4 +1029,3 @@ class GameBoardManager:
         """Register all game commands."""
         # TODO: Implement command registration
         pass
-
