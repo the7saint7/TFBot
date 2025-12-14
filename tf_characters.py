@@ -3,6 +3,7 @@ import json
 import importlib.util
 import logging
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("tfbot")
 
@@ -13,6 +14,40 @@ BOT_NAME = os.getenv("TFBOT_NAME", "Syn").strip() or "Syn"
 def _format_message(message: str) -> str:
     """Replace {BOT_NAME} placeholder with actual bot name."""
     return message.replace("{BOT_NAME}", BOT_NAME)
+
+_MODULE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_characters_repo_root() -> Optional[Path]:
+    """Locate the shared characters_repo directory (required)."""
+    repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip() or "characters_repo"
+    repo_dir = Path(repo_dir_setting)
+    if not repo_dir.is_absolute():
+        repo_dir = (_MODULE_DIR / repo_dir).resolve()
+    return repo_dir if repo_dir.exists() else None
+
+
+_CHARACTERS_REPO_ROOT = _resolve_characters_repo_root()
+if _CHARACTERS_REPO_ROOT is None:
+    message = (
+        "characters_repo directory not found. Ensure the shared repository exists "
+        "and TFBOT_CHARACTERS_REPO_DIR points to it."
+    )
+    logger.critical(message)
+    raise SystemExit(message)
+
+_config_path = _CHARACTERS_REPO_ROOT / "tf_characters.json"
+_packs_dir = _CHARACTERS_REPO_ROOT / "packs"
+
+if _config_path.exists():
+    logger.info("Character pack configuration: %s", _config_path)
+else:
+    logger.warning("Character pack configuration missing at %s", _config_path)
+
+if _packs_dir.exists():
+    logger.info("Character packs directory: %s", _packs_dir)
+else:
+    logger.warning("Character packs directory missing at %s", _packs_dir)
 
 # Shared cache for loaded characters so repeated imports don't reprocess packs
 _PACK_CACHE_KEY = f"tf_characters::{BOT_NAME}"
@@ -25,9 +60,6 @@ if _PACK_CACHE_KEY in globals():
 else:
     globals()[_PACK_CACHE_KEY] = TF_CHARACTERS
 
-# Load pack configuration from JSON
-_config_path = Path(__file__).parent / "tf_characters.json"
-_packs_dir = Path(__file__).parent / "packs"
 configured_files = set()
 
 if _config_path.exists():
@@ -59,6 +91,10 @@ if _config_path.exists():
             logger.info("  Pack '%s' (%s): %s", pack_name, pack_file, status)
             
             if should_load and pack_file:
+                if not _packs_dir.exists():
+                    logger.warning("    Packs directory missing; cannot load %s.", pack_file)
+                    continue
+
                 # Try to load from packs directory
                 pack_path = _packs_dir / f"{pack_file}.py"
                 if pack_path.exists():
@@ -85,6 +121,8 @@ if _config_path.exists():
                                     logger.info("    Loaded %d characters from %s", len(pack_chars), pack_file)
                         except Exception as exc:
                             logger.warning("Failed to load pack %s: %s", pack_file, exc)
+                    else:
+                        logger.warning("Pack file %s not found in %s", pack_file, _packs_dir)
     except Exception as exc:
         logger.warning("Failed to load pack config from tf_characters.json: %s", exc)
 
