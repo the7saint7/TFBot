@@ -261,6 +261,28 @@ if _characters_repo_path:
     os.environ["TFBOT_VN_ASSET_ROOT"] = str(_characters_repo_path)
 
 
+def _ensure_tf_characters_imported() -> None:
+    try:
+        import tf_characters  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+    module_path = BASE_DIR / "tf_characters.py"
+    if not module_path.exists():
+        raise ModuleNotFoundError(
+            "tf_characters module not found and tf_characters.py is missing. Ensure the dataset file exists.",
+        )
+    spec = importlib.util.spec_from_file_location("tf_characters", module_path)
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError("Unable to load tf_characters module from tf_characters.py.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[call-arg]
+    sys.modules["tf_characters"] = module
+
+
+_ensure_tf_characters_imported()
+
+
 def _resolve_character_faces_root() -> Optional[Path]:
     repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip() or "characters_repo"
     repo_dir = Path(repo_dir_setting)
