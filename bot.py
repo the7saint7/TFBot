@@ -2958,17 +2958,17 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             if SPECIAL_CHARACTERS_ADMIN_ONLY:
                 if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
                     if not author_is_admin and not author_has_special_power:
-                    await ctx.reply(
-                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
-                        mention_author=False,
-                    )
+                        await ctx.reply(
+                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                            mention_author=False,
+                        )
                         return None
                 if forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
                     if not author_is_admin and not author_has_special_power:
-                    await ctx.reply(
-                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
-                        mention_author=False,
-                    )
+                        await ctx.reply(
+                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                            mention_author=False,
+                        )
                         return None
             if (
                 forced_character is not None
@@ -4953,17 +4953,17 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
             if SPECIAL_CHARACTERS_ADMIN_ONLY:
                 if forced_character is not None and _is_special_reroll_name(forced_character.name):
                     if not author_is_admin and not author_has_special_reroll:
-                    await ctx.reply(
-                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
-                        mention_author=False,
-                    )
+                        await ctx.reply(
+                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                            mention_author=False,
+                        )
                         return None
                 if forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
                     if not author_is_admin and not author_has_special_reroll:
-                    await ctx.reply(
-                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
-                        mention_author=False,
-                    )
+                        await ctx.reply(
+                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                            mention_author=False,
+                        )
                         return None
             forced_special_name = None
             if forced_character is not None and _is_special_reroll_name(forced_character.name):
