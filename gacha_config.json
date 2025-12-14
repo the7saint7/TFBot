@@ -1,0 +1,4443 @@
+{
+  "characters": {
+    "abby": {
+      "display_name": "Abby Luten",
+      "poses": {
+        "a": {
+          "outfits": {
+            "costume": {
+              "rarity": "epic"
+            },
+            "lounge": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "suit": {
+              "rarity": "common"
+            },
+            "suit_b": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "akira": {
+      "display_name": "Akira",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "shirt": {
+              "rarity": "rare"
+            },
+            "suit": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "alex": {
+      "display_name": "Alex Hawkins",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "allison": {
+      "display_name": "Allison",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "epic"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_alt": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_b_wet": {
+              "rarity": "rare"
+            },
+            "wedding": {
+              "rarity": "epic"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_alt": {
+              "rarity": "rare"
+            },
+            "gym_b": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "amy": {
+      "display_name": "Amy",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "gym": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nighty": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "anuja": {
+      "display_name": "Anuja",
+      "poses": {
+        "a": {
+          "outfits": {
+            "exotic": {
+              "rarity": "epic"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "audrey": {
+      "display_name": "Audrey",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "track": {
+              "rarity": "rare"
+            },
+            "track_b": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual_b": {
+              "rarity": "common"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "track": {
+              "rarity": "rare"
+            },
+            "track_b": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "dress": {
+              "rarity": "common"
+            },
+            "idol": {
+              "rarity": "common"
+            }
+          }
+        },
+        "d": {
+          "outfits": {
+            "idol": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "brad": {
+      "display_name": "Brad",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "bradgb": {
+      "display_name": "Bradgb",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "carla": {
+      "display_name": "Carla",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "yukata": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "carrie": {
+      "display_name": "Carrie",
+      "poses": {
+        "a": {
+          "outfits": {
+            "bikini": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "casey": {
+      "display_name": "Casey",
+      "poses": {
+        "a": {
+          "outfits": {
+            "gym": {
+              "rarity": "common"
+            }
+          }
+        },
+        "am": {
+          "outfits": {
+            "maid": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "cassie": {
+      "display_name": "Cassie",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "casual_d": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "casual_d": {
+              "rarity": "rare"
+            },
+            "gown": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "dress": {
+              "rarity": "common"
+            },
+            "wedding": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "charlotte": {
+      "display_name": "Charlotte",
+      "poses": {
+        "a": {
+          "outfits": {
+            "bikini": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_hairloop": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "jeans": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_hairloop": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "bikini": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_hairloop": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "jeans": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_hairloop": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "circe": {
+      "display_name": "Circe",
+      "poses": {
+        "a": {
+          "outfits": {
+            "nude": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "claus": {
+      "display_name": "Claus",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "connie": {
+      "display_name": "Connie Williams",
+      "poses": {
+        "a": {
+          "outfits": {
+            "baseball": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "shaved": {
+              "rarity": "rare"
+            },
+            "suit": {
+              "rarity": "rare"
+            },
+            "sweater": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual_b": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "common"
+            },
+            "pregnant": {
+              "rarity": "common"
+            },
+            "shaved": {
+              "rarity": "common"
+            },
+            "suit": {
+              "rarity": "common"
+            },
+            "sweater": {
+              "rarity": "common"
+            },
+            "swimsuit": {
+              "rarity": "common"
+            },
+            "underwear": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "cornelia": {
+      "display_name": "Cornelia",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "costume": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "sport": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "cheer": {
+              "rarity": "rare"
+            },
+            "cheer_inverted": {
+              "rarity": "rare"
+            },
+            "costume": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "sport": {
+              "rarity": "rare"
+            },
+            "swimwear": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "yukata": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "dominic": {
+      "display_name": "Dominic",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "donna": {
+      "display_name": "Donna Barnes",
+      "poses": {
+        "a": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "elizabeth": {
+      "display_name": "Elizabeth",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "catsuit": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "maid_b": {
+              "rarity": "rare"
+            },
+            "maid_c": {
+              "rarity": "rare"
+            },
+            "maid_topless": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "winter": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "maid": {
+              "rarity": "common"
+            },
+            "maid_b": {
+              "rarity": "common"
+            },
+            "maid_stained": {
+              "rarity": "common"
+            },
+            "maid_topless": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "common"
+            },
+            "nude_shaved": {
+              "rarity": "common"
+            },
+            "server": {
+              "rarity": "common"
+            },
+            "winter": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "emily": {
+      "display_name": "Emily",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "eric": {
+      "display_name": "Eric",
+      "poses": {
+        "a": {
+          "outfits": {
+            "boxer": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "ericgb": {
+      "display_name": "Ericgb",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "faith": {
+      "display_name": "Faith",
+      "poses": {
+        "a": {
+          "outfits": {
+            "nude": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "flavia": {
+      "display_name": "Flavia",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "costume": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "gabriel": {
+      "display_name": "Gabriel",
+      "poses": {
+        "a": {
+          "outfits": {
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_c": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "costume": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_c": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "genny": {
+      "display_name": "Genny",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_c": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_c": {
+              "rarity": "rare"
+            },
+            "yukata": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "grace": {
+      "display_name": "Grace Reinhardt",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "greg": {
+      "display_name": "Greg Fisk",
+      "poses": {
+        "a": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "gwen": {
+      "display_name": "Gwen",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "hank": {
+      "display_name": "Hank",
+      "poses": {
+        "a": {
+          "outfits": {
+            "formal": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "hestia": {
+      "display_name": "Hestia",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "holly": {
+      "display_name": "Holly",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "miko": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "track": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "bikini": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "irene": {
+      "display_name": "Irene",
+      "poses": {
+        "a": {
+          "outfits": {
+            "athletic": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "costume": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "sport": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "sport": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "isabelle": {
+      "display_name": "Isabelle",
+      "poses": {
+        "a": {
+          "outfits": {
+            "nude": {
+              "rarity": "common"
+            },
+            "suit": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "izuna": {
+      "display_name": "Izuna",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_alt": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_alt": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "jack": {
+      "display_name": "Jack Mallory",
+      "poses": {
+        "a": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "john": {
+      "display_name": "John",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "monitor": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "sleepwear": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_alt": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "winter": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "johnLeonalife": {
+      "display_name": "John Leonalife",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "johngb": {
+      "display_name": "Johngb",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "traditional": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_shirt": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "genie": {
+              "rarity": "rare"
+            },
+            "pigtail_sexy": {
+              "rarity": "rare"
+            },
+            "pregnant": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "genie": {
+              "rarity": "rare"
+            },
+            "pigtail_sexy": {
+              "rarity": "rare"
+            },
+            "pregnant": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "johngbLegacy": {
+      "display_name": "Johngb Legacy",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "traditional": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "traditional": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "katrina": {
+      "display_name": "Katrina",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "casual_wet": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "maid_b": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "panties": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "casual_wet": {
+              "rarity": "rare"
+            },
+            "cheer": {
+              "rarity": "rare"
+            },
+            "cheer_inverted": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "panties": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "yshirt": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "katrinagb": {
+      "display_name": "Katrinagb",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "kiyoshi": {
+      "display_name": "Kiyoshi",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "gym_female": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "shirtless": {
+              "rarity": "rare"
+            },
+            "traditional": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "kiyoshigb": {
+      "display_name": "Kiyoshigb",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_legacy": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_legacy": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform_legacy": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "kyoko": {
+      "display_name": "Kyoko",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_assault": {
+              "rarity": "rare"
+            },
+            "casual_labcoat": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "gym_assault": {
+              "rarity": "rare"
+            },
+            "lingerie": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_assault": {
+              "rarity": "rare"
+            },
+            "uniform_labcoat": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "lingerie": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "kyoko_torimorph": {
+      "display_name": "Kyoko Torimorph",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform_burst": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "laura": {
+      "display_name": "Laura Morgan",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "loungewear": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "suit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "loungewear": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "suit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "leona": {
+      "display_name": "Leona Winters",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "suit": {
+              "rarity": "rare"
+            },
+            "suit_b": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "cosplay": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "lingerie": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "suit": {
+              "rarity": "rare"
+            },
+            "suit_b": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "yoga": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "leona_johnlife": {
+      "display_name": "Leon Davis",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "maria": {
+      "display_name": "Maria",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "marty": {
+      "display_name": "Marty",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "matt": {
+      "display_name": "Matt",
+      "poses": {
+        "a": {
+          "outfits": {
+            "formal": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "maurice": {
+      "display_name": "Maurice Honda",
+      "poses": {
+        "a": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "mel": {
+      "display_name": "Mel",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "costume": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_b": {
+              "rarity": "rare"
+            },
+            "swimsuit_shirt": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "costume": {
+              "rarity": "rare"
+            },
+            "costume_propless": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_b": {
+              "rarity": "rare"
+            },
+            "swimsuit_shirt": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "michelle": {
+      "display_name": "Michelle",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "nude_shaved": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "wedding": {
+              "rarity": "epic"
+            },
+            "winter": {
+              "rarity": "rare"
+            },
+            "yukata": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "mina": {
+      "display_name": "Mina",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_apron": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_b_apron": {
+              "rarity": "rare"
+            },
+            "uniform_c": {
+              "rarity": "rare"
+            },
+            "uniform_c_apron": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "bikini": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_apron": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_b_apron": {
+              "rarity": "rare"
+            },
+            "uniform_c": {
+              "rarity": "rare"
+            },
+            "uniform_c_apron": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "naomi": {
+      "display_name": "Naomi",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "nemuri": {
+      "display_name": "Nemuri Otani",
+      "poses": {
+        "a": {
+          "outfits": {
+            "robe": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "nora": {
+      "display_name": "Nora",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "patty": {
+      "display_name": "Patty",
+      "poses": {
+        "a": {
+          "outfits": {
+            "costume": {
+              "rarity": "rare"
+            },
+            "costume_ball": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "robe": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "paul": {
+      "display_name": "Paul",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "phila": {
+      "display_name": "Phila",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_apron": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_b_apron": {
+              "rarity": "rare"
+            },
+            "uniform_d": {
+              "rarity": "rare"
+            },
+            "uniform_d_apron": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "bikini": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_b": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_apron": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            },
+            "uniform_b_apron": {
+              "rarity": "rare"
+            },
+            "uniform_c": {
+              "rarity": "rare"
+            },
+            "uniform_d": {
+              "rarity": "rare"
+            },
+            "uniform_d_apron": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "rachel": {
+      "display_name": "Rachel Clark",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "sleepwear": {
+              "rarity": "rare"
+            },
+            "sleepwear_b": {
+              "rarity": "rare"
+            },
+            "sleepwear_inverted": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        },
+        "full_a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "rika": {
+      "display_name": "Rika",
+      "poses": {
+        "a": {
+          "outfits": {
+            "normal": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "sinister": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "riley": {
+      "display_name": "Riley",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "rileygb": {
+      "display_name": "Rileygb",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "towel": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "rita": {
+      "display_name": "Rita",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "server": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "boxer": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "rudy": {
+      "display_name": "Rudy",
+      "poses": {
+        "a": {
+          "outfits": {
+            "rudy": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "sadie": {
+      "display_name": "Sadie",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "cheer": {
+              "rarity": "rare"
+            },
+            "cheer_inverted": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "sleepwear": {
+              "rarity": "rare"
+            },
+            "sport": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "sam": {
+      "display_name": "Sam",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "sandra": {
+      "display_name": "Sandra",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "lingerie": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "suit": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "towel": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "suit": {
+              "rarity": "rare"
+            },
+            "witch": {
+              "rarity": "rare"
+            },
+            "yoga": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "sayaka": {
+      "display_name": "Sayaka",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "cheer": {
+              "rarity": "rare"
+            },
+            "cheer_inverted": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "sport": {
+              "rarity": "rare"
+            },
+            "sweatervest": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "sport": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "sayaka_frog": {
+      "display_name": "Sayaka Frog",
+      "poses": {
+        "a": {
+          "outfits": {
+            "base": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "scarlet": {
+      "display_name": "Scarlet",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "serena": {
+      "display_name": "Serena",
+      "poses": {
+        "a": {
+          "outfits": {
+            "nude": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "setsuna": {
+      "display_name": "Setsuna",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "miko": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "miko": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "school_swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "stevie": {
+      "display_name": "Stevie",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "girl": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "towel": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "tori": {
+      "display_name": "Tori",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "uniform_full": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "boxer": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "vanessa": {
+      "display_name": "Vanessa",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "veronica": {
+      "display_name": "Veronica",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "yoshinori": {
+      "display_name": "Yoshinori Ito",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "epic"
+            },
+            "gi": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "common"
+    },
+    "yui": {
+      "display_name": "Yui",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_covered": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "yui_highres": {
+      "display_name": "Yui Highres",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "yuuna": {
+      "display_name": "Yuuna Yamashita",
+      "poses": {
+        "a": {
+          "outfits": {
+            "business": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "epic"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "witch": {
+              "rarity": "rare"
+            },
+            "yoga": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "zoey": {
+      "display_name": "Zoey",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "epic"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "catrina": {
+      "display_name": "Catrina",
+      "poses": {
+        "a": {
+          "outfits": {
+            "leotard": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "common"
+            }
+        }
+      },
+        "b": {
+          "outfits": {
+            "leotard": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "frogyaka": {
+      "display_name": "Frogyaka",
+      "poses": {
+        "a": {
+          "outfits": {
+            "base": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "clausgb": {
+      "display_name": "ClausGB",
+      "poses": {
+        "a": {
+          "outfits": {
+            "skirt": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "narrator": {
+      "display_name": "Narrator",
+      "poses": {},
+      "rarity": "epic"
+    },
+    "yuigyaru": {
+      "display_name": "Yui Gyaru",
+      "poses": {
+        "a": {
+          "outfits": {
+            "zoomed": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+
+
+
+
+
+
+
+
+    "yuiBimbo": {
+      "display_name": "YuiBimbo (SpringBreak)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "base": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+    "hollyBimbo": {
+      "display_name": "HollyBimbo (SpringBreak)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "nude": {
+              "rarity": "common"
+            },
+            "underwear": {
+              "rarity": "common"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "tails": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+    "janePunk": {
+      "display_name": "JanePunk (SpringBreak)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "punk": {
+              "rarity": "common"
+            },
+            "punk_zoomed": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+    "nikki": {
+      "display_name": "Nikki (SpringBreak)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            },
+            "dominatrix": {
+              "rarity": "epic"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            },
+            "dominatrix": {
+              "rarity": "epic"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+    "ririsa": {
+      "display_name": "Ririsa (SpringBreak)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "bondage": {
+              "rarity": "epic"
+            },
+            "bondage_b": {
+              "rarity": "epic"
+            },
+            "bunny": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "common"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "lingerie": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "bondage": {
+              "rarity": "epic"
+            },
+            "bunny": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "common"
+            },
+            "uniform": {
+              "rarity": "common"
+            },
+            "dress": {
+              "rarity": "rare"
+            },
+            "lingerie": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+    "youko": {
+      "display_name": "Youko (SpringBreak)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "suit": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "kat_a": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            },
+            "suit_futa": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "kat_b": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            },
+            "suit_futa": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+
+
+
+
+
+
+
+
+
+
+
+
+    
+    "dildo": {
+      "display_name": "Dildo",
+      "rarity": "epic",
+      "inanimate": true,
+      "avatar_path": "avatars/dildo.webp",
+      "message": "grabbed a strange object on the floor, pink light and a puff of glitter later and they are suddenly small, smooth, and suspiciously rubbery. The world looms huge above them, and they realize with dawning horror-they've been turned into a dildo. They can't move, can't talk, and every vibration feels like an almost orgasm. Somewhere, distant laughter echoes... someone's having fun with this one.",
+      "responses": [
+        "The toy trembles slightly, as if trying to protest.",
+        "A faint buzz ripples through the air; maybe it's a scream, maybe it's just the batteries.",
+        "The rubbery shape rolls a few inches, helplessly, before flopping back into silence.",
+        "It gives the tiniest wiggle, but no sound follows-only the quiet hum of enchantment.",
+        "The object rattles once, like it's trying to say something, but can't quite manage words."
+      ]
+    },
+    "onahole": {
+      "display_name": "Onahole",
+      "rarity": "epic",
+      "inanimate": true,
+      "avatar_path": "avatars/onahole.webp",
+      "message": "steps on a strange rubbery object. Looking down they are shocked to see someone left a sex toy on the floor. After a flash of magic, their body collapses inward and reforms as duplicate of the forgotten adult toy. The original slowly fades away with a soft giggle. They can't move or speak, but you can definitely feel every every poke and prod from anyone who picks them up.",
+      "responses": [
+        "The toy wobbles faintly, as if sighing in defeat.",
+        "A quiet squelch echoes from inside the object - maybe it's trying to talk?",
+        "The rubbery surface flexes once, growing faintly before settling again.",
+        "It tips to one side, giving a sad little bounce.",
+        "The strange vessel vibrates slightly, humming with trapped frustration."
+      ]
+    },
+    "ball": {
+      "display_name": "Ball",
+      "rarity": "epic",
+      "inanimate": true,
+      "avatar_path": "avatars/ball.webp",
+      "message": "With a flash of blue light, your body condenses into a flawless sphere of shimmering crystal. You can see everything around you but can't move an inch. Your voice is gone-replaced by faint glimmers of light that flicker across your surface whenever you try to speak. Someone picks you up, grinning, and declares, 'Looks like we've got a new host for truth or dare!'",
+      "responses": [
+        "The crystal glows faintly, letters forming inside for a moment before fading away.",
+        "A soft hum vibrates through the ball, like it's sighing in resignation.",
+        "The sphere wobbles on its pedestal, pulsing light in quiet frustration.",
+        "For a brief second, the crystal flashes bright blue, as if trying to shout something.",
+        "The orb spins slowly, emitting a low, magical hum that might just be a groan."
+      ]
+    },
+    "chair": {
+      "display_name": "Chair",
+      "rarity": "epic",
+      "inanimate": true,
+      "avatar_path": "avatars/chair.png",
+      "message": "found a sigil hidden under their school chair. In a blink, their limbs stiffen and twist, reshaping into smooth wood and soft padding. Their body bends backward until they realize-they've become a chair. They can't move, can't shout, only watch.",
+      "responses": [
+        "The chair creaks softly, like it's trying to clear its throat.",
+        "One leg twitches, then stills again, pretending nothing happened.",
+        "A faint squeak echoes from the seat - maybe it was the wood... or maybe not.",
+        "The chair tilts ever so slightly, as if sighing in quiet defeat.",
+        "A muffled groan seems to come from somewhere deep inside the upholstery."
+      ]
+    },
+    "dress": {
+      "display_name": "Dress",
+      "rarity": "epic",
+      "inanimate": true,
+      "avatar_path": "avatars/dress.png",
+      "message": "A flash of glittering light wraps around them, soft fabric swallowing their body until they’re gone. When the sparkles fade, all that’s left is a short, tight pink minidress draped over a chair—smooth, silky, and still faintly warm. They can feel every brush of air, every curious hand testing the fabric, helpless to move or speak as giggles echo around the room.",
+      "responses": [
+        "The dress flutters faintly, as if breathing.",
+        "A ripple runs through the fabric—soft, quick, almost like a shiver.",
+        "For a second, the dress tightens, clinging to invisible curves before going still again.",
+        "The silky hem twitches, a tiny motion no one seems to notice.",
+        "A faint, embarrassed warmth radiates from the smooth pink fabric."
+      ]
+    },
+    "panties": {
+      "display_name": "Panties",
+      "rarity": "epic",
+      "inanimate": true,
+      "avatar_path": "avatars/panties.png",
+      "message": "A teasing giggle and a flash of pink magic—and suddenly they’re shrinking fast. Their body folds and twists, soft cotton replacing skin until there’s nothing left but a delicate pair of pink panties lying on the floor. They can’t move, can’t cry out, only sense warmth and motion when someone picks them up, stretching them between their fingers with a curious smile.",
+      "responses": [
+        "The panties twitch faintly, like they just took a tiny breath.",
+        "A soft ripple moves through the waistband, then fades.",
+        "The fabric quivers in someone’s hand, warm to the touch.",
+        "A faint, invisible sigh escapes as the panties settle back into place.",
+        "The delicate cloth trembles briefly, as if trying to wriggle free."
+      ]
+    },
+
+
+
+
+
+
+
+
+
+
+
+
+
+    "johngb3": {
+      "display_name": "JohnGB3 (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },    
+    "jori": {
+      "display_name": "Jori (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "jori2": {
+      "display_name": "Jori2 (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+    "yuvia": {
+      "display_name": "Yuvia (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "zoel": {
+      "display_name": "Zoel (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "allene": {
+      "display_name": "Allene (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+    "riyaka": {
+      "display_name": "Riyaka (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+    "joey": {
+      "display_name": "Joey (Fusion)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "swimsuit": {
+              "rarity": "ultra"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+
+
+
+
+
+
+
+
+
+
+    "corneliaGB": {
+      "display_name": "CorneliaGB (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    
+    "zoeyGB": {
+      "display_name": "ZoeyGB (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "sera": {
+      "display_name": "Sera (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_topless": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "reika": {
+      "display_name": "Reika (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "swimsuit_topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_topless": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "liliana": {
+      "display_name": "Liliana (Aftermath)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_plain": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_b": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_plain": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "underwear_b": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },    
+    "kutsumi": {
+      "display_name": "Kutsumi (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "nun": {
+              "rarity": "common"
+            },
+            "lingery": {
+              "rarity": "epic"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "kiyoshiGBPtn6": {
+      "display_name": "Kiyoshi GB (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "bathrobe": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "fashion": {
+              "rarity": "rare"
+            },
+            "magical": {
+              "rarity": "rare"
+            },
+            "pj": {
+              "rarity": "rare"
+            },
+            "swimsuit1": {
+              "rarity": "rare"
+            },
+            "swimsuit2": {
+              "rarity": "rare"
+            },
+            "swimsuit3": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "fashion": {
+              "rarity": "rare"
+            },
+            "magical": {
+              "rarity": "rare"
+            },
+            "pj": {
+              "rarity": "rare"
+            },
+            "swimsuit1": {
+              "rarity": "rare"
+            },
+            "swimsuit2": {
+              "rarity": "rare"
+            },
+            "swimsuit3": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "fashion": {
+              "rarity": "rare"
+            },
+            "magical": {
+              "rarity": "rare"
+            },
+            "pj": {
+              "rarity": "rare"
+            },
+            "swimsuit1": {
+              "rarity": "rare"
+            },
+            "swimsuit2": {
+              "rarity": "rare"
+            },
+            "swimsuit3": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+
+    "katrinaBimbo": {
+      "display_name": "Katrina Bimbo (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "bra": {
+              "rarity": "rare"
+            },
+            "bunny_girl": {
+              "rarity": "epic"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "casual_c": {
+              "rarity": "rare"
+            },
+            "casual_d": {
+              "rarity": "rare"
+            },
+            "magical_girl": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "micro_swimsuit": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "panties": {
+              "rarity": "rare"
+            },
+            "sexy": {
+              "rarity": "rare"
+            },
+            "underwear_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "johnGBPtn6": {
+      "display_name": "JohnGB (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "bottomless": {
+              "rarity": "rare"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "ultra"
+    },
+
+    "johnGBOneEye": {
+      "display_name": "JohnGB OneEye",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual_pose2": {
+              "rarity": "common"
+            },
+            "nude_pose2": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "johnFem": {
+      "display_name": "John Fem (Katrina's Notebook)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "uniform_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    },
+
+    "johnStyled": {
+      "display_name": "John Styled (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "casual": {
+              "rarity": "rare"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "latex_underwear_wig": {
+              "rarity": "rare"
+            },
+            "latex_underwear_wig_hose": {
+              "rarity": "rare"
+            },
+            "formal": {
+              "rarity": "rare"
+            },
+            "latex": {
+              "rarity": "rare"
+            },
+            "latex_panties": {
+              "rarity": "rare"
+            },
+            "latex_underwear": {
+              "rarity": "rare"
+            },
+            "long_hair_dress_a": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "panties": {
+              "rarity": "rare"
+            },
+            "towel": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "wig": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "allison": {
+          "outfits": {
+            "uniform": {
+              "rarity": "common"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "gym_blouse": {
+              "rarity": "rare"
+            },
+            "gym_bra": {
+              "rarity": "rare"
+            },
+            "gym_skirt": {
+              "rarity": "rare"
+            },
+            "gym_skirt_b": {
+              "rarity": "rare"
+            },
+            "gym_topless": {
+              "rarity": "rare"
+            },
+            "gym_vest": {
+              "rarity": "rare"
+            },
+            "gym_vest_b": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+    "jackGB": {
+      "display_name": "Jack GB (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "suit": {
+              "rarity": "common"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "suits": {
+              "rarity": "common"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "suits": {
+              "rarity": "common"
+            }
+          }
+        },
+        "d": {
+          "outfits": {
+            "suits": {
+              "rarity": "common"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },    
+
+    "emoChick": {
+      "display_name": "Emo Chick (Potion #6)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual2": {
+              "rarity": "rare"
+            },
+            "casual_3": {
+              "rarity": "epic"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "b": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual2": {
+              "rarity": "rare"
+            },
+            "casual_3": {
+              "rarity": "epic"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        },
+        "c": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "casual2": {
+              "rarity": "rare"
+            },
+            "topless": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "epic"
+    },
+
+
+    "hinano": {
+      "display_name": "Hinano (Shorts)",
+      "poses": {
+        "a": {
+          "outfits": {
+            "casual": {
+              "rarity": "common"
+            },
+            "gym": {
+              "rarity": "rare"
+            },
+            "maid": {
+              "rarity": "rare"
+            },
+            "nude": {
+              "rarity": "rare"
+            },
+            "pajamas": {
+              "rarity": "rare"
+            },
+            "swimsuit": {
+              "rarity": "rare"
+            },
+            "underwear": {
+              "rarity": "rare"
+            },
+            "uniform": {
+              "rarity": "rare"
+            }
+          }
+        }
+      },
+      "rarity": "rare"
+    }
+
+
+
+  },
+  "frog_boost_bonus": 0.15,
+  "frog_boost_rolls": 2,
+  "frog_boost_targets": [
+    "rare",
+    "epic",
+    "ultra"
+  ],
+  "rarities": {
+    "common": 70,
+    "rare": 24,
+    "epic": 5,
+    "ultra": 1
+  },
+  "starter_characters": [],
+  "starter_outfits": {},
+  "starter_rarities": [
+    "common"
+  ]
+}
+

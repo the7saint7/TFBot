@@ -1,0 +1,11 @@
+{
+  "Narrator": {
+    "base_image": "vn_assets/vn_narrator.png",
+    "name_box": [20, 10, 420, 60],
+    "text_box": [20, 70, 820, 300],
+    "name_padding": 12,
+    "text_padding": 16,
+    "avatar_box": null,
+    "disable_avatar": true
+  }
+}
