@@ -421,7 +421,14 @@ REQUIRED_GUILD_PERMISSIONS = {
 }
 MAGIC_EMOJI_NAME = os.getenv("TFBOT_MAGIC_EMOJI_NAME", "magic_emoji")
 MAGIC_EMOJI_CACHE: Dict[int, str] = {}
-SPECIAL_REROLL_FORMS = ("ball", "narrator")
+def _parse_special_form_names(raw: str) -> tuple[str, ...]:
+    tokens = [token.strip() for token in re.split(r"[;,]", raw or "") if token.strip()]
+    if not tokens:
+        return ("ball", "narrator")
+    return tuple(tokens)
+
+
+SPECIAL_REROLL_FORMS = _parse_special_form_names(os.getenv("TFBOT_SPECIAL_FORMS", "Ball,Narrator"))
 ADMIN_ONLY_RANDOM_FORMS = ("syn", "circe")
 CHARACTER_AUTOCOMPLETE_LIMIT = 25
 OUTFIT_AUTOCOMPLETE_LIMIT = 25
@@ -447,6 +454,32 @@ SPECIAL_REROLL_TOKENS = {
     token for token in (_normalize_special_token(item) for item in SPECIAL_REROLL_FORMS) if token
 }
 CHARACTER_DIRECTORY_CACHE_TTL = 120.0  # seconds
+
+
+def _format_human_list(items: Sequence[str]) -> str:
+    cleaned = [entry.strip() for entry in items if str(entry).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} or {cleaned[1]}"
+    return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
+
+
+SPECIAL_FORMS_DISPLAY = _format_human_list(SPECIAL_REROLL_FORMS)
+SPECIAL_FORM_TARGET = SPECIAL_FORMS_DISPLAY or "the configured special forms"
+SPECIAL_FORM_SUBJECT = (
+    f"{SPECIAL_FORMS_DISPLAY} characters" if SPECIAL_FORMS_DISPLAY else "the configured special forms"
+)
+SPECIAL_FORM_CAPITALIZED = SPECIAL_FORM_TARGET[:1].upper() + SPECIAL_FORM_TARGET[1:] if SPECIAL_FORM_TARGET else "Special forms"
+PRIVILEGED_FORM_TOKENS = set(SPECIAL_REROLL_TOKENS)
+
+
+def _privileged_requirement_message(action: str) -> str:
+    if SPECIAL_FORMS_DISPLAY:
+        return f"Only admins or {SPECIAL_FORM_SUBJECT} can {action}."
+    return f"Only admins can {action}."
 
 def _parse_featured_weight_map(raw: str) -> Dict[str, float]:
     """Parse comma/semicolon separated token=weight entries."""
@@ -519,6 +552,16 @@ def _state_matches_folder(state: TransformationState, folder_name: str) -> bool:
     if not normalized:
         return False
     return _state_folder_token(state) == normalized
+
+
+def _state_has_privileged_access(state: Optional[TransformationState]) -> bool:
+    if not state or not PRIVILEGED_FORM_TOKENS:
+        return False
+    folder_token = _state_folder_token(state)
+    if folder_token and folder_token in PRIVILEGED_FORM_TOKENS:
+        return True
+    name_token = _normalize_special_token(state.character_name)
+    return bool(name_token and name_token in PRIVILEGED_FORM_TOKENS)
 
 
 def _find_character_by_folder(folder_name: str) -> Optional[TFCharacter]:
@@ -818,7 +861,7 @@ def _actor_has_narrator_power(member: Optional[discord.Member]) -> bool:
     state = find_active_transformation(member.id, member.guild.id)
     if not state:
         return False
-    return _state_matches_folder(state, "narrator")
+    return _state_has_privileged_access(state)
 
 
 def _extract_user_id_from_token(token: str) -> Optional[int]:
@@ -870,7 +913,7 @@ def _format_special_reroll_hint(character_label: str, folder_token: Optional[str
         return None
     admin_restriction_text = ""
     if ADMIN_PROTECTION_ENABLED:
-        admin_restriction_text = "- You can't target admins or turn someone into Ball or Narrator.\n"
+        admin_restriction_text = f"- You can't target admins or turn someone into {SPECIAL_FORM_TARGET}.\n"
     return (
         "```diff\n"
         f"- {character_label} perk unlocked! Use `/reroll who_member:<target>` to reroll a non-admin or add `to_character:<folder>` to pick the form.\n"
@@ -2005,7 +2048,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         duration_label = "10 minutes"
         duration_delta = INANIMATE_DURATION
         selected_folder_token = _normalize_folder_token(selected_name)
-        if selected_folder_token in {"narrator", "ball"}:
+        if selected_folder_token in PRIVILEGED_FORM_TOKENS:
             duration_label = "1 hour"
             duration_delta = timedelta(hours=1)
     else:
@@ -2016,7 +2059,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
         inanimate_responses = tuple()
         duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
         selected_folder_token = _normalize_folder_token(character.folder if character and character.folder else selected_name)
-        if selected_folder_token in {"narrator", "ball"}:
+        if selected_folder_token in PRIVILEGED_FORM_TOKENS:
             duration_label = "1 hour"
             duration_delta = timedelta(hours=1)
     now = utc_now()
@@ -2879,7 +2922,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 and target_is_admin
             ):
                 await ctx.reply(
-                    "Ball and Narrator perks can't be used on admins.",
+                    f"{SPECIAL_FORM_CAPITALIZED} perks can't be used on admins.",
                     mention_author=False,
                 )
                 return None
@@ -2915,17 +2958,17 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             if SPECIAL_CHARACTERS_ADMIN_ONLY:
                 if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
                     if not author_is_admin and not author_has_special_power:
-                        await ctx.reply(
-                            "Only admins or Ball/Narrator characters can force someone into Ball or Narrator.",
-                            mention_author=False,
-                        )
+                    await ctx.reply(
+                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                        mention_author=False,
+                    )
                         return None
                 if forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
                     if not author_is_admin and not author_has_special_power:
-                        await ctx.reply(
-                            "Only admins or Ball/Narrator characters can force someone into Ball or Narrator.",
-                            mention_author=False,
-                        )
+                    await ctx.reply(
+                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                        mention_author=False,
+                    )
                         return None
             if (
                 forced_character is not None
@@ -2947,7 +2990,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     and _is_special_reroll_name(forced_character.folder or forced_character.name)
                 ):
                     await ctx.reply(
-                        "Ball and Narrator perks can't force someone into Ball or Narrator.",
+                        f"{SPECIAL_FORM_CAPITALIZED} perks can't force someone into {SPECIAL_FORM_TARGET}.",
                         mention_author=False,
                     )
                     return None
@@ -2958,7 +3001,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     and _is_special_reroll_name(str(forced_inanimate.get("name", "")))
                 ):
                     await ctx.reply(
-                        "Ball and Narrator perks can't force someone into Ball or Narrator.",
+                        f"{SPECIAL_FORM_CAPITALIZED} perks can't force someone into {SPECIAL_FORM_TARGET}.",
                         mention_author=False,
                     )
                     return None
@@ -3656,7 +3699,7 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
             await send_channel_feedback("Targeted background changes can only be used inside a server channel.")
             return
         if not can_target_others:
-            await send_channel_feedback("Only admins or the Narrator can set backgrounds for other characters.")
+            await send_channel_feedback(_privileged_requirement_message("set backgrounds for other characters"))
             return
         target_lower = target_spec.lower()
         if target_lower == "all":
@@ -4203,7 +4246,7 @@ async def _handle_slash_say(
         if not can_use_command and ROLEPLAY_COG is not None and guild_channel and ROLEPLAY_COG.is_roleplay_post(guild_channel):
             can_use_command = ROLEPLAY_COG.has_control(actor)
         if not can_use_command:
-            await interaction.response.send_message("Only admins or the Narrator can use this command.", ephemeral=True)
+            await interaction.response.send_message(_privileged_requirement_message("use this command"), ephemeral=True)
             return
 
     directory_lookup = {name.lower(): name for name in _list_character_directory_names()}
@@ -4639,7 +4682,7 @@ def _find_character_by_token(token: str) -> Optional[TFCharacter]:
 
 
 def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
-    """Check if a state has special reroll access (Ball/Narrator)."""
+    """Check if a state has special reroll access (configured special forms)."""
     if state is None:
         return False
     # Use folder OR name to match the earlier definition at line 483
@@ -4704,7 +4747,11 @@ def _actor_has_narrator_power_35(member: Optional[discord.Member]) -> bool:
     state = find_active_transformation(member.id, member.guild.id)
     if not state:
         return False
-    return _name_matches_token(state.character_name, "narrator")
+    if _state_has_privileged_access(state):
+        return True
+    if not PRIVILEGED_FORM_TOKENS:
+        return False
+    return any(_name_matches_token(state.character_name, token) for token in PRIVILEGED_FORM_TOKENS)
 
 
 @bot.command(name="reroll")
@@ -4847,7 +4894,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
         # NOW check if they can force reroll (after state is resolved)
         if forced_token and not can_force_reroll:
             await ctx.reply(
-                "Only admins or Narrator TFs can force a reroll into a specific form.",
+                _privileged_requirement_message("force a reroll into a specific form"),
                 mention_author=False,
             )
             return None
@@ -4906,17 +4953,17 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
             if SPECIAL_CHARACTERS_ADMIN_ONLY:
                 if forced_character is not None and _is_special_reroll_name(forced_character.name):
                     if not author_is_admin and not author_has_special_reroll:
-                        await ctx.reply(
-                            "Only admins or Ball/Narrator characters can force someone into Ball or Narrator.",
-                            mention_author=False,
-                        )
+                    await ctx.reply(
+                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                        mention_author=False,
+                    )
                         return None
                 if forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
                     if not author_is_admin and not author_has_special_reroll:
-                        await ctx.reply(
-                            "Only admins or Ball/Narrator characters can force someone into Ball or Narrator.",
-                            mention_author=False,
-                        )
+                    await ctx.reply(
+                        f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                        mention_author=False,
+                    )
                         return None
             forced_special_name = None
             if forced_character is not None and _is_special_reroll_name(forced_character.name):
@@ -4940,7 +4987,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
             if ADMIN_PROTECTION_ENABLED:
                 if forced_special_name and author_has_special_reroll and not author_is_admin:
                     await ctx.reply(
-                        "Ball/Narrator TFs can't force others into Ball or Narrator. Ask an admin or owner.",
+                        f"{SPECIAL_FORM_CAPITALIZED} TFs can't force others into {SPECIAL_FORM_TARGET}. Ask an admin or owner.",
                         mention_author=False,
                     )
                     return None
@@ -5477,7 +5524,7 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     author_has_special_access = _has_special_reroll_access(author_state)
     
     if not author_is_admin and not author_has_special_access:
-        await ctx.reply("Only admins, Ball, or Narrator can use this command.", mention_author=False)
+        await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
         return
     
     tokens = [token for token in args.split() if token.strip()]
@@ -5614,7 +5661,7 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     )
 
 
-@bot.tree.command(name="swap", description="Swap characters between two players or characters (admin, ball, or narrator only).")
+@bot.tree.command(name="swap", description="Swap characters between two players or characters (admins or special-form characters only).")
 @app_commands.describe(
     character1="First character/user to swap (character name or @mention).",
     character2="Second character/user to swap (character name or @mention).",
@@ -5664,7 +5711,7 @@ async def slash_swap_command(
     author_has_special_access = _has_special_reroll_access(author_state)
     
     if not author_is_admin and not author_has_special_access:
-        await interaction.followup.send("Only admins, Ball, or Narrator can use this command.", ephemeral=True)
+        await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
         return
     
     # Use the same logic as prefix command but adapted for slash
@@ -6010,7 +6057,7 @@ async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
             await ctx.reply("Targeted background changes can only be used inside a server channel.", mention_author=False)
             return
         if not can_target_others:
-            await ctx.reply("Only admins or the Narrator can set backgrounds for other characters.", mention_author=False)
+            await ctx.reply(_privileged_requirement_message("set backgrounds for other characters"), mention_author=False)
             return
         target_lower = target_spec.lower()
         if target_lower == "all":
@@ -6235,7 +6282,7 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
         return
     can_use_command = is_admin(actor) or _actor_has_narrator_power_35(actor)
     if not can_use_command:
-        await ctx.reply("Only admins or the Narrator can use `!say`.", mention_author=False)
+        await ctx.reply(_privileged_requirement_message("use `!say`"), mention_author=False)
         return
 
     args = args.strip()
