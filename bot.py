@@ -416,6 +416,82 @@ TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
     ("10 hours", timedelta(hours=10)),
 ]
 INANIMATE_DURATION = timedelta(minutes=10)
+_DEFAULT_INANIMATE_MINUTES = (10,)
+_DEFAULT_SPECIAL_MINUTES = (60,)
+_DEFAULT_GENERIC_MINUTES = (600,)
+
+
+def _parse_duration_minutes(raw_value: Optional[str], fallback: Sequence[int]) -> Tuple[int, ...]:
+    if not raw_value:
+        return tuple(fallback)
+    parsed: List[int] = []
+    for token in re.split(r"[;,]", raw_value):
+        stripped = token.strip()
+        if not stripped:
+            continue
+        try:
+            minutes_value = int(float(stripped))
+        except ValueError:
+            logger.warning("Ignoring invalid duration value '%s' in %s", stripped, raw_value)
+            continue
+        if minutes_value <= 0:
+            logger.warning("Ignoring non-positive duration value '%s' in %s", stripped, raw_value)
+            continue
+        parsed.append(minutes_value)
+    return tuple(parsed or fallback)
+
+
+def _duration_options_from_env(var_name: str, fallback: Sequence[int], legacy_var: Optional[str] = None) -> Tuple[int, ...]:
+    raw_value = os.getenv(var_name)
+    if raw_value is None and legacy_var:
+        raw_value = os.getenv(legacy_var)
+    return _parse_duration_minutes(raw_value, fallback)
+
+
+TF_INANIMATE_DURATION_OPTIONS = _duration_options_from_env(
+    "TF_INANIMATE_DURATION",
+    fallback=_DEFAULT_INANIMATE_MINUTES,
+    legacy_var="TF_INNANIMATE_DURATION",
+)
+TF_SPECIAL_DURATION_OPTIONS = _duration_options_from_env(
+    "TF_SPECIAL_DURATION",
+    fallback=_DEFAULT_SPECIAL_MINUTES,
+)
+TF_GENERIC_DURATION_OPTIONS = _duration_options_from_env(
+    "TF_GENERIC_DURATION",
+    fallback=_DEFAULT_GENERIC_MINUTES,
+)
+
+
+def _format_duration_label_from_minutes(minutes: int) -> str:
+    total_minutes = max(int(minutes), 1)
+    days, remainder = divmod(total_minutes, 1440)
+    hours, minutes_only = divmod(remainder, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes_only:
+        parts.append(f"{minutes_only} minute{'s' if minutes_only != 1 else ''}")
+    if not parts:
+        parts.append("less than a minute")
+    return " ".join(parts)
+
+
+def _random_duration_from_options(options: Sequence[int]) -> Tuple[str, timedelta]:
+    minutes = random.choice(options)
+    return _format_duration_label_from_minutes(minutes), timedelta(minutes=minutes)
+
+
+def _choose_reroll_duration(is_inanimate: bool, character_name: str) -> Tuple[str, timedelta]:
+    if is_inanimate:
+        options = TF_INANIMATE_DURATION_OPTIONS
+    elif _is_special_reroll_name(character_name):
+        options = TF_SPECIAL_DURATION_OPTIONS
+    else:
+        options = TF_GENERIC_DURATION_OPTIONS
+    return _random_duration_from_options(options)
 REQUIRED_GUILD_PERMISSIONS = {
     "send_messages": "Send Messages (needed to respond in channels)",
     "embed_links": "Embed Links (history channel logging)",
@@ -3276,10 +3352,10 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         placeholder_key = None
         placeholder_state = None
 
-        guaranteed_duration = timedelta(hours=10)
+        duration_label, guaranteed_duration = _choose_reroll_duration(new_is_inanimate, new_name)
         state.started_at = now
         state.expires_at = now + guaranteed_duration
-        state.duration_label = "10 hours"
+        state.duration_label = duration_label
         existing_task = revert_tasks.get(key)
         if existing_task:
             existing_task.cancel()
@@ -5286,15 +5362,8 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
     state.is_inanimate = new_is_inanimate
     state.inanimate_responses = new_responses
 
-    if new_is_inanimate:
-        guaranteed_duration = INANIMATE_DURATION
-        state.duration_label = "10 minutes"
-    elif _is_special_reroll_name(new_name):
-        guaranteed_duration = timedelta(hours=1)
-        state.duration_label = "1 hour"
-    else:
-        guaranteed_duration = timedelta(days=365)
-        state.duration_label = "1 year"
+    duration_label, guaranteed_duration = _choose_reroll_duration(new_is_inanimate, new_name)
+    state.duration_label = duration_label
     
     state.started_at = now
     state.expires_at = now + guaranteed_duration
