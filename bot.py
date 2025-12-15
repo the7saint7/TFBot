@@ -514,6 +514,18 @@ def _normalize_folder_token(value: Optional[str]) -> str:
     return normalized
 
 
+def _folder_lookup_tokens(value: Optional[str]) -> set[str]:
+    """Return normalized folder tokens for matching user input against character folders."""
+    normalized = _normalize_folder_token(value)
+    if not normalized:
+        return set()
+    variants = {normalized}
+    compact = normalized.replace(" ", "_").replace("-", "_")
+    if compact:
+        variants.add(compact)
+    return variants
+
+
 def _normalize_special_token(value: Optional[str]) -> str:
     normalized = _normalize_folder_token(value)
     if "/" in normalized:
@@ -4873,6 +4885,14 @@ def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[Transform
         state = active_transformations.get(state_key(guild.id, user_id))
         if state:
             return state
+    folder_tokens = _folder_lookup_tokens(normalized)
+    if folder_tokens:
+        for state in active_transformations.values():
+            if state.guild_id != guild.id:
+                continue
+            folder_token = _state_folder_token(state)
+            if folder_token and folder_token in folder_tokens:
+                return state
     token_variants = _token_variants(normalized)
     for state in active_transformations.values():
         if state.guild_id != guild.id:
@@ -4907,6 +4927,10 @@ def _find_character_by_token(token: str) -> Optional[TFCharacter]:
     normalized = (token or "").strip()
     if not normalized:
         return None
+    for folder_token in _folder_lookup_tokens(normalized):
+        match = CHARACTER_BY_FOLDER.get(folder_token)
+        if match:
+            return match
     for character in CHARACTER_POOL:
         if _character_matches_token(character, normalized):
             return character
