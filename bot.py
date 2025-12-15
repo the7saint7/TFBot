@@ -410,12 +410,6 @@ MESSAGE_STYLE = os.getenv(
     "TFBOT_MESSAGE_STYLE",
     "vn" if GACHA_ENABLED else "classic",
 ).lower()
-TRANSFORM_DURATION_CHOICES: Sequence[Tuple[str, timedelta]] = [
-    ("10 minutes", timedelta(minutes=10)),
-    ("1 hour", timedelta(hours=1)),
-    ("10 hours", timedelta(hours=10)),
-]
-INANIMATE_DURATION = timedelta(minutes=10)
 _DEFAULT_INANIMATE_MINUTES = (10,)
 _DEFAULT_SPECIAL_MINUTES = (60,)
 _DEFAULT_GENERIC_MINUTES = (600,)
@@ -484,10 +478,10 @@ def _random_duration_from_options(options: Sequence[int]) -> Tuple[str, timedelt
     return _format_duration_label_from_minutes(minutes), timedelta(minutes=minutes)
 
 
-def _choose_reroll_duration(is_inanimate: bool, character_name: str) -> Tuple[str, timedelta]:
+def _choose_reroll_duration(is_inanimate: bool, character_token: str) -> Tuple[str, timedelta]:
     if is_inanimate:
         options = TF_INANIMATE_DURATION_OPTIONS
-    elif _is_special_reroll_name(character_name):
+    elif _is_special_reroll_name(character_token):
         options = TF_SPECIAL_DURATION_OPTIONS
     else:
         options = TF_GENERIC_DURATION_OPTIONS
@@ -2195,23 +2189,15 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
             character_message = "You feel unsettlingly still."
         if not inanimate_responses:
             inanimate_responses = (character_message,)
-        duration_label = "10 minutes"
-        duration_delta = INANIMATE_DURATION
-        selected_folder_token = _normalize_folder_token(selected_name)
-        if selected_folder_token in PRIVILEGED_FORM_TOKENS:
-            duration_label = "1 hour"
-            duration_delta = timedelta(hours=1)
+        duration_label, duration_delta = _choose_reroll_duration(True, selected_name)
     else:
         character = _select_weighted_character(available_characters)
         selected_name = character.name
         character_avatar_path = character.avatar_path
         character_message = character.message
         inanimate_responses = tuple()
-        duration_label, duration_delta = random.choice(TRANSFORM_DURATION_CHOICES)
-        selected_folder_token = _normalize_folder_token(character.folder if character and character.folder else selected_name)
-        if selected_folder_token in PRIVILEGED_FORM_TOKENS:
-            duration_label = "1 hour"
-            duration_delta = timedelta(hours=1)
+        character_token = character.folder or selected_name
+        duration_label, duration_delta = _choose_reroll_duration(False, character_token)
     now = utc_now()
     expires_at = now + duration_delta
     original_nick = member.nick
@@ -3352,7 +3338,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         placeholder_key = None
         placeholder_state = None
 
-        duration_label, guaranteed_duration = _choose_reroll_duration(new_is_inanimate, new_name)
+        duration_label, guaranteed_duration = _choose_reroll_duration(
+            new_is_inanimate, new_folder or new_name
+        )
         state.started_at = now
         state.expires_at = now + guaranteed_duration
         state.duration_label = duration_label
@@ -5283,6 +5271,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
     forced_mode = forced_character is not None or forced_inanimate is not None
 
     new_name: str
+    new_folder: Optional[str]
     new_avatar_path: str
     new_message: str
     new_is_inanimate: bool
@@ -5290,6 +5279,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
 
     if forced_inanimate is not None:
         new_name = str(forced_inanimate.get("name") or "Mystery Relic")
+        new_folder = None
         new_avatar_path = str(forced_inanimate.get("avatar_path") or "")
         new_message = str(forced_inanimate.get("message") or "You feel unsettlingly still.")
         responses_raw = forced_inanimate.get("responses") or []
@@ -5302,6 +5292,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
         new_is_inanimate = True
     elif forced_character is not None:
         new_name = forced_character.name
+        new_folder = forced_character.folder
         new_avatar_path = forced_character.avatar_path
         new_message = forced_character.message
         new_responses = tuple()
@@ -5336,6 +5327,7 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
             return None
         chosen = random.choice(available_characters)
         new_name = chosen.name
+        new_folder = chosen.folder
         new_avatar_path = chosen.avatar_path
         new_message = chosen.message
         new_responses = tuple()
@@ -5356,13 +5348,15 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
 
     previous_character = state.character_name
     state.character_name = new_name
+    state.character_folder = new_folder
     state.character_avatar_path = new_avatar_path
     state.character_message = new_message
     state.avatar_applied = False
     state.is_inanimate = new_is_inanimate
     state.inanimate_responses = new_responses
 
-    duration_label, guaranteed_duration = _choose_reroll_duration(new_is_inanimate, new_name)
+    character_token = new_folder or new_name
+    duration_label, guaranteed_duration = _choose_reroll_duration(new_is_inanimate, character_token)
     state.duration_label = duration_label
     
     state.started_at = now
