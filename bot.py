@@ -5260,6 +5260,20 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
         )
         return None
 
+    await _unswap_and_announce(
+        guild.id,
+        target_member.id,
+        reason=f"{target_member.display_name}'s swap chain reset before reroll.",
+        channel=ctx.channel,
+    )
+    state = active_transformations.get(key)
+    if state is None:
+        await ctx.reply(
+            "Their transformation reset during the swap cleanup. Try again if they are still transformed.",
+            mention_author=False,
+        )
+        return None
+
     used_names = {
         current_state.character_name
         for current_key, current_state in active_transformations.items()
