@@ -4779,11 +4779,6 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
     variants = _token_variants(token)
     if not variants:
         return False
-    name_normalized = character.name.lower()
-    first_token = name_normalized.split(" ", 1)[0]
-    for variant in variants:
-        if variant == name_normalized or variant == first_token:
-            return True
     folder_name_raw = (character.folder or "").strip()
     if folder_name_raw:
         folder_normalized = folder_name_raw.replace("\\", "/").strip("/").lower()
@@ -4793,6 +4788,11 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
         for folder_candidate in folder_candidates:
             if folder_candidate in variants:
                 return True
+    name_normalized = character.name.lower()
+    first_token = name_normalized.split(" ", 1)[0]
+    for variant in variants:
+        if variant == name_normalized or variant == first_token:
+            return True
     return False
 
 
