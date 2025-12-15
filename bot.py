@@ -2309,6 +2309,42 @@ def _command_channel_error_message() -> str:
     return f"Rolls are only supported in {', '.join(hints[:-1])}, or {hints[-1]}."
 
 
+def _describe_channel(channel: Optional[Union[discord.abc.GuildChannel, discord.Thread]]) -> str:
+    if channel is None:
+        return "channel=None"
+    parent = getattr(channel, "parent", None)
+    parent_desc = f"{getattr(parent, 'name', None)}#{getattr(parent, 'id', None)}" if parent else "None"
+    return f"{channel.__class__.__name__}(name={getattr(channel, 'name', None)}, id={getattr(channel, 'id', None)}, parent={parent_desc})"
+
+
+def _allowed_instance_channel_ids() -> set[int]:
+    allowed: set[int] = set()
+    if TF_CHANNEL_ID > 0:
+        allowed.add(TF_CHANNEL_ID)
+    rp_forum_post_id = ROLEPLAY_COG.forum_post_id if ROLEPLAY_COG else 0
+    if rp_forum_post_id:
+        allowed.add(rp_forum_post_id)
+    if GACHA_CHANNEL_ID > 0:
+        allowed.add(GACHA_CHANNEL_ID)
+    return allowed
+
+
+def _channel_matches_allowed(
+    channel: Optional[Union[discord.abc.GuildChannel, discord.Thread]],
+    allowed_ids: set[int],
+) -> bool:
+    if not allowed_ids or channel is None:
+        return False
+    channel_id = getattr(channel, "id", None)
+    if channel_id in allowed_ids:
+        return True
+    parent = getattr(channel, "parent", None)
+    parent_id = getattr(parent, "id", None)
+    if parent_id in allowed_ids:
+        return True
+    return False
+
+
 def _extract_command_channel(
     channel_obj: Any,
 ) -> Optional[Union[discord.abc.GuildChannel, discord.Thread]]:
@@ -2321,6 +2357,14 @@ async def _ensure_command_channel_for_ctx(ctx: commands.Context) -> bool:
     channel = _extract_command_channel(ctx.channel)
     if _is_allowed_command_channel(channel):
         return True
+    logger.warning(
+        "Command guard blocked %s for %s in %s (allowed TF=%s, gacha=%s)",
+        getattr(ctx.command, "qualified_name", getattr(ctx.command, "name", "unknown")),
+        getattr(ctx.author, "id", "unknown"),
+        _describe_channel(channel),
+        TF_CHANNEL_ID,
+        GACHA_CHANNEL_ID,
+    )
     await ctx.reply(_command_channel_error_message(), mention_author=False)
     return False
 
@@ -2329,6 +2373,14 @@ async def _ensure_command_channel_for_interaction(interaction: discord.Interacti
     channel = _extract_command_channel(interaction.channel)
     if _is_allowed_command_channel(channel):
         return True
+    logger.warning(
+        "Interaction guard blocked %s for %s in %s (allowed TF=%s, gacha=%s)",
+        getattr(interaction.command, "qualified_name", getattr(interaction.command, "name", "unknown")),
+        getattr(interaction.user, "id", "unknown"),
+        _describe_channel(channel),
+        TF_CHANNEL_ID,
+        GACHA_CHANNEL_ID,
+    )
     message = _command_channel_error_message()
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)
@@ -3330,7 +3382,6 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 )
 @app_commands.autocomplete(who_character=_character_name_autocomplete, to_character=_character_name_autocomplete)
 @app_commands.guild_only()
-@guard_slash_command_channel
 async def slash_reroll_command(
     interaction: discord.Interaction,
     who_member: Optional[discord.Member] = None,
@@ -4553,16 +4604,31 @@ async def on_message(message: discord.Message):
     )
 
     command_invoked = False
+    allowed_ids = _allowed_instance_channel_ids()
+    channel_allowed = (
+        not message.guild
+        or not allowed_ids
+        or _channel_matches_allowed(message.channel, allowed_ids)
+    )
+
     ctx = await bot.get_context(message)
     if ctx.command:
-        command_invoked = True
-        logger.debug(
-            "Invoking command %s by %s in channel %s",
-            ctx.command.qualified_name,
-            message.author.id,
-            getattr(message.channel, "id", None),
-        )
-        await bot.invoke(ctx)
+        if channel_allowed:
+            command_invoked = True
+            logger.debug(
+                "Invoking command %s by %s in channel %s",
+                ctx.command.qualified_name,
+                message.author.id,
+                getattr(message.channel, "id", None),
+            )
+            await bot.invoke(ctx)
+        else:
+            logger.debug(
+                "Ignoring command %s by %s in disallowed channel %s",
+                ctx.command.qualified_name,
+                message.author.id,
+                getattr(message.channel, "id", None),
+            )
     elif message.content.startswith(str(bot.command_prefix)):
         logger.debug(
             "Command-like message ignored (ctx.command missing) content=%s author=%s channel=%s",
@@ -4604,18 +4670,12 @@ async def on_message(message: discord.Message):
     if message.guild and message.guild.owner_id == message.author.id and not is_roleplay_forum_post:
         logger.debug("Ignoring message %s from server owner %s", message.id, message.author.id)
         return None
-    allowed_channels: set[int] = set()
-    if TF_CHANNEL_ID > 0:
-        allowed_channels.add(TF_CHANNEL_ID)
-    rp_forum_post_id = ROLEPLAY_COG.forum_post_id if ROLEPLAY_COG else 0
-    if rp_forum_post_id:
-        allowed_channels.add(rp_forum_post_id)
-    if message.guild and allowed_channels and channel_id not in allowed_channels:
+    if message.guild and allowed_ids and not _channel_matches_allowed(message.channel, allowed_ids):
         logger.info(
             "Skipping message %s: channel %s is not in the monitored TF/RP channels %s.",
             message.id,
             channel_id,
-            ", ".join(str(cid) for cid in sorted(allowed_channels)),
+            ", ".join(str(cid) for cid in sorted(allowed_ids)),
         )
         return None
 
@@ -4861,7 +4921,6 @@ def _actor_has_narrator_power_35(member: Optional[discord.Member]) -> bool:
 
 @bot.command(name="reroll")
 @commands.guild_only()
-@guard_prefix_command_channel
 async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
     """3.5 version of reroll command."""
     author = ctx.author
@@ -6037,7 +6096,6 @@ async def prefix_loadgame_command(ctx: commands.Context, *, state_file: str = ""
 
 
 @bot.command(name="bg")
-@guard_prefix_command_channel
 async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
     """3.5 version of bg command."""
     # Check if this is a game thread first - completely isolate from global VN system
