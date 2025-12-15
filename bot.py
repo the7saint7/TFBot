@@ -2973,6 +2973,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     state = placeholder
             else:
                 state = _find_state_by_folder(guild, first)
+                if state is None:
+                    # Allow slash args/autocomplete values that send a display name instead of a folder
+                    state = _find_state_by_token(guild, first)
             if state is None:
                 potential_member = discord.utils.find(
                     lambda m: m.name.lower() == first.lower()
