@@ -5093,10 +5093,12 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
             return None
 
         if forced_token:
-            forced_character = next(
-                (character for character in CHARACTER_POOL if _character_matches_token(character, forced_token)),
-                None,
-            )
+            forced_character = _find_character_by_folder(forced_token)
+            if forced_character is None:
+                forced_character = next(
+                    (character for character in CHARACTER_POOL if _character_matches_token(character, forced_token)),
+                    None,
+                )
             if forced_character is None:
                 forced_inanimate = next(
                     (
