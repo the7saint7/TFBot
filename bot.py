@@ -2015,13 +2015,13 @@ async def send_history_message(title: str, description: str) -> None:
     schedule_history_refresh()
 
 
-async def archive_original_message(message: discord.Message) -> None:
+async def _resolve_archive_channel(preferred_guild: Optional[discord.Guild]) -> Optional[discord.abc.Messageable]:
     if TF_ARCHIVE_CHANNEL_ID <= 0:
-        return
+        return None
 
     archive_channel = None
-    if message.guild is not None:
-        archive_channel = message.guild.get_channel(TF_ARCHIVE_CHANNEL_ID)
+    if preferred_guild is not None:
+        archive_channel = preferred_guild.get_channel(TF_ARCHIVE_CHANNEL_ID)
     if archive_channel is None:
         archive_channel = bot.get_channel(TF_ARCHIVE_CHANNEL_ID)
     if archive_channel is None:
@@ -2029,10 +2029,16 @@ async def archive_original_message(message: discord.Message) -> None:
             archive_channel = await bot.fetch_channel(TF_ARCHIVE_CHANNEL_ID)
         except (discord.Forbidden, discord.HTTPException) as exc:
             logger.warning("Cannot access archive channel %s: %s", TF_ARCHIVE_CHANNEL_ID, exc)
-            return
-
+            return None
     if archive_channel is None or not hasattr(archive_channel, "send"):
         logger.debug("Archive channel %s unavailable or not messageable.", TF_ARCHIVE_CHANNEL_ID)
+        return None
+    return archive_channel
+
+
+async def archive_original_message(message: discord.Message) -> None:
+    archive_channel = await _resolve_archive_channel(message.guild)
+    if archive_channel is None:
         return
 
     created_at = message.created_at
@@ -2071,6 +2077,97 @@ async def archive_original_message(message: discord.Message) -> None:
         logger.warning("Forbidden to send archive message for %s: %s", message.id, exc)
     except discord.HTTPException as exc:
         logger.warning("Failed to send archive message for %s: %s", message.id, exc)
+
+
+def _format_interaction_option_values(options: Optional[Sequence[Mapping[str, Any]]]) -> str:
+    if not options:
+        return ""
+    parts: list[str] = []
+    for option in options:
+        name = str(option.get("name", ""))
+        opt_type = option.get("type")
+        nested = option.get("options")
+        if opt_type in (1, 2) and nested:
+            nested_str = _format_interaction_option_values(nested)
+            segment = f"{name} {nested_str}".strip()
+            if segment:
+                parts.append(segment)
+            continue
+        value = option.get("value")
+        if isinstance(value, str):
+            value_str = value
+        elif value is None:
+            value_str = "None"
+        else:
+            value_str = str(value)
+        if name:
+            parts.append(f"{name}={value_str}")
+        else:
+            parts.append(value_str)
+    return " ".join(parts)
+
+
+def _format_interaction_invocation(interaction: discord.Interaction, command: app_commands.Command) -> str:
+    base_name = getattr(command, "qualified_name", getattr(command, "name", "unknown"))
+    prefix = f"/{base_name}"
+    data = interaction.data or {}
+    option_str = _format_interaction_option_values(data.get("options")) if isinstance(data, Mapping) else ""
+    target_id = ""
+    if isinstance(data, Mapping):
+        raw_target = data.get("target_id")
+        if raw_target:
+            target_id = f" target_id={raw_target}"
+    if option_str:
+        return f"{prefix} {option_str}{target_id}".strip()
+    return f"{prefix}{target_id}".strip()
+
+
+async def log_command_archive_entry(
+    *,
+    actor: Union[discord.Member, discord.User],
+    channel: Optional[discord.abc.Messageable],
+    command_display: str,
+    invocation_text: Optional[str],
+    source: str,
+    guild: Optional[discord.Guild],
+    invocation_id: Optional[str],
+) -> None:
+    archive_channel = await _resolve_archive_channel(guild)
+    if archive_channel is None:
+        return
+
+    timestamp = utc_now()
+    actor_name = getattr(actor, "display_name", getattr(actor, "name", "Unknown"))
+    actor_id = getattr(actor, "id", "unknown")
+    if channel is None:
+        channel_value = "DM"
+    else:
+        channel_value = getattr(channel, "mention", None) or f"#{getattr(channel, 'id', 'unknown')}"
+
+    description = invocation_text.strip() if invocation_text else "*no invocation text available*"
+    embed = discord.Embed(
+        title="Command Executed",
+        description=description,
+        color=0x1ABC9C,
+        timestamp=timestamp,
+    )
+    embed.add_field(name="Author", value=f"{actor_name} (`{actor_id}`)", inline=False)
+    embed.add_field(name="Channel", value=str(channel_value), inline=False)
+    embed.add_field(name="Command", value=command_display or "unknown", inline=False)
+    embed.add_field(name="Source", value=source, inline=True)
+    if invocation_id:
+        embed.add_field(name="Invocation ID", value=str(invocation_id), inline=True)
+    avatar_asset = getattr(actor, "display_avatar", None)
+    avatar_url = getattr(avatar_asset, "url", None)
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
+    try:
+        await archive_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden as exc:
+        logger.warning("Forbidden to send command archive entry: %s", exc)
+    except discord.HTTPException as exc:
+        logger.warning("Failed to send command archive entry: %s", exc)
 
 
 def _format_character_message(
@@ -4668,7 +4765,49 @@ async def slash_ball_shortcut(
     await _handle_slash_say(interaction, "ball", text, enforce_permissions=False)
 
 
+@bot.event
+async def on_command_completion(ctx: commands.Context) -> None:
+    command = ctx.command
+    message = getattr(ctx, "message", None)
+    if command is None or message is None:
+        return
+    try:
+        await log_command_archive_entry(
+            actor=ctx.author,
+            channel=ctx.channel,
+            command_display=command.qualified_name,
+            invocation_text=message.content,
+            source="prefix",
+            guild=ctx.guild,
+            invocation_id=str(message.id),
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.debug("Failed to log prefix command completion: %s", exc)
 
+
+@bot.event
+async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command) -> None:
+    user = interaction.user
+    if user is None:
+        return
+    command_name = getattr(command, "qualified_name", getattr(command, "name", "unknown"))
+    try:
+        invocation_text = _format_interaction_invocation(interaction, command)
+    except Exception as exc:  # pragma: no cover - fallback to simple label
+        logger.debug("Unable to format interaction command %s: %s", command_name, exc)
+        invocation_text = f"/{command_name}"
+    try:
+        await log_command_archive_entry(
+            actor=user,
+            channel=interaction.channel,
+            command_display=command_name,
+            invocation_text=invocation_text,
+            source="slash",
+            guild=interaction.guild,
+            invocation_id=str(interaction.id),
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.debug("Failed to log slash command completion: %s", exc)
 
 @bot.event
 async def on_message(message: discord.Message):
