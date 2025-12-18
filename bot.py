@@ -5655,6 +5655,9 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
 
     await ensure_state_restored()
 
+    guild_channel = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
+    selection_scope = _selection_scope_for_channel(guild_channel)
+
     author_state = find_active_transformation(author.id, guild.id)
     author_is_admin = is_admin(author)
     author_has_special = _has_special_reroll_access(author_state) or _state_has_privileged_access(author_state)
@@ -6966,7 +6969,12 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
     else:
         normalized_pose = None
 
-    if not set_selected_pose_outfit(state.character_name, parsed_pose if normalized_pose else None, parsed_outfit):
+    if not set_selected_pose_outfit(
+        state.character_name,
+        parsed_pose if normalized_pose else None,
+        parsed_outfit,
+        scope=selection_scope,
+    ):
         pose_lines = []
         for pose, options in pose_outfits.items():
             pose_lines.append(f"{pose}: {', '.join(options)}")
@@ -6980,7 +6988,10 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
             await ctx.send(message)
         return
 
-    selected_pose, selected_outfit = get_selected_pose_outfit(state.character_name)
+    selected_pose, selected_outfit = get_selected_pose_outfit(
+        state.character_name,
+        scope=selection_scope,
+    )
     pose_label = selected_pose or "auto"
     outfit_label = selected_outfit or parsed_outfit
     confirmation = (
