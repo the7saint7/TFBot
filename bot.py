@@ -605,11 +605,27 @@ INANIMATE_ENABLED = os.getenv("TFBOT_INANIMATE_ENABLED", "true").lower() in ("tr
 BLOCK_INANIMATE_EXCEPT_SPECIAL = os.getenv("TFBOT_BLOCK_INANIMATE_EXCEPT_SPECIAL", "false").lower() in ("true", "1", "yes", "on")
 
 
-def _is_special_reroll_name(name: str) -> bool:
-    normalized = _normalize_special_token(name)
+def _special_token_variants(value: Optional[str]) -> set[str]:
+    normalized = _normalize_special_token(value)
     if not normalized:
+        return set()
+    sanitized = normalized.replace("'", "").replace('"', "").strip()
+    variants: set[str] = set()
+    if sanitized:
+        variants.add(sanitized)
+        variants.add(sanitized.replace(" ", ""))
+    for chunk in re.split(r"[\\s/_-]+", sanitized):
+        chunk = chunk.strip()
+        if chunk:
+            variants.add(chunk)
+    return {variant for variant in variants if variant}
+
+
+def _is_special_reroll_name(name: str) -> bool:
+    variants = _special_token_variants(name)
+    if not variants:
         return False
-    return normalized in SPECIAL_REROLL_TOKENS
+    return any(variant in SPECIAL_REROLL_TOKENS for variant in variants)
 
 
 def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
@@ -641,10 +657,12 @@ def _state_has_privileged_access(state: Optional[TransformationState]) -> bool:
     if not state or not PRIVILEGED_FORM_TOKENS:
         return False
     folder_token = _state_folder_token(state)
-    if folder_token and folder_token in PRIVILEGED_FORM_TOKENS:
+    if folder_token and any(
+        token in PRIVILEGED_FORM_TOKENS for token in _special_token_variants(folder_token)
+    ):
         return True
-    name_token = _normalize_special_token(state.character_name)
-    return bool(name_token and name_token in PRIVILEGED_FORM_TOKENS)
+    name_variants = _special_token_variants(state.character_name)
+    return any(token in PRIVILEGED_FORM_TOKENS for token in name_variants)
 
 
 def _find_character_by_folder(folder_name: str) -> Optional[TFCharacter]:
@@ -5710,9 +5728,9 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
         )
         return
 
-    if target_member.id != author.id and not author_is_admin:
+    if target_member.id != author.id and not (author_is_admin or author_has_special):
         await ctx.reply(
-            "Only admins can pillow other people.",
+            _privileged_requirement_message("pillow other people"),
             mention_author=False,
         )
         return
@@ -5798,14 +5816,14 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
             )
             return
 
-    if target_member.id != author.id and not author_is_admin:
+    if target_member.id != author.id and not (author_is_admin or author_has_special):
         logger.info(
-            "Undopillow blocked: non-admin tried to affect others actor=%s target=%s",
+            "Undopillow blocked: non-privileged tried to affect others actor=%s target=%s",
             author.id,
             target_member.id,
         )
         await ctx.reply(
-            "Only admins can undo pillow forms on other people.",
+            _privileged_requirement_message("undo pillow forms on other people"),
             mention_author=False,
         )
         return
