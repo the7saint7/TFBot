@@ -6880,6 +6880,8 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
     await ensure_state_restored()
 
     guild_id = ctx.guild.id if ctx.guild else None
+    guild_channel = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
+    selection_scope = _selection_scope_for_channel(guild_channel)
     actor_member = ctx.author if isinstance(ctx.author, discord.Member) else None
     can_target_others = (
         ctx.guild is not None
