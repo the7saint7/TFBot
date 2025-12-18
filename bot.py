@@ -5628,6 +5628,7 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
     author = ctx.author
     guild = ctx.guild
     if guild is None or not isinstance(author, discord.Member):
+        logger.info("Undopillow blocked: non-guild context user=%s", getattr(author, "id", None))
         await ctx.reply(
             "This command can only be used inside a server.",
             mention_author=False,
@@ -5640,6 +5641,12 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
     author_is_admin = is_admin(author)
     author_has_special = _has_special_reroll_access(author_state)
     if not (author_is_admin or author_has_special):
+        logger.info(
+            "Undopillow blocked: insufficient privileges user=%s admin=%s special=%s",
+            author.id,
+            author_is_admin,
+            author_has_special,
+        )
         await ctx.reply(
             "Only admins or privileged forms can use this command.",
             mention_author=False,
@@ -5669,6 +5676,11 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
         target_member = author
 
     if target_state is None:
+        logger.info(
+            "Undopillow ignored: no active TF for token=%s user=%s",
+            search_token or "<self>",
+            author.id,
+        )
         await ctx.reply(
             "I couldn't find an active transformation for that target.",
             mention_author=False,
@@ -5775,6 +5787,11 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
     if target_member is None:
         _, target_member = await fetch_member(guild.id, target_state.user_id)
         if target_member is None:
+            logger.info(
+                "Undopillow blocked: member lookup failed guild=%s target=%s",
+                guild.id,
+                target_state.user_id,
+            )
             await ctx.reply(
                 "I couldn't look up that member.",
                 mention_author=False,
@@ -5782,6 +5799,11 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
             return
 
     if target_member.id != author.id and not author_is_admin:
+        logger.info(
+            "Undopillow blocked: non-admin tried to affect others actor=%s target=%s",
+            author.id,
+            target_member.id,
+        )
         await ctx.reply(
             "Only admins can undo pillow forms on other people.",
             mention_author=False,
@@ -5789,6 +5811,11 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
         return
 
     if not target_state.is_pillow:
+        logger.info(
+            "Undopillow ignored: target not pillow actor=%s target=%s",
+            author.id,
+            target_member.id,
+        )
         await ctx.reply(
             f"{target_member.display_name} isn't a pillow right now.",
             mention_author=False,
@@ -5801,6 +5828,12 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
     await ctx.reply(
         f"{author.display_name} lets {target_member.display_name} stretch out of their pillowcase.",
         mention_author=False,
+    )
+    logger.info(
+        "Undopillow applied: actor=%s target=%s character=%s",
+        author.id,
+        target_member.id,
+        target_state.character_name,
     )
     await send_history_message(
         "TF Modifier",
