@@ -5871,7 +5871,7 @@ async def slash_pillow_command(
         await interaction.followup.send("No pillow transformation was applied.", ephemeral=True)
 
 
-@bot.command(name="undopillow")
+@bot.command(name="undopillow", aliases=["unpillow"])
 @commands.guild_only()
 @guard_prefix_command_channel
 async def undopillow_command(ctx: commands.Context, *, target: str = ""):
