@@ -46,6 +46,7 @@ class TransformationState:
     inanimate_responses: Tuple[str, ...] = field(default_factory=tuple)
     form_owner_user_id: Optional[int] = None
     identity_display_name: Optional[str] = None
+    is_pillow: bool = False
 
 
 @dataclass

@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 import discord
 
 from tfbot.models import TransformationState
-from tfbot.panels import fetch_avatar_bytes
+from tfbot.panels import compose_state_avatar_image, fetch_avatar_bytes
 from tfbot.utils import utc_now
 
 
@@ -31,7 +31,15 @@ async def build_legacy_embed(
     embed.set_author(name=state.character_name)
 
     avatar_file: Optional[discord.File] = None
-    avatar_bytes = await fetch_avatar_bytes(state.character_avatar_path)
+    avatar_bytes: Optional[bytes] = None
+    if getattr(state, "is_pillow", False):
+        avatar_image = compose_state_avatar_image(state)
+        if avatar_image is not None:
+            buffer = io.BytesIO()
+            avatar_image.save(buffer, format="PNG")
+            avatar_bytes = buffer.getvalue()
+    if avatar_bytes is None:
+        avatar_bytes = await fetch_avatar_bytes(state.character_avatar_path)
     if avatar_bytes:
         suffix = Path(state.character_avatar_path).suffix or ".png"
         filename = f"tf-avatar-{state.user_id}{suffix}"

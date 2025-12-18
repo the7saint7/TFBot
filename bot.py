@@ -5624,6 +5624,132 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
             await GAME_BOARD_MANAGER._log_action(game_state, f"{target_member.display_name} character rerolled to {new_name}")
 
 
+async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
+    author = ctx.author
+    guild = ctx.guild
+    if guild is None or not isinstance(author, discord.Member):
+        await ctx.reply(
+            "This command can only be used inside a server.",
+            mention_author=False,
+        )
+        return
+
+    await ensure_state_restored()
+
+    author_state = find_active_transformation(author.id, guild.id)
+    author_is_admin = is_admin(author)
+    author_has_special = _has_special_reroll_access(author_state)
+    if not (author_is_admin or author_has_special):
+        await ctx.reply(
+            "Only admins or privileged forms can use this command.",
+            mention_author=False,
+        )
+        return
+
+    search_token = target.strip()
+    slash_member = getattr(ctx, "_slash_target_member", None)
+    slash_folder = getattr(ctx, "_slash_target_folder", None)
+    if not search_token:
+        if slash_member is not None:
+            search_token = slash_member.mention
+        elif slash_folder:
+            search_token = slash_folder.strip()
+
+    target_state: Optional[TransformationState]
+    target_member: Optional[discord.Member] = None
+
+    if search_token:
+        target_state = _find_state_by_token(guild, search_token)
+        if target_state:
+            target_member = guild.get_member(target_state.user_id)
+            if target_member is None:
+                _, target_member = await fetch_member(guild.id, target_state.user_id)
+    else:
+        target_state = active_transformations.get(state_key(guild.id, author.id))
+        target_member = author
+
+    if target_state is None:
+        await ctx.reply(
+            "I couldn't find an active transformation for that target.",
+            mention_author=False,
+        )
+        return
+
+    if target_state.is_inanimate:
+        await ctx.reply(
+            "That form is already an object—there's nowhere to wrap a pillow cover!",
+            mention_author=False,
+        )
+        return
+
+    if target_member is None:
+        _, target_member = await fetch_member(guild.id, target_state.user_id)
+        if target_member is None:
+            await ctx.reply(
+                "I couldn't look up that member.",
+                mention_author=False,
+            )
+            return
+
+    if target_state.is_pillow:
+        await ctx.reply(
+            f"{target_member.display_name} is already a cuddly pillow.",
+            mention_author=False,
+        )
+        return
+
+    if target_member.id != author.id and not author_is_admin:
+        await ctx.reply(
+            "Only admins can pillow other people.",
+            mention_author=False,
+        )
+        return
+
+    target_state.is_pillow = True
+    persist_states()
+
+    duration_hint = target_state.duration_label or "the rest of their TF"
+    await ctx.reply(
+        f"{author.display_name} stuffs {target_member.display_name} into a body pillowcase! "
+        f"They'll stay a pillow for {duration_hint}.",
+        mention_author=False,
+    )
+    await send_history_message(
+        "TF Modifier",
+        f"Pillow form applied to **{target_member.display_name}** ({target_state.character_name}) "
+        f"by **{author.display_name}**.",
+    )
+
+
+@bot.command(name="pillow")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def pillow_command(ctx: commands.Context, *, target: str = ""):
+    await _handle_pillow_command(ctx, target)
+
+
+@bot.tree.command(name="pillow", description="Wrap a transformed member into a body pillow.")
+@app_commands.describe(
+    who_member="Member to pillow (defaults to yourself).",
+    who_character="Folder or character token to target instead.",
+)
+@app_commands.autocomplete(who_character=_character_name_autocomplete)
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_pillow_command(
+    interaction: discord.Interaction,
+    who_member: Optional[discord.Member] = None,
+    who_character: Optional[str] = None,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    ctx._slash_target_member = who_member
+    ctx._slash_target_folder = who_character
+    await _handle_pillow_command(ctx, "")
+    if not ctx.responded:
+        await interaction.followup.send("No pillow transformation was applied.", ephemeral=True)
+
+
 @bot.command(name="tf", aliases=["TF"])
 @guard_prefix_command_channel
 async def prefix_tf_35(ctx: commands.Context):
@@ -6023,6 +6149,7 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         inanimate_responses=char2_responses,
         form_owner_user_id=owner2,
         identity_display_name=identity1,
+        is_pillow=state1.is_pillow,
     )
 
     new_state2 = TransformationState(
@@ -6042,6 +6169,7 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         inanimate_responses=char1_responses,
         form_owner_user_id=owner1,
         identity_display_name=identity2,
+        is_pillow=state2.is_pillow,
     )
     
     # Update active_transformations
@@ -6209,6 +6337,7 @@ async def slash_swap_command(
         inanimate_responses=char2_responses,
         form_owner_user_id=owner2,
         identity_display_name=identity1,
+        is_pillow=state1.is_pillow,
     )
 
     new_state2 = TransformationState(
@@ -6228,6 +6357,7 @@ async def slash_swap_command(
         inanimate_responses=char1_responses,
         form_owner_user_id=owner1,
         identity_display_name=identity2,
+        is_pillow=state2.is_pillow,
     )
     
     # Update active_transformations

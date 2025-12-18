@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -75,6 +76,49 @@ VN_AVATAR_SCALE = max(0.1, float_from_env("TFBOT_VN_AVATAR_SCALE", 1.0))
 _VN_BG_ROOT_SETTING = os.getenv("TFBOT_VN_BG_ROOT", "").strip()
 _VN_BG_DEFAULT_SETTING = os.getenv("TFBOT_VN_BG_DEFAULT", "school/cafeteria.png").strip()
 VN_BACKGROUND_DEFAULT_RELATIVE = Path(_VN_BG_DEFAULT_SETTING) if _VN_BG_DEFAULT_SETTING else None
+
+_PILLOW_IMAGE_SETTING = os.getenv("TFBOT_PILLOW_IMAGE", "vn_assets/pillow.png").strip()
+_pillow_candidate = Path(_PILLOW_IMAGE_SETTING) if _PILLOW_IMAGE_SETTING else Path("vn_assets/pillow.png")
+if not _pillow_candidate.is_absolute():
+    PILLOW_IMAGE_PATH = (BASE_DIR / _pillow_candidate).resolve()
+else:
+    PILLOW_IMAGE_PATH = _pillow_candidate.resolve()
+_PILLOW_POINT_TOP_LEFT = (50.0, 110.0)
+_PILLOW_POINT_TOP_RIGHT = (330.0, 70.0)
+_PILLOW_POINT_BOTTOM_LEFT = (193.0, 868.0)
+_PILLOW_POINT_BOTTOM_RIGHT = (461.0, 824.0)
+PILLOW_SURFACE_POINTS: Tuple[Tuple[float, float], ...] = (
+    _PILLOW_POINT_TOP_LEFT,
+    _PILLOW_POINT_TOP_RIGHT,
+    _PILLOW_POINT_BOTTOM_LEFT,
+    _PILLOW_POINT_BOTTOM_RIGHT,
+)
+_PILLOW_WARP_POINTS: Tuple[Tuple[float, float], ...] = (
+    _PILLOW_POINT_TOP_LEFT,
+    _PILLOW_POINT_TOP_RIGHT,
+    _PILLOW_POINT_BOTTOM_RIGHT,
+    _PILLOW_POINT_BOTTOM_LEFT,
+)
+
+
+def _pillow_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+
+_PILLOW_TARGET_WIDTH = max(
+    1,
+    max(
+        _pillow_distance(_PILLOW_POINT_TOP_LEFT, _PILLOW_POINT_TOP_RIGHT),
+        _pillow_distance(_PILLOW_POINT_BOTTOM_LEFT, _PILLOW_POINT_BOTTOM_RIGHT),
+    ),
+)
+_PILLOW_TARGET_HEIGHT = max(
+    1,
+    max(
+        _pillow_distance(_PILLOW_POINT_TOP_LEFT, _PILLOW_POINT_BOTTOM_LEFT),
+        _pillow_distance(_PILLOW_POINT_TOP_RIGHT, _PILLOW_POINT_BOTTOM_RIGHT),
+    ),
+)
 
 if _VN_BG_ROOT_SETTING:
     candidate_bg_root = Path(_VN_BG_ROOT_SETTING).expanduser()
@@ -1408,6 +1452,8 @@ def set_selected_pose_outfit(
 
 _COMPOSE_AVATAR_CACHE: "OrderedDict[Tuple[str, Optional[str], Optional[str], str], 'Image.Image']" = OrderedDict()
 _COMPOSE_AVATAR_CACHE_LIMIT = 512
+_PILLOW_AVATAR_CACHE: "OrderedDict[Tuple[str, str, str, Optional[str], Optional[str], str], 'Image.Image']" = OrderedDict()
+_PILLOW_AVATAR_CACHE_LIMIT = 256
 
 
 def compose_game_avatar(
@@ -1920,6 +1966,7 @@ def _compose_game_avatar_uncached(
 
 def _clear_compose_game_avatar_cache() -> None:
     _COMPOSE_AVATAR_CACHE.clear()
+    _PILLOW_AVATAR_CACHE.clear()
     # Also clear disk cache to force regeneration when accessories change
     if VN_CACHE_DIR and VN_CACHE_DIR.exists():
         try:
@@ -1933,6 +1980,201 @@ def _clear_compose_game_avatar_cache() -> None:
 
 
 compose_game_avatar.cache_clear = _clear_compose_game_avatar_cache  # type: ignore[attr-defined]
+
+
+def _load_state_avatar_from_path(path: str) -> Optional["Image.Image"]:
+    if not path:
+        return None
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = (BASE_DIR / candidate).resolve()
+    if not candidate.exists():
+        logger.warning("State avatar image missing at %s", candidate)
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(candidate) as avatar_file:
+            return avatar_file.convert("RGBA")
+    except OSError as exc:
+        logger.warning("Failed to load avatar image %s: %s", candidate, exc)
+        return None
+
+
+@lru_cache(maxsize=1)
+def _load_pillow_assets() -> Optional[Tuple["Image.Image", "Image.Image", "Image.Image"]]:
+    if not PILLOW_IMAGE_PATH.exists():
+        logger.warning("Pillow base image missing at %s", PILLOW_IMAGE_PATH)
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageOps
+    except ImportError:
+        return None
+    try:
+        with Image.open(PILLOW_IMAGE_PATH) as pillow_source:
+            pillow_base = pillow_source.convert("RGBA")
+    except OSError as exc:
+        logger.warning("Failed to read pillow base %s: %s", PILLOW_IMAGE_PATH, exc)
+        return None
+    mask = Image.new("L", pillow_base.size, 0)
+    ImageDraw.Draw(mask).polygon(PILLOW_SURFACE_POINTS, fill=255)
+    shading_source = ImageOps.autocontrast(pillow_base.convert("L"))
+    shading = Image.new("L", pillow_base.size, 255)
+    shading.paste(shading_source, mask=mask)
+    return pillow_base, shading, mask
+
+
+def _prepare_pillow_sprite(image: "Image.Image") -> Optional["Image.Image"]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    sprite = _crop_transparent_vertical(image)
+    if sprite.width <= 0 or sprite.height <= 0:
+        return None
+    sprite = sprite.convert("RGBA")
+    scale = min(_PILLOW_TARGET_WIDTH / sprite.width, _PILLOW_TARGET_HEIGHT / sprite.height)
+    if scale <= 0:
+        return None
+    if not math.isclose(scale, 1.0, rel_tol=0.02):
+        scaled_width = max(1, int(sprite.width * scale))
+        scaled_height = max(1, int(sprite.height * scale))
+        sprite = sprite.resize((scaled_width, scaled_height), Image.LANCZOS)
+    return sprite
+
+
+def _basic_sprite_projection(
+    sprite: "Image.Image",
+    canvas_size: Tuple[int, int],
+) -> Optional["Image.Image"]:
+    try:
+        from PIL import Image, ImageChops, ImageDraw
+    except ImportError:
+        return None
+    canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    min_x = int(min(point[0] for point in PILLOW_SURFACE_POINTS))
+    min_y = int(min(point[1] for point in PILLOW_SURFACE_POINTS))
+    max_x = int(max(point[0] for point in PILLOW_SURFACE_POINTS))
+    max_y = int(max(point[1] for point in PILLOW_SURFACE_POINTS))
+    width = max(1, max_x - min_x)
+    height = max(1, max_y - min_y)
+    resized = sprite.resize((width, height), Image.LANCZOS)
+    canvas.paste(resized, (min_x, min_y), resized)
+    mask = Image.new("L", canvas_size, 0)
+    ImageDraw.Draw(mask).polygon(PILLOW_SURFACE_POINTS, fill=255)
+    alpha = canvas.getchannel("A")
+    alpha = ImageChops.multiply(alpha, mask)
+    canvas.putalpha(alpha)
+    return canvas
+
+
+def _warp_sprite_to_pillow(sprite: "Image.Image", canvas_size: Tuple[int, int]) -> Optional["Image.Image"]:
+    try:
+        import numpy as np  # type: ignore
+        import cv2  # type: ignore
+    except ImportError:
+        return _basic_sprite_projection(sprite, canvas_size)
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    src = np.float32([[0, 0], [sprite.width, 0], [sprite.width, sprite.height], [0, sprite.height]])
+    dst = np.float32(_PILLOW_WARP_POINTS)
+    sprite_array = np.array(sprite.convert("RGBA"))
+    width, height = canvas_size
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(
+        sprite_array,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+    return Image.fromarray(warped, mode="RGBA")
+
+
+def _apply_pillow_shading(
+    warped: "Image.Image",
+    shading_map: Optional["Image.Image"],
+) -> "Image.Image":
+    if shading_map is None:
+        return warped
+    try:
+        from PIL import Image, ImageChops
+    except ImportError:
+        return warped
+    softened = ImageChops.blend(Image.new("L", shading_map.size, 255), shading_map, 0.35)
+    shading_rgb = Image.merge("RGB", (softened, softened, softened))
+    shaded_rgb = ImageChops.multiply(warped.convert("RGB"), shading_rgb)
+    shaded = Image.merge("RGBA", (*shaded_rgb.split(), warped.getchannel("A")))
+    return shaded
+
+
+def _compose_pillow_avatar(avatar_image: "Image.Image") -> Optional["Image.Image"]:
+    assets = _load_pillow_assets()
+    if assets is None:
+        return None
+    pillow_base, shading_map, _ = assets
+    sprite = _prepare_pillow_sprite(avatar_image)
+    if sprite is None:
+        return None
+    warped = _warp_sprite_to_pillow(sprite, pillow_base.size)
+    if warped is None:
+        warped = _basic_sprite_projection(sprite, pillow_base.size)
+    if warped is None:
+        return None
+    shaded = _apply_pillow_shading(warped, shading_map)
+    alpha = shaded.getchannel("A").point(lambda value: int(value * 0.93))
+    shaded.putalpha(alpha)
+    pillow_canvas = pillow_base.copy()
+    pillow_canvas.alpha_composite(shaded)
+    return pillow_canvas
+
+
+def compose_state_avatar_image(
+    state: TransformationState,
+    pose_override: Optional[str] = None,
+    outfit_override: Optional[str] = None,
+    selection_scope: Optional[str] = None,
+) -> Optional["Image.Image"]:
+    scope_key = _normalize_selection_scope(selection_scope)
+    avatar = compose_game_avatar(
+        state.character_name,
+        pose_override=pose_override,
+        outfit_override=outfit_override,
+        selection_scope=scope_key,
+    )
+    fallback_identity = (state.character_avatar_path or "").strip()
+    if avatar is None and fallback_identity:
+        avatar = _load_state_avatar_from_path(fallback_identity)
+    if avatar is None:
+        return None
+    if not getattr(state, "is_pillow", False):
+        return avatar
+    folder_token = (state.character_folder or "").strip().lower()
+    cache_key = (
+        state.character_name.strip().lower(),
+        folder_token,
+        fallback_identity,
+        pose_override,
+        outfit_override,
+        scope_key,
+    )
+    cached = _PILLOW_AVATAR_CACHE.get(cache_key)
+    if cached is not None:
+        _PILLOW_AVATAR_CACHE.move_to_end(cache_key)
+        return cached
+    pillow_variant = _compose_pillow_avatar(avatar)
+    if pillow_variant is None:
+        return avatar
+    _PILLOW_AVATAR_CACHE[cache_key] = pillow_variant
+    _PILLOW_AVATAR_CACHE.move_to_end(cache_key)
+    if len(_PILLOW_AVATAR_CACHE) > _PILLOW_AVATAR_CACHE_LIMIT:
+        _PILLOW_AVATAR_CACHE.popitem(last=False)
+    return pillow_variant
 
 
 def _get_pose_metadata(config: Dict, pose_name: str) -> Dict:
@@ -2827,10 +3069,11 @@ def render_vn_panel(
 
     avatar_image = None
     if avatar_box:
-        avatar_image = compose_game_avatar(
-            state.character_name,
+        avatar_image = compose_state_avatar_image(
+            state,
             pose_override=gacha_pose_override,
             outfit_override=gacha_outfit_override,
+            selection_scope=selection_scope,
         )
     if avatar_image is not None and avatar_box:
         cropped = _crop_transparent_vertical(avatar_image)
@@ -3281,6 +3524,7 @@ __all__ = [
     "compose_background_layer",
     "resolve_panel_layout",
     "compose_game_avatar",
+    "compose_state_avatar_image",
     "resolve_character_directory",
     "resolve_character_name_color",
     "list_pose_outfits",
