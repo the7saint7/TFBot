@@ -7014,6 +7014,9 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
     """3.5 version of say command."""
     await ensure_state_restored()
 
+    guild_channel = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
+    selection_scope = _selection_scope_for_channel(guild_channel)
+
     actor = ctx.author
     if not isinstance(actor, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
@@ -7087,6 +7090,7 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
             reply_context=reply_context,
+            selection_scope=selection_scope,
         )
         if vn_file:
             files.append(vn_file)
