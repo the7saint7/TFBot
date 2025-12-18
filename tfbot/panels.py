@@ -83,10 +83,10 @@ if not _pillow_candidate.is_absolute():
     PILLOW_IMAGE_PATH = (BASE_DIR / _pillow_candidate).resolve()
 else:
     PILLOW_IMAGE_PATH = _pillow_candidate.resolve()
-_PILLOW_POINT_TOP_LEFT = (50.0, 110.0)
-_PILLOW_POINT_TOP_RIGHT = (330.0, 70.0)
-_PILLOW_POINT_BOTTOM_LEFT = (193.0, 868.0)
-_PILLOW_POINT_BOTTOM_RIGHT = (461.0, 824.0)
+_PILLOW_POINT_TOP_LEFT = (30.0, 50.0)
+_PILLOW_POINT_TOP_RIGHT = (330.0, 28.0)
+_PILLOW_POINT_BOTTOM_LEFT = (100.0, 715.0)
+_PILLOW_POINT_BOTTOM_RIGHT = (378.0, 720.0)
 PILLOW_SURFACE_POINTS: Tuple[Tuple[float, float], ...] = (
     _PILLOW_POINT_TOP_LEFT,
     _PILLOW_POINT_TOP_RIGHT,
