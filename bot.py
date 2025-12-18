@@ -5639,7 +5639,7 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
 
     author_state = find_active_transformation(author.id, guild.id)
     author_is_admin = is_admin(author)
-    author_has_special = _has_special_reroll_access(author_state)
+    author_has_special = _has_special_reroll_access(author_state) or _state_has_privileged_access(author_state)
     if not (author_is_admin or author_has_special):
         logger.info(
             "Undopillow blocked: insufficient privileges user=%s admin=%s special=%s",
@@ -5747,7 +5747,7 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
 
     author_state = find_active_transformation(author.id, guild.id)
     author_is_admin = is_admin(author)
-    author_has_special = _has_special_reroll_access(author_state)
+    author_has_special = _has_special_reroll_access(author_state) or _state_has_privileged_access(author_state)
     if not (author_is_admin or author_has_special):
         await ctx.reply(
             "Only admins or privileged forms can use this command.",
