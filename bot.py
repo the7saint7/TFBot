@@ -5721,6 +5721,94 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
     )
 
 
+async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None:
+    author = ctx.author
+    guild = ctx.guild
+    if guild is None or not isinstance(author, discord.Member):
+        await ctx.reply(
+            "This command can only be used inside a server.",
+            mention_author=False,
+        )
+        return
+
+    await ensure_state_restored()
+
+    author_state = find_active_transformation(author.id, guild.id)
+    author_is_admin = is_admin(author)
+    author_has_special = _has_special_reroll_access(author_state)
+    if not (author_is_admin or author_has_special):
+        await ctx.reply(
+            "Only admins or privileged forms can use this command.",
+            mention_author=False,
+        )
+        return
+
+    search_token = target.strip()
+    slash_member = getattr(ctx, "_slash_target_member", None)
+    slash_folder = getattr(ctx, "_slash_target_folder", None)
+    if not search_token:
+        if slash_member is not None:
+            search_token = slash_member.mention
+        elif slash_folder:
+            search_token = slash_folder.strip()
+
+    target_state: Optional[TransformationState]
+    target_member: Optional[discord.Member] = None
+
+    if search_token:
+        target_state = _find_state_by_token(guild, search_token)
+        if target_state:
+            target_member = guild.get_member(target_state.user_id)
+            if target_member is None:
+                _, target_member = await fetch_member(guild.id, target_state.user_id)
+    else:
+        target_state = active_transformations.get(state_key(guild.id, author.id))
+        target_member = author
+
+    if target_state is None:
+        await ctx.reply(
+            "I couldn't find an active transformation for that target.",
+            mention_author=False,
+        )
+        return
+
+    if target_member is None:
+        _, target_member = await fetch_member(guild.id, target_state.user_id)
+        if target_member is None:
+            await ctx.reply(
+                "I couldn't look up that member.",
+                mention_author=False,
+            )
+            return
+
+    if target_member.id != author.id and not author_is_admin:
+        await ctx.reply(
+            "Only admins can undo pillow forms on other people.",
+            mention_author=False,
+        )
+        return
+
+    if not target_state.is_pillow:
+        await ctx.reply(
+            f"{target_member.display_name} isn't a pillow right now.",
+            mention_author=False,
+        )
+        return
+
+    target_state.is_pillow = False
+    persist_states()
+
+    await ctx.reply(
+        f"{author.display_name} lets {target_member.display_name} stretch out of their pillowcase.",
+        mention_author=False,
+    )
+    await send_history_message(
+        "TF Modifier",
+        f"Pillow form removed from **{target_member.display_name}** ({target_state.character_name}) "
+        f"by **{author.display_name}**.",
+    )
+
+
 @bot.command(name="pillow")
 @commands.guild_only()
 @guard_prefix_command_channel
@@ -5748,6 +5836,35 @@ async def slash_pillow_command(
     await _handle_pillow_command(ctx, "")
     if not ctx.responded:
         await interaction.followup.send("No pillow transformation was applied.", ephemeral=True)
+
+
+@bot.command(name="undopillow")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def undopillow_command(ctx: commands.Context, *, target: str = ""):
+    await _handle_undopillow_command(ctx, target)
+
+
+@bot.tree.command(name="undopillow", description="Remove a body pillow modifier from a transformed member.")
+@app_commands.describe(
+    who_member="Member to restore (defaults to yourself).",
+    who_character="Folder or character token to target instead.",
+)
+@app_commands.autocomplete(who_character=_character_name_autocomplete)
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_undopillow_command(
+    interaction: discord.Interaction,
+    who_member: Optional[discord.Member] = None,
+    who_character: Optional[str] = None,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    ctx._slash_target_member = who_member
+    ctx._slash_target_folder = who_character
+    await _handle_undopillow_command(ctx, "")
+    if not ctx.responded:
+        await interaction.followup.send("No pillow modifier was removed.", ephemeral=True)
 
 
 @bot.command(name="tf", aliases=["TF"])
