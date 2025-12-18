@@ -83,10 +83,10 @@ if not _pillow_candidate.is_absolute():
     PILLOW_IMAGE_PATH = (BASE_DIR / _pillow_candidate).resolve()
 else:
     PILLOW_IMAGE_PATH = _pillow_candidate.resolve()
-_PILLOW_POINT_TOP_LEFT = (30.0, 50.0)
-_PILLOW_POINT_TOP_RIGHT = (330.0, 28.0)
-_PILLOW_POINT_BOTTOM_LEFT = (100.0, 715.0)
-_PILLOW_POINT_BOTTOM_RIGHT = (378.0, 720.0)
+_PILLOW_POINT_TOP_LEFT = (37.0, 38.0)
+_PILLOW_POINT_TOP_RIGHT = (310.0, 12.0)
+_PILLOW_POINT_BOTTOM_LEFT = (88.0, 600.0)
+_PILLOW_POINT_BOTTOM_RIGHT = (360.0, 575.0)
 PILLOW_SURFACE_POINTS: Tuple[Tuple[float, float], ...] = (
     _PILLOW_POINT_TOP_LEFT,
     _PILLOW_POINT_TOP_RIGHT,
@@ -2127,7 +2127,7 @@ def _compose_pillow_avatar(avatar_image: "Image.Image") -> Optional["Image.Image
     if warped is None:
         return None
     shaded = _apply_pillow_shading(warped, shading_map)
-    alpha = shaded.getchannel("A").point(lambda value: int(value * 0.93))
+    alpha = shaded.getchannel("A").point(lambda value: int(value * 0.95))
     shaded.putalpha(alpha)
     pillow_canvas = pillow_base.copy()
     pillow_canvas.alpha_composite(shaded)
