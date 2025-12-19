@@ -405,7 +405,9 @@ GAME_FORUM_CHANNEL_ID = int_from_env("TFBOT_GAME_FORUM_CHANNEL_ID", 0)
 GAME_DM_CHANNEL_ID = int_from_env("TFBOT_GAME_DM_CHANNEL_ID", 0)
 GAME_CONFIG_FILE = Path(os.getenv("TFBOT_GAME_CONFIG_FILE", "games/game_config.json"))
 GAME_ASSETS_DIR = path_from_env("TFBOT_GAME_ASSETS_DIR") or Path("games/assets")
-GAME_BOARD_ENABLED = GAME_FORUM_CHANNEL_ID > 0
+# Gameboard enable/disable toggle (like INANIMATE_ENABLED pattern)
+GAMEBOARD_ENABLED = os.getenv("TFBOT_GAMEBOARD_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+GAME_BOARD_ENABLED = GAMEBOARD_ENABLED and GAME_FORUM_CHANNEL_ID > 0
 MESSAGE_STYLE = os.getenv(
     "TFBOT_MESSAGE_STYLE",
     "vn" if GACHA_ENABLED else "classic",
@@ -2238,6 +2240,13 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     if not message.guild:
         logger.debug("Skipping TF outside of guild context.")
         return None
+    
+    # CRITICAL: NEVER trigger random transformations in gameboard threads
+    # Gameboard is GM-controlled only - no random rolls!
+    if GAME_BOARD_MANAGER and isinstance(message.channel, discord.Thread):
+        if GAME_BOARD_MANAGER.is_game_thread(message.channel):
+            logger.debug("Blocking random transformation in gameboard thread %s - GM controlled only", message.channel.id)
+            return None
 
     await ensure_state_restored()
 
@@ -2522,7 +2531,12 @@ def _channel_matches_allowed(
     channel: Optional[Union[discord.abc.GuildChannel, discord.Thread]],
     allowed_ids: set[int],
 ) -> bool:
-    if not allowed_ids or channel is None:
+    if channel is None:
+        return False
+    # Check if this is a game thread - always allow game threads
+    if isinstance(channel, discord.Thread) and GAME_BOARD_MANAGER and GAME_BOARD_MANAGER.is_game_thread(channel):
+        return True
+    if not allowed_ids:
         return False
     channel_id = getattr(channel, "id", None)
     if channel_id in allowed_ids:
@@ -3051,15 +3065,24 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
     
-    # Check if this is a game thread - if so, apply game-specific restrictions
-    game_state = None
+    # Check if this is a game thread - if so, route to gameboard manager
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
         game_state = GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
         if game_state:
-            # In game threads, only GM can reroll
-            if not GAME_BOARD_MANAGER._is_gm(author, game_state):
-                await ctx.reply("Only the GM can reroll characters in game threads.", mention_author=False)
-                return None
+            # Parse member from args if provided
+            target_member = None
+            if args:
+                # Try to extract member mention from args
+                import re
+                mention_match = re.search(r'<@!?(\d+)>', args)
+                if mention_match:
+                    member_id = int(mention_match.group(1))
+                    if ctx.guild:
+                        target_member = ctx.guild.get_member(member_id)
+            
+            # Route to gameboard reroll
+            await GAME_BOARD_MANAGER.command_reroll(ctx, member=target_member)
+            return None
     
     roleplay_dm_override = (
         ROLEPLAY_COG is not None
@@ -4840,11 +4863,20 @@ async def on_message(message: discord.Message):
     )
 
     command_invoked = False
+    
+    # Check if this is a game thread - if so, allow commands
+    is_game_thread = (
+        GAME_BOARD_MANAGER is not None
+        and isinstance(message.channel, discord.Thread)
+        and GAME_BOARD_MANAGER.is_game_thread(message.channel)
+    )
+    
     allowed_ids = _allowed_instance_channel_ids()
     channel_allowed = (
         not message.guild
         or not allowed_ids
         or _channel_matches_allowed(message.channel, allowed_ids)
+        or is_game_thread  # Allow game thread commands
     )
 
     ctx = await bot.get_context(message)
@@ -4872,19 +4904,34 @@ async def on_message(message: discord.Message):
             message.author.id,
             getattr(message.channel, "id", None),
         )
+        # CRITICAL: Command-like message that doesn't exist - check if in game thread
+        # If so, prevent it from falling through to VN mode (would cause narrator to revert)
+        is_game_thread = (
+            GAME_BOARD_MANAGER is not None
+            and isinstance(message.channel, discord.Thread)
+            and GAME_BOARD_MANAGER.is_game_thread(message.channel)
+        )
+        if is_game_thread:
+            # Invalid command in game thread - don't process as VN message
+            # This prevents narrator from reverting to VN character on typos
+            return None
 
     if command_invoked:
         return None
 
     # Check for game thread FIRST (before other systems)
+    # CRITICAL: Game threads use isolated game state, never global active_transformations
     is_game_thread = (
         GAME_BOARD_MANAGER is not None
         and isinstance(message.channel, discord.Thread)
         and GAME_BOARD_MANAGER.is_game_thread(message.channel)
     )
     if is_game_thread:
+        # Game thread messages use game_state.player_states (isolated)
+        # This ensures game characters don't affect VN mode and vice versa
         handled = await GAME_BOARD_MANAGER.handle_message(message, command_invoked=command_invoked)
         if handled:
+            # Message was handled by game system - return early to prevent VN mode processing
             return None
 
     is_gacha_channel = (
@@ -4903,10 +4950,18 @@ async def on_message(message: discord.Message):
     channel_id = getattr(message.channel, "id", None)
     is_roleplay_forum_post = ROLEPLAY_COG is not None and ROLEPLAY_COG.is_roleplay_post(message.channel)
     is_admin_user = is_admin(message.author)
+    
+    # Don't skip game thread messages
+    is_game_thread_msg = (
+        GAME_BOARD_MANAGER is not None
+        and isinstance(message.channel, discord.Thread)
+        and GAME_BOARD_MANAGER.is_game_thread(message.channel)
+    )
+    
     if message.guild and message.guild.owner_id == message.author.id and not is_roleplay_forum_post:
         logger.debug("Ignoring message %s from server owner %s", message.id, message.author.id)
         return None
-    if message.guild and allowed_ids and not _channel_matches_allowed(message.channel, allowed_ids):
+    if message.guild and allowed_ids and not _channel_matches_allowed(message.channel, allowed_ids) and not is_game_thread_msg:
         logger.info(
             "Skipping message %s: channel %s is not in the monitored TF/RP channels %s.",
             message.id,
@@ -4952,6 +5007,17 @@ async def on_message(message: discord.Message):
         return None
 
     if is_roleplay_forum_post:
+        return None
+    
+    # CRITICAL: NEVER trigger random transformations in gameboard threads
+    # Gameboard is GM-controlled only - no random rolls!
+    is_game_thread_block = (
+        GAME_BOARD_MANAGER is not None
+        and isinstance(message.channel, discord.Thread)
+        and GAME_BOARD_MANAGER.is_game_thread(message.channel)
+    )
+    if is_game_thread_block:
+        logger.debug("Blocking random transformation in gameboard thread %s - GM controlled only", message.channel.id)
         return None
 
     logger.info(
@@ -6182,8 +6248,27 @@ async def prefix_removeplayer_command(ctx: commands.Context, member: Optional[di
 @guard_prefix_command_channel
 async def prefix_assign_command(ctx: commands.Context, member: Optional[discord.Member] = None, *, character_name: str = "") -> None:
     """Assign a character to a player (GM only)."""
-    if GAME_BOARD_MANAGER:
+    # Check if this is a game thread first
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
         await GAME_BOARD_MANAGER.command_assign(ctx, member=member, character_name=character_name)
+        return
+    
+    # If not in game thread, this might be a VN bot command - let it fall through
+    # (or we could add a message here)
+    if GAME_BOARD_MANAGER:
+        # Try anyway in case it's a game thread that wasn't detected
+        await GAME_BOARD_MANAGER.command_assign(ctx, member=member, character_name=character_name)
+
+
+@bot.command(name="transfergm")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_transfergm_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+    """Transfer GM role to another user (current GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_transfergm(ctx, member=member)
+
+
 
 
 @bot.command(name="swap")
@@ -7032,7 +7117,34 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
         return
 
     target_token, text = args.split(None, 1)
-    target_state = _find_state_by_token(ctx.guild, target_token)
+    
+    # CRITICAL: Check gameboard states FIRST if in a game thread
+    target_state = None
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread):
+        game_state = GAME_BOARD_MANAGER.get_game_state_for_thread(ctx.channel)
+        if game_state:
+            # Check gameboard player states first
+            user_id = _extract_user_id_from_token(target_token)
+            if user_id is not None:
+                target_state = game_state.player_states.get(user_id)
+            if target_state is None:
+                # Try matching by character name or folder
+                token_variants = _token_variants(target_token)
+                for player_id, state in game_state.player_states.items():
+                    if state.guild_id != ctx.guild.id:
+                        continue
+                    if _name_matches_token(state.character_name, target_token):
+                        target_state = state
+                        break
+                    character_entry = CHARACTER_BY_NAME.get(state.character_name.strip().lower())
+                    if character_entry and _character_matches_token(character_entry, target_token):
+                        target_state = state
+                        break
+    
+    # If not found in gameboard, check global states
+    if target_state is None:
+        target_state = _find_state_by_token(ctx.guild, target_token)
+    
     if target_state is None:
         character = _find_character_by_token(target_token)
         if character is None:
