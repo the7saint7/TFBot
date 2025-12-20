@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 from typing import Dict, Optional, Tuple, List
+import logging
 
 import sys
 from pathlib import Path
@@ -23,6 +24,8 @@ if str(_tfbot_root) not in sys.path:
 
 from tfbot.game_models import GameConfig, GamePlayer, GameState
 from tfbot.game_board import parse_alphanumeric_coordinate
+
+logger = logging.getLogger("tfbot.games.snakes_ladders")
 
 
 # Game-specific data stored in game state
@@ -46,11 +49,10 @@ def tile_number_to_alphanumeric(tile_num: int, game_config: GameConfig) -> Optio
     """
     Convert tile number (1-100) to alphanumeric coordinate (A1-J10).
     
-    Snakes & Ladders numbering:
-    - Row 1 (bottom): 1-10 (A1-J1, left to right)
-    - Row 2: 11-20 (J2-A2, right to left)
-    - Row 3: 21-30 (A3-J3, left to right)
-    - Alternates direction each row
+    Uses classic Snakes & Ladders zig-zag numbering:
+    - Row 1 (bottom) runs left-to-right (A-J)
+    - Row 2 runs right-to-left (J-A)
+    - Alternates every row.
     """
     if tile_num < 1:
         return None
@@ -66,32 +68,31 @@ def tile_number_to_alphanumeric(tile_num: int, game_config: GameConfig) -> Optio
     # Calculate row (1-indexed, from bottom)
     row = ((tile_num - 1) // cols) + 1
     
-    # Calculate column position within row
+    # Zig-zag column calculation
     position_in_row = ((tile_num - 1) % cols) + 1
-    
-    # Odd rows (1, 3, 5, ...) go left to right (A, B, C, ...)
-    # Even rows (2, 4, 6, ...) go right to left (J, I, H, ...)
     if row % 2 == 1:
-        # Left to right: A=1, B=2, ...
-        col_letter = chr(ord('A') + position_in_row - 1)
+        column = position_in_row
     else:
-        # Right to left: J=1, I=2, ...
-        col_letter = chr(ord('A') + cols - position_in_row)
+        column = cols - position_in_row + 1
+    col_letter = chr(ord('A') + column - 1)
     
     result = f"{col_letter}{row}"
     
-    # Debug logging for key tiles
-    if tile_num in [1, 10, 11, 20, 51, 60, 100]:
-        import logging
-        logger = logging.getLogger("tfbot.games.snakes_ladders")
-        logger.info("TILE_TO_COORD DEBUG: tile %d -> row=%d, pos_in_row=%d, col_letter=%s -> %s", 
-                   tile_num, row, position_in_row, col_letter, result)
+    logger.debug(
+        "tile_number_to_alphanumeric: tile=%s rows=%s cols=%s -> row=%s column=%s (%s)",
+        tile_num,
+        rows,
+        cols,
+        row,
+        column,
+        result,
+    )
     
     return result
 
 
 def alphanumeric_to_tile_number(coord: str, game_config: GameConfig) -> Optional[int]:
-    """Convert alphanumeric coordinate (A1-J10) to tile number (1-100)."""
+    """Convert alphanumeric coordinate (A1-J10) to tile number (1-100) using zig-zag layout."""
     parsed = parse_alphanumeric_coordinate(coord)
     if not parsed:
         return None
@@ -101,17 +102,21 @@ def alphanumeric_to_tile_number(coord: str, game_config: GameConfig) -> Optional
     grid_config = game_config.grid
     cols = int(grid_config.get("cols", 10))
     
-    # Calculate position within row
+    # Determine position within row based on zig-zag direction
     if row_index_1 % 2 == 1:
-        # Odd rows: left to right
         position_in_row = column_index_1
     else:
-        # Even rows: right to left
         position_in_row = cols - column_index_1 + 1
     
-    # Calculate tile number
     tile_num = ((row_index_1 - 1) * cols) + position_in_row
     
+    logger.debug(
+        "alphanumeric_to_tile_number: coord=%s -> row=%s column=%s (tile=%s)",
+        coord,
+        row_index_1,
+        column_index_1,
+        ((row_index_1 - 1) * cols) + position_in_row,
+    )
     return tile_num
 
 
@@ -188,13 +193,21 @@ def on_dice_rolled(
     
     # Get current tile
     current_tile = data['tile_numbers'].get(player.user_id, 1)
+    logger.debug(
+        "on_dice_rolled: player=%s current_tile=%s dice_result=%s",
+        player.user_id,
+        current_tile,
+        dice_result,
+    )
     new_tile = current_tile + dice_result
+    logger.debug("on_dice_rolled: tentative new_tile=%s", new_tile)
     
     # Check win condition
     rules = game_config.rules or {}
     win_tile = int(rules.get("win_tile", 100))
     if new_tile >= win_tile:
         new_tile = win_tile
+        logger.debug("on_dice_rolled: capped to win_tile=%s", new_tile)
     
     # Move player
     data['tile_numbers'][player.user_id] = new_tile
@@ -203,6 +216,11 @@ def on_dice_rolled(
     new_pos = tile_number_to_alphanumeric(new_tile, game_config)
     if new_pos:
         player.grid_position = new_pos
+    logger.debug(
+        "on_dice_rolled: updated grid position -> tile=%s coord=%s",
+        new_tile,
+        new_pos,
+    )
     
     # Check for snakes and ladders
     # Convert string keys to ints for comparison
@@ -222,6 +240,12 @@ def on_dice_rolled(
         new_pos = tile_number_to_alphanumeric(tail_tile, game_config)
         if new_pos:
             player.grid_position = new_pos
+        logger.debug(
+            "on_dice_rolled: snake encountered head=%s tail=%s coord=%s",
+            new_tile,
+            tail_tile,
+            new_pos,
+        )
         message_parts.append(f"🐍 Snake! Slid down to tile {tail_tile}")
     
     # Check ladder
@@ -232,6 +256,12 @@ def on_dice_rolled(
         new_pos = tile_number_to_alphanumeric(top_tile, game_config)
         if new_pos:
             player.grid_position = new_pos
+        logger.debug(
+            "on_dice_rolled: ladder encountered base=%s top=%s coord=%s",
+            new_tile,
+            top_tile,
+            new_pos,
+        )
         message_parts.append(f"🪜 Ladder! Climbed up to tile {top_tile}")
     
     # Apply tile transformation (tiles 2-99) - AFTER snake/ladder movement
@@ -244,6 +274,12 @@ def on_dice_rolled(
             transformation_char = new_char
             # Update player's character name
             player.character_name = new_char
+        logger.debug(
+            "on_dice_rolled: transformation check tile=%s message=%s new_char=%s",
+            final_tile,
+            transform_msg,
+            transformation_char,
+        )
     
     # Mark player as having rolled this turn
     if player.user_id not in data['players_rolled_this_turn']:
@@ -253,6 +289,14 @@ def on_dice_rolled(
     is_turn_complete = False
     if data['turn_order']:
         is_turn_complete = len(data['players_rolled_this_turn']) >= len(data['turn_order'])
+    logger.debug(
+        "on_dice_rolled: final_tile=%s coord=%s turn_complete=%s rolled=%s/%s",
+        final_tile,
+        player.grid_position,
+        is_turn_complete,
+        len(data['players_rolled_this_turn']),
+        len(data['turn_order']) if data['turn_order'] else 0,
+    )
     
     # Check win condition
     win_msg = check_win_condition(game_state, game_config)

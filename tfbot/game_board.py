@@ -204,69 +204,12 @@ def alphanumeric_to_pixel(
         logger.warning("Row index %d out of bounds (1-%d) for coord %s", row_index_1, rows, coord)
         return None
     
-    # Convert to 0-indexed for pixel calculation
-    column_index_0 = column_index_1 - 1
-    row_index_0 = row_index_1 - 1
+    # Calculate pixel positions with straight-through columns (A=leftmost) and rows counted
+    # from bottom while the image rows count from the top.
+    image_col = column_index_1 - 1
+    image_row = rows - row_index_1
     
-    # Calculate pixel position
-    # CRITICAL: The board image uses a simple left-to-right layout for ALL rows,
-    # but the game logic uses alternating row directions (snakes & ladders style).
-    #
-    # Board image layout (from create_board.py):
-    # - Image row 0 (top) = Game row 10 (top) = tiles 91-100 (left to right: 91, 92, ..., 100)
-    # - Image row 9 (bottom) = Game row 1 (bottom) = tiles 1-10 (left to right: 1, 2, ..., 10)
-    # - All image rows go left-to-right: image col 0 = A, image col 9 = J
-    # - Tile number formula: tile_num = (rows - image_row - 1) * cols + image_col + 1
-    #
-    # Game coordinate system (alternating rows):
-    # - Row 1 (bottom): A1-J1 (left to right) = tiles 1-10
-    # - Row 2: J2-A2 (right to left) = tiles 11-20
-    # - Row 3: A3-J3 (left to right) = tiles 21-30
-    # - etc.
-    #
-    # Solution: Convert game coordinate to tile number using game logic,
-    # then find where that tile is on the board image (which uses simple left-to-right)
-    
-    # Step 1: Convert game coordinate to tile number using game logic
-    # Game logic: Odd rows go left-to-right, even rows go right-to-left
-    if row_index_1 % 2 == 1:
-        # Odd row: left to right (A=1, B=2, ..., J=10)
-        position_in_row = column_index_1
-    else:
-        # Even row: right to left (J=1, I=2, ..., A=10)
-        position_in_row = cols - column_index_1 + 1
-    
-    tile_num = ((row_index_1 - 1) * cols) + position_in_row
-    
-    # Step 2: Find where this tile number is on the board image
-    # The actual board image has tiles arranged in a 10x10 grid.
-    # Based on the board image, tiles are arranged:
-    # - Bottom row: 1-10 (left to right)
-    # - Next row up: 11-20 (left to right) 
-    # - etc.
-    # But the game logic uses alternating directions, so we need to find
-    # where the tile number actually appears on the image.
-    #
-    # The board image formula from create_board.py:
-    # tile_num = (rows - image_row - 1) * cols + image_col + 1
-    # Where image_row is 0-indexed from top, image_col is 0-indexed from left
-    #
-    # Solving for image coordinates:
-    # tile_row_from_bottom = (tile_num - 1) // cols  # Which row from bottom (0-indexed)
-    # image_row = rows - 1 - tile_row_from_bottom    # Row from top (0-indexed)
-    # image_col = (tile_num - 1) % cols              # Column from left (0-indexed)
-    
-    # The board image uses simple left-to-right for ALL rows (from create_board.py).
-    # We need to find where tile_num actually appears on the image.
-    # Board image formula: tile_num = (rows - image_row - 1) * cols + image_col + 1
-    # Solving: image_row = rows - 1 - ((tile_num - 1) // cols)
-    #         image_col = (tile_num - 1) % cols
-    
-    tile_row_from_bottom = (tile_num - 1) // cols  # 0-indexed from bottom
-    image_row = rows - 1 - tile_row_from_bottom    # 0-indexed from top
-    image_col = (tile_num - 1) % cols               # 0-indexed from left
-    
-    # Step 3: Calculate pixel position from image coordinates
+    # Calculate pixel position from image coordinates
     # Image coordinates: row 0 = top, row 9 = bottom; col 0 = left, col 9 = right
     pixel_x = start_x + (image_col * tile_width) + (tile_width // 2)
     pixel_y = start_y + (image_row * tile_height) + (tile_height // 2)
@@ -377,9 +320,10 @@ def render_game_board(
                 rect_right = pixel_x + half_width
                 rect_bottom = pixel_y + half_height
                 
-                # Draw red outline (2px width)
+                # Draw white background with red outline (makes debug text legible)
                 draw.rectangle(
                     [rect_left, rect_top, rect_right, rect_bottom],
+                    fill=(255, 255, 255, 255),
                     outline=(255, 0, 0),  # Red
                     width=2
                 )
