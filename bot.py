@@ -1305,6 +1305,19 @@ def _build_character_pool(
                 from tf_characters import BOT_NAME
                 message_text = message_text.replace("{BOT_NAME}", BOT_NAME)
             
+            # Fix common encoding issues (Windows-1252 to UTF-8)
+            # Replace common Windows-1252 encoded characters with correct UTF-8 equivalents
+            encoding_fixes = {
+                'â€™': "'",  # Right single quotation mark
+                'â€œ': '"',  # Left double quotation mark
+                'â€': '"',   # Right double quotation mark
+                'â€"': '—',  # Em dash
+                'â€"': '–',  # En dash
+                'â€¦': '…',  # Horizontal ellipsis
+            }
+            for wrong, correct in encoding_fixes.items():
+                message_text = message_text.replace(wrong, correct)
+            
             pool.append(
                 TFCharacter(
                     name=entry["name"],
@@ -1365,7 +1378,7 @@ class TFBot(commands.Bot):
         await setup_bot_extensions()
 
 
-bot = TFBot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents)
+bot = TFBot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents, case_insensitive=True)
 ROLEPLAY_COG: Optional[RoleplayCog] = None
 GAME_BOARD_MANAGER: Optional["GameBoardManager"] = None
 _SYNCED_APP_COMMAND_GUILDS: set[int] = set()
@@ -1854,8 +1867,6 @@ async def relay_transformed_message(
     payload: dict = {}
 
     if MESSAGE_STYLE == "vn" and not state.is_inanimate:
-        if formatted_segments is None:
-            formatted_segments = parse_discord_formatting(cleaned_content)
         custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments)
         if reply_context:
             logger.debug(
@@ -5987,7 +5998,7 @@ async def slash_undopillow_command(
         await interaction.followup.send("No pillow modifier was removed.", ephemeral=True)
 
 
-@bot.command(name="tf", aliases=["TF"])
+@bot.command(name="tf")
 @guard_prefix_command_channel
 async def prefix_tf_35(ctx: commands.Context):
     """3.5 version of tf stats command."""
@@ -6227,6 +6238,15 @@ async def prefix_endgame_command(ctx: commands.Context) -> None:
     """End the current game (GM only)."""
     if GAME_BOARD_MANAGER:
         await GAME_BOARD_MANAGER.command_endgame(ctx)
+
+
+@bot.command(name="start")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_start_command(ctx: commands.Context) -> None:
+    """Start the game - render board and allow dice rolls (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_start(ctx)
 
 
 @bot.command(name="listgames")
@@ -6681,10 +6701,59 @@ async def prefix_movetoken_command(ctx: commands.Context, member: Optional[disco
 @bot.command(name="dice")
 @commands.guild_only()
 @guard_prefix_command_channel
-async def prefix_dice_command(ctx: commands.Context) -> None:
-    """Roll dice (player command)."""
-    if GAME_BOARD_MANAGER:
-        await GAME_BOARD_MANAGER.command_dice(ctx)
+async def prefix_dice_command(ctx: commands.Context, *, args: str = "") -> None:
+    """Roll dice (player command). GM can use: !dice @player or !dice character_name"""
+    if not GAME_BOARD_MANAGER:
+        return
+    
+    # Check if this is a game thread
+    if isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        target_player = None
+        
+        # Parse arguments if provided (for GM override)
+        if args.strip():
+            # Try to parse as member mention first
+            import re
+            mention_match = re.search(r'<@!?(\d+)>', args)
+            if mention_match:
+                member_id = int(mention_match.group(1))
+                if ctx.guild:
+                    target_player = ctx.guild.get_member(member_id)
+            else:
+                # Try to find by character name or player name
+                args_lower = args.strip().lower()
+                game_state = await GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
+                if game_state and ctx.guild:
+                    # Search by character name first (exact match)
+                    for user_id, player in game_state.players.items():
+                        if player.character_name and player.character_name.lower() == args_lower:
+                            target_player = ctx.guild.get_member(user_id)
+                            break
+                    
+                    # If not found, try partial character name match
+                    if not target_player:
+                        for user_id, player in game_state.players.items():
+                            if player.character_name and args_lower in player.character_name.lower():
+                                target_player = ctx.guild.get_member(user_id)
+                                break
+                    
+                    # If not found by character, try by display name (exact)
+                    if not target_player:
+                        for user_id, player in game_state.players.items():
+                            member = ctx.guild.get_member(user_id)
+                            if member and member.display_name.lower() == args_lower:
+                                target_player = member
+                                break
+                    
+                    # If not found, try partial display name match
+                    if not target_player:
+                        for user_id, player in game_state.players.items():
+                            member = ctx.guild.get_member(user_id)
+                            if member and args_lower in member.display_name.lower():
+                                target_player = member
+                                break
+        
+        await GAME_BOARD_MANAGER.command_dice(ctx, target_player=target_player)
 
 
 @bot.command(name="roll")
@@ -6705,13 +6774,8 @@ async def prefix_roll_command(ctx: commands.Context, *, args: str = "") -> None:
             await GACHA_MANAGER.command_roll(ctx, roll_type, extra)
             return
 
-    if (
-        GAME_BOARD_MANAGER
-        and isinstance(ctx.channel, discord.Thread)
-        and GAME_BOARD_MANAGER.is_game_thread(ctx.channel)
-    ):
-        await GAME_BOARD_MANAGER.command_dice(ctx)
-        return
+    # !roll is only for gacha, not for game board
+    # Game board uses !dice only
 
     await ctx.reply(
         "Rolls are only supported in the gacha channel or inside active game threads.",

@@ -469,6 +469,13 @@ def render_game_board(
             token_x, token_y = token_positions[idx]
             color = colors[player.user_id % len(colors)]
             
+            # Get player number from turn_order (if available)
+            player_number = None
+            if hasattr(game_state, '_pack_data') and game_state._pack_data:
+                turn_order = game_state._pack_data.get('turn_order', [])
+                if player.user_id in turn_order:
+                    player_number = turn_order.index(player.user_id) + 1  # 1-indexed (P1, P2, etc.)
+            
             # Try to load face image from face sync cache
             face_path = None
             if player.character_name:
@@ -524,6 +531,56 @@ def render_game_board(
                             int(face_y + token_size + border_width),
                         )
                         draw.ellipse(border_bbox, outline=color, width=border_width)
+                        
+                        # Draw player number label (P1, P2, etc.) on token
+                        if player_number is not None:
+                            try:
+                                from PIL import ImageFont
+                                # Try to load a font for the label
+                                try:
+                                    label_font = ImageFont.truetype("arial.ttf", max(10, token_size // 6)) if ImageFont else None
+                                except (OSError, IOError):
+                                    try:
+                                        label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(10, token_size // 6)) if ImageFont else None
+                                    except (OSError, IOError):
+                                        label_font = ImageFont.load_default() if ImageFont else None
+                                
+                                label_text = f"P{player_number}"
+                                # Position label at bottom-right of token
+                                label_x = int(face_x + token_size - token_size // 3)
+                                label_y = int(face_y + token_size - token_size // 3)
+                                
+                                # Draw white background for label
+                                if label_font:
+                                    try:
+                                        bbox = draw.textbbox((0, 0), label_text, font=label_font)
+                                        text_width = bbox[2] - bbox[0]
+                                        text_height = bbox[3] - bbox[1]
+                                    except AttributeError:
+                                        text_width, text_height = draw.textsize(label_text, font=label_font)
+                                else:
+                                    text_width = len(label_text) * 6
+                                    text_height = 10
+                                
+                                # Draw background rectangle
+                                bg_padding = 2
+                                draw.rectangle(
+                                    [label_x - bg_padding, label_y - bg_padding, 
+                                     label_x + text_width + bg_padding, label_y + text_height + bg_padding],
+                                    fill=(255, 255, 255, 200),  # Semi-transparent white
+                                    outline=(0, 0, 0),  # Black outline
+                                    width=1
+                                )
+                                
+                                # Draw label text
+                                draw.text(
+                                    (label_x, label_y),
+                                    label_text,
+                                    fill=(0, 0, 0),  # Black text
+                                    font=label_font
+                                )
+                            except Exception as exc:
+                                logger.warning("Failed to draw player number label: %s", exc)
                 except Exception as exc:
                     logger.warning("Failed to load face token for %s: %s", player.character_name, exc)
                     # Fall through to colored circle
@@ -539,6 +596,51 @@ def render_game_board(
                     int(token_y + radius),
                 )
                 draw.ellipse(bbox, fill=color, outline=(0, 0, 0), width=2)
+                
+                # Draw player number label on colored circle token too
+                if player_number is not None:
+                    try:
+                        from PIL import ImageFont
+                        try:
+                            label_font = ImageFont.truetype("arial.ttf", max(10, radius)) if ImageFont else None
+                        except (OSError, IOError):
+                            try:
+                                label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(10, radius)) if ImageFont else None
+                            except (OSError, IOError):
+                                label_font = ImageFont.load_default() if ImageFont else None
+                        
+                        label_text = f"P{player_number}"
+                        label_x = int(token_x + radius - radius // 2)
+                        label_y = int(token_y + radius - radius // 2)
+                        
+                        if label_font:
+                            try:
+                                bbox = draw.textbbox((0, 0), label_text, font=label_font)
+                                text_width = bbox[2] - bbox[0]
+                                text_height = bbox[3] - bbox[1]
+                            except AttributeError:
+                                text_width, text_height = draw.textsize(label_text, font=label_font)
+                        else:
+                            text_width = len(label_text) * 6
+                            text_height = 10
+                        
+                        bg_padding = 2
+                        draw.rectangle(
+                            [label_x - bg_padding, label_y - bg_padding,
+                             label_x + text_width + bg_padding, label_y + text_height + bg_padding],
+                            fill=(255, 255, 255, 200),
+                            outline=(0, 0, 0),
+                            width=1
+                        )
+                        
+                        draw.text(
+                            (label_x, label_y),
+                            label_text,
+                            fill=(0, 0, 0),
+                            font=label_font
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to draw player number label on circle: %s", exc)
     
     # Convert to bytes
     img_bytes = io.BytesIO()

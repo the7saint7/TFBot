@@ -1,6 +1,6 @@
 {
   "name": "Snakes and Ladders",
-  "board_image": "snakes_ladders_board.png",
+  "board_image": "snakes_ladders_board.webp",
   "grid": {
     "rows": 10,
     "cols": 10,

@@ -454,7 +454,15 @@ def _run_face_git_batch_for_repo(
 
 VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
 _VN_LAYOUT_FILE_SETTING = os.getenv("TFBOT_VN_LAYOUTS", "vn_layouts.json").strip()
-VN_LAYOUT_FILE = Path(_VN_LAYOUT_FILE_SETTING) if _VN_LAYOUT_FILE_SETTING else None
+if _VN_LAYOUT_FILE_SETTING:
+    layout_path = Path(_VN_LAYOUT_FILE_SETTING)
+    # Resolve relative to BASE_DIR if not absolute
+    if not layout_path.is_absolute():
+        VN_LAYOUT_FILE = (BASE_DIR / layout_path).resolve()
+    else:
+        VN_LAYOUT_FILE = layout_path.resolve()
+else:
+    VN_LAYOUT_FILE = None
 
 SPRITE_IMAGE_SUFFIXES: Tuple[str, ...] = (".png", ".webp")
 

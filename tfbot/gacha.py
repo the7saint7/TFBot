@@ -26,9 +26,6 @@ from tfbot.utils import float_from_env, int_from_env, is_admin, path_from_env, u
 
 logger = logging.getLogger("tfbot.gacha")
 
-# put this near the top of gacha.py (after the existing logger)
-logger = logging.getLogger("tfbot.gacha")
-
 # 👇 add this helper
 _roll_logger = logging.getLogger("tfbot.gacha.rolls")
 if not _roll_logger.handlers:
@@ -994,7 +991,7 @@ class GachaManager:
         profile = await self._fetch_profile(message.guild.id, message.author.id)
         if not profile.starter_granted:
             await self._grant_starter_pack(message, profile)
-            profile = await self._fetch_profile(message.guild.id, message.author.id)
+            # Profile is updated in-place by _grant_starter_pack, no need to refetch
 
         if not await self.enforce_spam_policy(message, profile=profile):
             return False
@@ -1628,7 +1625,8 @@ class GachaManager:
                 starter_outfit.rarity,
             )
         await self._update_profile(new_profile)
-        profile = await self._fetch_profile(message.guild.id, message.author.id)
+        # Profile is updated in-place by _grant_starter_pack (new_profile = profile creates a reference)
+        # No need to refetch - the profile parameter already has all updates
 
         rarity_title = (starter_character.rarity or "common").title()
         announcement_lines = [

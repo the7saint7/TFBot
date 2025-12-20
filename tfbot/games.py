@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import random
-import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional
 
 import discord
 from discord.ext import commands
@@ -86,6 +86,11 @@ class GameBoardManager:
         # Use environment variable if available, otherwise use config file
         env_forum_id = int_from_env("TFBOT_GAME_FORUM_CHANNEL_ID", 0)
         self.forum_channel_id = env_forum_id if env_forum_id > 0 else int(self._config.get("forum_channel_id", 0))
+        env_map_forum_id = int_from_env("TFBOT_GAME_MAP_FORUM_CHANNEL_ID", 0)
+        self.map_forum_channel_id = env_map_forum_id if env_map_forum_id > 0 else int(self._config.get("map_forum_channel_id", 0))
+        # If map forum not configured, fall back to game forum (backwards compatibility)
+        if self.map_forum_channel_id == 0:
+            self.map_forum_channel_id = self.forum_channel_id
         env_dm_id = int_from_env("TFBOT_GAME_DM_CHANNEL_ID", 0)
         self.dm_channel_id = env_dm_id if env_dm_id > 0 else int(self._config.get("dm_channel_id", 0))
         
@@ -96,9 +101,28 @@ class GameBoardManager:
         # Packs directory for game-specific logic
         self.packs_dir = self.config_path.parent / "packs"
         
+        # Check if any packs exist - if not, disable gameboard functionality
+        self._has_packs = False
+        if self.packs_dir.exists():
+            pack_files = list(self.packs_dir.glob("*.py"))
+            self._has_packs = len(pack_files) > 0
+            if not self._has_packs:
+                logger.warning("GameBoardManager: No game packs found in %s - gameboard will be disabled", self.packs_dir)
+            else:
+                logger.info("GameBoardManager: Found %d game pack(s) in %s", len(pack_files), self.packs_dir)
+        else:
+            logger.warning("GameBoardManager: Packs directory %s does not exist - gameboard will be disabled", self.packs_dir)
+        
+        # If no packs found, clear game configs (fallback redundancy)
+        if not self._has_packs:
+            logger.warning("GameBoardManager: No game packs available - clearing game configs and disabling gameboard")
+            self._game_configs = {}
+        
         # Active game state (one game per thread)
         self._active_games: Dict[int, GameState] = {}  # thread_id -> GameState
         self._lock = asyncio.Lock()
+        self._command_locks: Dict[int, asyncio.Lock] = {}  # Per-game command locks (thread_id -> Lock)
+        self._message_queues: Dict[int, List[Dict]] = {}  # Per-game message queues (thread_id -> List[message_data])
         
         # States directory
         self.states_dir = self.config_path.parent / "states"
@@ -107,11 +131,19 @@ class GameBoardManager:
         # Load any active games from disk
         self._load_active_games()
         
-        logger.info(
-            "GameBoardManager initialized: forum_channel_id=%s, detected %d games",
-            self.forum_channel_id,
-            len(self._game_configs),
-        )
+        if self._has_packs:
+            logger.info(
+                "GameBoardManager initialized: forum_channel_id=%s, map_forum_channel_id=%s, detected %d games",
+                self.forum_channel_id,
+                self.map_forum_channel_id,
+                len(self._game_configs),
+            )
+        else:
+            logger.warning(
+                "GameBoardManager initialized (DISABLED - no packs): forum_channel_id=%s, map_forum_channel_id=%s, games=0",
+                self.forum_channel_id,
+                self.map_forum_channel_id,
+            )
 
     def _load_main_config(self) -> Dict[str, object]:
         """Load the main game_config.json file."""
@@ -166,6 +198,8 @@ class GameBoardManager:
                     is_locked=bool(data.get("is_locked", False)),
                     narrator_user_id=data.get("narrator_user_id"),
                     debug_mode=bool(data.get("debug_mode", False)),
+                    turn_count=int(data.get("turn_count", 0)),
+                    game_started=bool(data.get("game_started", False)),  # Default to False for old saves
                 )
                 
                 # Recreate player_states for players with assigned characters (like RP mode)
@@ -191,6 +225,10 @@ class GameBoardManager:
 
     def is_game_thread(self, channel: Optional[discord.abc.GuildChannel]) -> bool:
         """Check if a channel is a game thread (active or by name pattern)."""
+        # If no packs available, gameboard is disabled - no threads are game threads
+        if not self._has_packs:
+            return False
+        
         if not isinstance(channel, discord.Thread):
             return False
         
@@ -272,6 +310,7 @@ class GameBoardManager:
                     is_locked=bool(data.get("is_locked", False)),
                     narrator_user_id=narrator_user_id,
                     debug_mode=bool(data.get("debug_mode", False)),
+                    game_started=bool(data.get("game_started", False)),  # Default to False for old saves
                     player_states={},  # Will be recreated below
                     )
                     
@@ -336,10 +375,11 @@ class GameBoardManager:
             game_type=matched_game_type,
             narrator_user_id=gm_user_id,  # GM becomes narrator by default
             debug_mode=False,  # Default to off
+            game_started=False,  # Game starts as not ready - GM must use !start to begin
         )
         
         self._active_games[thread.id] = game_state
-        await self._save_game_state(game_state)
+        # Note: Auto-save removed - use !savegame to save manually
         logger.info("Created new game state for existing thread: thread_id=%s, game_type=%s, gm=%s", thread.id, matched_game_type, gm_user_id)
         return game_state
 
@@ -506,8 +546,18 @@ class GameBoardManager:
         
         return backgrounds[0] if backgrounds else None
 
-    async def handle_message(self, message: discord.Message, *, command_invoked: bool) -> bool:
-        """Handle a message in a game thread. Returns True if handled."""
+    async def handle_message(self, message: discord.Message, *, command_invoked: bool, is_queued: bool = False) -> bool:
+        """Handle a message in a game thread. Returns True if handled.
+        
+        Args:
+            message: The message to handle
+            command_invoked: Whether this message invoked a command
+            is_queued: Whether this is a queued message being reprocessed (skip lock check)
+        """
+        # If no packs available, gameboard is disabled - don't handle messages
+        if not self._has_packs:
+            return False
+        
         if message.author.bot or command_invoked:
             return False
         
@@ -551,6 +601,57 @@ class GameBoardManager:
         if game_state.is_locked:
             return False
         
+        # CRITICAL: Check if a command is currently processing (lock is held)
+        # If so, delete message immediately and queue it for processing after command completes
+        # This applies to ALL messages (including GM/admin) to ensure proper ordering
+        # EXCEPTION: Skip this check if this is a queued message being reprocessed
+        if not is_queued:
+            command_lock = self._get_command_lock(thread_id)
+            if command_lock.locked():
+                # Command is processing - extract message data BEFORE deleting
+                logger.debug("Command processing - deleting and queuing message from %s (GM/admin messages also queued)", message.author.id)
+                
+                # Download attachments before deleting message (attachments become inaccessible after deletion)
+                attachment_data = []
+                if message.attachments:
+                    for attachment in message.attachments:
+                        try:
+                            attachment_bytes = await attachment.read()
+                            attachment_data.append({
+                                'filename': attachment.filename,
+                                'bytes': attachment_bytes,
+                                'content_type': attachment.content_type,
+                            })
+                            logger.debug("Downloaded attachment %s (%d bytes) for queuing", attachment.filename, len(attachment_bytes))
+                        except Exception as exc:
+                            logger.warning("Failed to download attachment %s for queuing: %s", attachment.filename, exc)
+                
+                # Extract all necessary message data before deletion
+                message_data = {
+                    'content': message.content,
+                    'author': message.author,
+                    'channel': message.channel,
+                    'guild': message.guild,
+                    'reference': message.reference,
+                    'attachments': attachment_data,  # Store downloaded attachment data
+                    'id': message.id,
+                }
+                
+                # Delete message immediately
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass  # Message might already be deleted
+                
+                # Queue message data for processing after command completes
+                # CRITICAL: Queue ALL messages (including GM/admin) to ensure proper ordering
+                if thread_id not in self._message_queues:
+                    self._message_queues[thread_id] = []
+                self._message_queues[thread_id].append(message_data)
+                logger.debug("Queued message from %s (queue size: %d, attachments: %d)", 
+                            message.author.id, len(self._message_queues[thread_id]), len(attachment_data))
+                return True
+        
         # Check if author is GM or admin
         is_gm = self._is_gm(message.author, game_state)
         is_admin_user = is_admin(message.author)
@@ -558,9 +659,16 @@ class GameBoardManager:
         
         # GM and admins can always send messages (commands or narrator) - never block them
         if is_gm or is_admin_user:
-            # If GM is narrator and not a player, handle as narrator
+            # Check if GM/admin is a player with a character assigned
             player = game_state.players.get(message.author.id)
-            if is_narrator and not (player and player.character_name):
+            has_character = player and player.character_name
+            
+            # If GM/admin is a player with a character, they should get VN panel rendering like regular players
+            if has_character:
+                # Fall through to VN panel rendering below (don't return False)
+                pass
+            elif is_narrator and not has_character:
+                # GM is narrator and not a player - handle as narrator
                 # Check if message looks like a command - if so, let it through
                 # CRITICAL: If command doesn't exist, we still return False to let command handler process it
                 # But we need to prevent it from falling through to VN mode
@@ -571,19 +679,23 @@ class GameBoardManager:
                 # Otherwise handle as narrator message
                 await self._handle_narrator_message(message, game_state)
                 return True
-            # GM/admin but not narrator or has character - let through (for commands)
-            return False
-        
-        # Check if player is in the game and has a character assigned
-        player = game_state.players.get(message.author.id)
-        has_character = player and player.character_name
+            else:
+                # GM/admin but not a player and not narrator - let through (for commands only)
+                return False
+        else:
+            # Not GM/admin - check if player is in the game and has a character assigned
+            player = game_state.players.get(message.author.id)
+            has_character = player and player.character_name
         
         # Block messages from non-GM, non-admin players without assigned character
+        # This includes players not in the game (player is None) or players without character assigned
         if not has_character:
+            logger.debug("Deleting message from unassigned player %s (player=%s, has_character=%s)", 
+                        message.author.id, player is not None, has_character)
             try:
                 await message.delete()
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc:
+                logger.warning("Failed to delete message from unassigned player %s: %s", message.author.id, exc)
             return True
         
         # Player has character - proceed with normal VN panel rendering
@@ -611,6 +723,9 @@ class GameBoardManager:
         if state.character_name != player.character_name:
             logger.warning("State character_name mismatch for player %s! State has '%s', player has '%s'. Recreating state.",
                         message.author.id, state.character_name, player.character_name)
+            # CRITICAL: Delete the old state first to ensure clean recreation
+            if message.author.id in game_state.player_states:
+                del game_state.player_states[message.author.id]
             # Recreate state with correct character name
             state = await self._create_game_state_for_player(
                 player,
@@ -620,10 +735,10 @@ class GameBoardManager:
             )
             if state:
                 game_state.player_states[message.author.id] = state
-                logger.info("Recreated game state for player %s with correct character '%s'", 
-                           message.author.id, state.character_name)
+                logger.info("Recreated game state for player %s with correct character '%s' (was '%s')", 
+                           message.author.id, state.character_name, player.character_name)
             else:
-                logger.error("Failed to recreate state for player %s", message.author.id)
+                logger.error("Failed to recreate state for player %s with character '%s'", message.author.id, player.character_name)
                 return True
         
         # Verify state is from game, not global (safety check)
@@ -646,17 +761,23 @@ class GameBoardManager:
             MESSAGE_STYLE = getattr(bot_module, 'MESSAGE_STYLE', 'classic') if bot_module else 'classic'
             
             # Clean message content
-            cleaned_content = message.content.strip()
+            cleaned_content = message.content.strip() if message.content else ""
             cleaned_content, _ = strip_urls(cleaned_content)
             cleaned_content = cleaned_content.strip()
             
-            if not cleaned_content:
-                # No content after filtering - ignore
+            # Check if message has attachments (images) - these should be allowed even without text
+            has_attachments = message.attachments and len(message.attachments) > 0
+            
+            if not cleaned_content and not has_attachments:
+                # No content and no attachments - ignore
                 return True
             
+            # Use cleaned_content for display (or placeholder if only attachments)
+            display_content = cleaned_content if cleaned_content else ("(image)" if has_attachments else "")
+            
             # Parse formatting
-            formatted_segments = parse_discord_formatting(cleaned_content)
-            custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments)
+            formatted_segments = parse_discord_formatting(display_content) if display_content else []
+            custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments) if formatted_segments else {}
             
             # Get reply context if message is a reply
             reply_context = None
@@ -670,6 +791,9 @@ class GameBoardManager:
             
             # Get background path from game player (completely isolated from global state)
             background_path = self._get_game_background_path(player.background_id)
+            
+            # Get character display name (used for logging and display)
+            character_display_name = player.character_name  # Use player's character name (source of truth)
             
             # Render VN panel (only if VN style is enabled)
             files = []
@@ -694,18 +818,31 @@ class GameBoardManager:
                     # Render with game-specific character (use game-assigned character, not VN mode)
                     # CRITICAL: Always use player.character_name (the source of truth) not state.character_name
                     # The state might be stale or incorrect, but player.character_name is always correct
-                    character_display_name = player.character_name  # Use player's character name (source of truth)
+                    # character_display_name is already defined above
                     
                     # CRITICAL: If state.character_name doesn't match, fix the state immediately
                     if state.character_name != player.character_name:
                         logger.error("CRITICAL MISMATCH before render: state.character_name='%s' != player.character_name='%s'. Fixing state...", 
                                     state.character_name, player.character_name)
-                        # Fix the state immediately
-                        state.character_name = player.character_name
+                        # Get the character object to update all fields
+                        character = self._get_character_by_name(player.character_name)
+                        if character:
+                            # Update ALL character-related fields, not just the name
+                            state.character_name = player.character_name
+                            state.character_folder = character.folder
+                            state.character_avatar_path = character.avatar_path or ""
+                            state.character_message = character.message or ""
+                            logger.info("Updated state with character '%s' (folder='%s', avatar='%s')", 
+                                       character.name, character.folder, character.avatar_path)
+                        else:
+                            # Fallback: just update the name if character lookup fails
+                            logger.warning("Character lookup failed for '%s', only updating name", player.character_name)
+                            state.character_name = player.character_name
                         # Also update the stored state
                         game_state.player_states[message.author.id] = state
-                        await self._save_game_state(game_state)
-                        logger.info("Fixed state: now state.character_name='%s'", state.character_name)
+                        # Note: Auto-save removed - use !savegame to save manually
+                        logger.info("Fixed state: now state.character_name='%s', folder='%s', avatar='%s'", 
+                                   state.character_name, state.character_folder, state.character_avatar_path)
                     
                     logger.info("Rendering VN panel for game player: user_id=%s, player.character_name='%s', state.character_name='%s', character_display_name='%s'", 
                                message.author.id, player.character_name, state.character_name, character_display_name)
@@ -718,7 +855,7 @@ class GameBoardManager:
                     
                     vn_file = render_vn_panel(
                         state=state,
-                        message_content=cleaned_content,
+                        message_content=display_content,
                         character_display_name=character_display_name,
                         original_name=message.author.display_name,
                         attachment_id=str(message.id),
@@ -745,6 +882,27 @@ class GameBoardManager:
                     "allowed_mentions": discord.AllowedMentions.none(),
                 }
                 
+                # Include message attachments (images) if present
+                if has_attachments:
+                    # Download and attach original message attachments
+                    attachment_files = []
+                    for attachment in message.attachments:
+                        try:
+                            # Download attachment
+                            attachment_bytes = await attachment.read()
+                            attachment_file = discord.File(
+                                io.BytesIO(attachment_bytes),
+                                filename=attachment.filename
+                            )
+                            attachment_files.append(attachment_file)
+                        except Exception as exc:
+                            logger.warning("Failed to download attachment %s: %s", attachment.filename, exc)
+                    
+                    if attachment_files:
+                        # Add attachments to files list
+                        send_kwargs["files"] = files + attachment_files
+                        logger.info("Including %d attachment(s) with VN panel", len(attachment_files))
+                
                 # Preserve reply reference if present
                 if message.reference:
                     send_kwargs["reference"] = message.reference
@@ -759,6 +917,38 @@ class GameBoardManager:
                         pass  # Message might already be deleted
                 except discord.HTTPException as exc:
                     logger.error("Failed to send game VN panel: %s", exc, exc_info=True)
+            elif has_attachments:
+                # No VN panel but message has attachments - send attachments as-is (for images without text)
+                logger.info("Sending attachments only (no VN panel) for game player %s", message.author.id)
+                attachment_files = []
+                for attachment in message.attachments:
+                    try:
+                        attachment_bytes = await attachment.read()
+                        attachment_file = discord.File(
+                            io.BytesIO(attachment_bytes),
+                            filename=attachment.filename
+                        )
+                        attachment_files.append(attachment_file)
+                    except Exception as exc:
+                        logger.warning("Failed to download attachment %s: %s", attachment.filename, exc)
+                
+                if attachment_files:
+                    send_kwargs = {
+                        "files": attachment_files,
+                        "allowed_mentions": discord.AllowedMentions.none(),
+                    }
+                    if message.reference:
+                        send_kwargs["reference"] = message.reference
+                    
+                    try:
+                        await message.channel.send(**send_kwargs)
+                        # Delete original message
+                        try:
+                            await message.delete()
+                        except discord.HTTPException:
+                            pass
+                    except Exception as exc:
+                        logger.error("Failed to send attachments: %s", exc, exc_info=True)
             else:
                 logger.warning("No VN panel file created for game player %s as %s (MESSAGE_STYLE=%s, files=%s)", 
                              message.author.id, character_display_name, MESSAGE_STYLE, len(files) if 'files' in locals() else 0)
@@ -769,23 +959,15 @@ class GameBoardManager:
         return True
     
     async def _handle_narrator_message(self, message: discord.Message, game_state: GameState) -> None:
-        """Handle narrator message (GM speaking as narrator)."""
-        # Use the slash say command handler directly
+        """Handle narrator message (GM speaking as narrator). Uses EXACT same rendering as VN mode."""
         import sys
         bot_module = sys.modules.get('bot') or sys.modules.get('__main__')
         if not bot_module:
             logger.warning("Cannot get bot module for narrator message")
             return
         
-        _handle_slash_say = getattr(bot_module, '_handle_slash_say', None)
-        if not _handle_slash_say:
-            logger.warning("_handle_slash_say not found for narrator message")
-            return
-        
-        # Create a fake interaction for the say command
-        # We'll use the message directly instead
         try:
-            # Get narrator character
+            # Get narrator character - MUST match exactly how VN mode gets it
             CHARACTER_BY_NAME = getattr(bot_module, 'CHARACTER_BY_NAME', None)
             if not CHARACTER_BY_NAME:
                 logger.warning("CHARACTER_BY_NAME not found")
@@ -803,16 +985,21 @@ class GameBoardManager:
                 logger.warning("Narrator character not found")
                 return
             
-            # Create a TransformationState for narrator
+            # CRITICAL: Character name MUST be exactly "Narrator" (capitalized) to match vn_layouts.json
+            # The layout key is normalized, but the character_name in state must match the original
+            narrator_char_name = "Narrator"  # Force exact match for layout lookup
+            
+            # Create a TransformationState for narrator - EXACT same as VN mode
             from tfbot.models import TransformationState
             from tfbot.utils import member_profile_name, utc_now
             from datetime import timedelta
+            from tfbot.panels import render_vn_panel, parse_discord_formatting, prepare_custom_emoji_images
             
             now = utc_now()
             narrator_state = TransformationState(
                 user_id=message.author.id,
                 guild_id=message.guild.id if message.guild else 0,
-                character_name=narrator_char.name,
+                character_name=narrator_char_name,  # MUST be "Narrator" for layout lookup
                 character_folder=narrator_char.folder,
                 character_avatar_path=narrator_char.avatar_path,
                 character_message=narrator_char.message or "",
@@ -826,44 +1013,74 @@ class GameBoardManager:
                 inanimate_responses=tuple(),
             )
             
-            # Render and send VN panel
-            from tfbot.panels import render_vn_panel, parse_discord_formatting, prepare_custom_emoji_images
-            
+            # Use EXACT same rendering path as VN mode - direct render_vn_panel call
             cleaned_content = message.content.strip()
             formatted_segments = parse_discord_formatting(cleaned_content)
             custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments)
             
+            # Get reply context if message is a reply
+            reply_context = None
+            if message.reference and message.reference.resolved:
+                ref_msg = message.reference.resolved
+                if isinstance(ref_msg, discord.Message):
+                    reply_context = type('ReplyContext', (), {
+                        'author': ref_msg.author.display_name,
+                        'text': ref_msg.content[:100] if ref_msg.content else "",
+                    })()
+            
+            # Render VN panel - EXACT same call as VN mode uses
             vn_file = render_vn_panel(
                 state=narrator_state,
                 message_content=cleaned_content,
-                character_display_name=narrator_char.name,
+                character_display_name=narrator_char_name,  # Use "Narrator" for display
                 original_name=message.author.display_name,
                 attachment_id=str(message.id),
                 formatted_segments=formatted_segments,
                 custom_emoji_images=custom_emoji_images,
-                reply_context=None,
+                reply_context=reply_context,
             )
             
             if vn_file:
-                await message.channel.send(files=[vn_file], allowed_mentions=discord.AllowedMentions.none())
+                # Send with same parameters as VN mode
+                send_kwargs = {
+                    "files": [vn_file],
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if message.reference:
+                    send_kwargs["reference"] = message.reference
+                await message.channel.send(**send_kwargs)
+                
+                # Delete original message
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
             else:
+                logger.warning("Failed to render narrator VN panel, falling back to text")
                 # Fallback to text
-                await message.channel.send(f"**{narrator_char.name}**: {cleaned_content}", allowed_mentions=discord.AllowedMentions.none())
-            
-            # Delete original message
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                pass
+                await message.channel.send(f"**{narrator_char_name}**: {cleaned_content}", allowed_mentions=discord.AllowedMentions.none())
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
         except Exception as exc:
             logger.exception("Error handling narrator message: %s", exc)
 
     def get_game_config(self, game_type: str) -> Optional[GameConfig]:
         """Get game configuration by type name."""
         return self._game_configs.get(game_type)
+    
+    def _get_player_number(self, game_state: GameState, user_id: int) -> Optional[int]:
+        """Get player number (1, 2, 3, etc.) from pack."""
+        pack = get_game_pack(game_state.game_type, self.packs_dir)
+        if pack and pack.has_function("get_player_number"):
+            return pack.call("get_player_number", game_state, user_id)
+        return None
 
-    def list_available_games(self) -> Sequence[str]:
+    def list_available_games(self) -> List[str]:
         """Get list of available game types."""
+        if not self._has_packs:
+            return []  # No games available if no packs
         return list(self._game_configs.keys())
 
     def _is_gm(self, member: Optional[discord.Member], game_state: Optional[GameState] = None) -> bool:
@@ -875,6 +1092,99 @@ class GameBoardManager:
         if game_state and game_state.gm_user_id == member.id:
             return True
         return False
+    
+    def _get_command_lock(self, thread_id: int) -> asyncio.Lock:
+        """Get or create a command lock for a specific game thread."""
+        if thread_id not in self._command_locks:
+            self._command_locks[thread_id] = asyncio.Lock()
+        return self._command_locks[thread_id]
+    
+    async def _execute_gameboard_command(self, ctx: commands.Context, coro) -> None:
+        """Execute a gameboard GM command with per-game locking to ensure message ordering."""
+        # Only lock if we're in a game thread
+        if not isinstance(ctx.channel, discord.Thread):
+            # Not in a thread, execute without lock
+            await coro()
+            return
+        
+        thread_id = ctx.channel.id
+        command_lock = self._get_command_lock(thread_id)
+        
+        # Check if lock is already held (another command is processing)
+        if command_lock.locked():
+            await ctx.reply("⏳ Another command is currently processing for this game. Please wait...", mention_author=False)
+            return
+        
+        # Acquire lock and execute - this ensures all messages from this command appear in order
+        async with command_lock:
+            await coro()
+    
+    def _resolve_target_member(
+        self, 
+        ctx: commands.Context, 
+        game_state: GameState, 
+        token: str
+    ) -> Optional[discord.Member]:
+        """
+        Resolve a target token to a Discord member.
+        Supports: @user mention, character_name, character_folder, or player display name.
+        Returns the member if found, None otherwise.
+        """
+        if not ctx.guild:
+            return None
+        
+        token = token.strip()
+        if not token:
+            return None
+        
+        # Try member mention first
+        import re
+        mention_match = re.search(r'<@!?(\d+)>', token)
+        if mention_match:
+            member_id = int(mention_match.group(1))
+            member = ctx.guild.get_member(member_id)
+            if member and member.id in game_state.players:
+                return member
+        
+        token_lower = token.lower()
+        
+        # Try character name (exact match)
+        for user_id, player in game_state.players.items():
+            if player.character_name and player.character_name.lower() == token_lower:
+                member = ctx.guild.get_member(user_id)
+                if member:
+                    return member
+        
+        # Try character name (partial match)
+        for user_id, player in game_state.players.items():
+            if player.character_name and token_lower in player.character_name.lower():
+                member = ctx.guild.get_member(user_id)
+                if member:
+                    return member
+        
+        # Try character folder (via character lookup)
+        character = self._get_character_by_name(token)
+        if character:
+            # Find player with this character
+            for user_id, player in game_state.players.items():
+                if player.character_name == character.name:
+                    member = ctx.guild.get_member(user_id)
+                    if member:
+                        return member
+        
+        # Try display name (exact match)
+        for user_id, player in game_state.players.items():
+            member = ctx.guild.get_member(user_id)
+            if member and member.display_name.lower() == token_lower:
+                return member
+        
+        # Try display name (partial match)
+        for user_id, player in game_state.players.items():
+            member = ctx.guild.get_member(user_id)
+            if member and token_lower in member.display_name.lower():
+                return member
+        
+        return None
 
     async def _get_game_state_for_context(self, ctx: commands.Context) -> Optional[GameState]:
         """Get game state for a command context (thread or DM channel)."""
@@ -895,10 +1205,11 @@ class GameBoardManager:
         """Save game state to disk."""
         async with self._lock:
             # Generate filename with game type, date, and time for better organization
+            # CRITICAL: Use Windows-safe time format (no colons)
             from datetime import datetime
             now = datetime.now()
             date_str = now.strftime("%d-%m-%Y")
-            time_str = now.strftime("%H:%M")
+            time_str = now.strftime("%H-%M")  # Changed from %H:%M to %H-%M (Windows-safe)
             game_type = game_state.game_type or "unknown"
             # Sanitize game_type for filename (remove invalid chars)
             safe_game_type = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in game_type)
@@ -916,8 +1227,10 @@ class GameBoardManager:
                 "board_message_id": game_state.board_message_id,
                 "is_locked": game_state.is_locked,
                 "narrator_user_id": game_state.narrator_user_id,
-                "debug_mode": game_state.debug_mode,
-                "players": {
+                    "debug_mode": game_state.debug_mode,
+                    "turn_count": game_state.turn_count,
+                    "game_started": game_state.game_started,
+                    "players": {
                     str(user_id): {
                         "user_id": player.user_id,
                         "character_name": player.character_name,
@@ -929,14 +1242,155 @@ class GameBoardManager:
                     for user_id, player in game_state.players.items()
                 },
             }
+            # Ensure directory exists
             state_file.parent.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            
+            # Write file and verify it was written successfully
+            try:
+                json_content = json.dumps(data, indent=2)
+                state_file.write_text(json_content, encoding="utf-8")
+                
+                # Verify file was written (check file size)
+                if not state_file.exists():
+                    logger.error("CRITICAL: Save file was not created: %s", state_file)
+                    return
+                
+                file_size = state_file.stat().st_size
+                if file_size == 0:
+                    logger.error("CRITICAL: Save file is 0 bytes: %s", state_file)
+                    return
+                
+                logger.info("Game state saved successfully: %s (%d bytes)", filename, file_size)
+            except Exception as exc:
+                logger.error("CRITICAL: Failed to save game state to %s: %s", state_file, exc, exc_info=True)
+                raise
+
+    async def _save_auto_save(self, game_state: GameState, ctx: Optional[commands.Context] = None) -> None:
+        """Save auto-save at end of turn. Replaces previous auto-save for this game."""
+        async with self._lock:
+            try:
+                # Get thread name for filename
+                thread_name = "game"
+                guild = None
+                if ctx and ctx.guild:
+                    guild = ctx.guild
+                elif game_state.forum_channel_id:
+                    # Try to get guild from forum channel
+                    try:
+                        forum_channel = self.bot.get_channel(game_state.forum_channel_id)
+                        if forum_channel and hasattr(forum_channel, 'guild') and forum_channel.guild:
+                            guild = forum_channel.guild
+                    except Exception:
+                        pass
+                
+                if guild:
+                    try:
+                        thread = guild.get_channel(game_state.game_thread_id)
+                        if thread and hasattr(thread, 'name'):
+                            thread_name = thread.name
+                            # Sanitize thread name for filename
+                            thread_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in thread_name)
+                            if not thread_name:
+                                thread_name = "game"
+                    except Exception:
+                        pass
+                
+                # Get GM name for filename
+                gm_name = "gm"
+                if guild:
+                    try:
+                        gm_member = guild.get_member(game_state.gm_user_id)
+                        if gm_member:
+                            gm_name = gm_member.display_name.lower()
+                            # Sanitize GM name for filename
+                            gm_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in gm_name)
+                            if not gm_name:
+                                gm_name = "gm"
+                    except Exception:
+                        pass
+                
+                # Get game type
+                game_type = game_state.game_type or "unknown"
+                safe_game_type = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in game_type)
+                
+                # Get date
+                from datetime import datetime
+                now = datetime.now()
+                date_str = now.strftime("%d-%m-%Y")
+                
+                # Get turn number
+                turn_num = game_state.turn_count
+                
+                # Generate filename: game1_snakesladders_aireo_date_turn1
+                filename = f"{thread_name}_{safe_game_type}_{gm_name}_{date_str}_turn{turn_num}.json"
+                state_file = self.states_dir / filename
+                
+                # Delete previous auto-save for this game (if exists)
+                # Pattern: {thread_name}_{safe_game_type}_{gm_name}_{date_str}_turn*.json
+                pattern = f"{thread_name}_{safe_game_type}_{gm_name}_{date_str}_turn*.json"
+                for old_file in self.states_dir.glob(pattern):
+                    if old_file != state_file:
+                        try:
+                            old_file.unlink()
+                            logger.info("Deleted previous auto-save: %s", old_file.name)
+                        except Exception as exc:
+                            logger.warning("Failed to delete previous auto-save %s: %s", old_file.name, exc)
+                
+                # Save current state
+                data = {
+                    "game_thread_id": game_state.game_thread_id,
+                    "forum_channel_id": game_state.forum_channel_id,
+                    "dm_channel_id": game_state.dm_channel_id,
+                    "gm_user_id": game_state.gm_user_id,
+                    "game_type": game_state.game_type,
+                    "map_thread_id": game_state.map_thread_id,
+                    "current_turn": game_state.current_turn,
+                    "board_message_id": game_state.board_message_id,
+                    "is_locked": game_state.is_locked,
+                    "narrator_user_id": game_state.narrator_user_id,
+                    "debug_mode": game_state.debug_mode,
+                    "turn_count": game_state.turn_count,
+                    "game_started": game_state.game_started,
+                    "players": {
+                        str(user_id): {
+                            "user_id": player.user_id,
+                            "character_name": player.character_name,
+                            "grid_position": player.grid_position,
+                            "background_id": player.background_id,
+                            "outfit_name": player.outfit_name,
+                            "token_image": player.token_image,
+                        }
+                        for user_id, player in game_state.players.items()
+                    },
+                }
+                
+                # Ensure directory exists
+                state_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Write file and verify
+                json_content = json.dumps(data, indent=2)
+                state_file.write_text(json_content, encoding="utf-8")
+                
+                # Verify file was written
+                if not state_file.exists():
+                    logger.error("CRITICAL: Auto-save file was not created: %s", state_file)
+                    return
+                
+                file_size = state_file.stat().st_size
+                if file_size == 0:
+                    logger.error("CRITICAL: Auto-save file is 0 bytes: %s", state_file)
+                    return
+                
+                logger.info("Auto-save created successfully: %s (%d bytes, turn %d)", filename, file_size, turn_num)
+            except Exception as exc:
+                logger.error("CRITICAL: Failed to create auto-save: %s", exc, exc_info=True)
 
     async def _update_board(
         self,
         game_state: GameState,
         error_channel: Optional[discord.abc.Messageable] = None,
-        target_thread: str = "map"
+        target_thread: str = "map",
+        also_post_to_game: bool = False
     ) -> None:
         """
         Update board image.
@@ -945,9 +1399,10 @@ class GameBoardManager:
             game_state: The game state
             error_channel: Channel to send error messages to
             target_thread: "game" to send to game thread, "map" to send to map thread (default)
+            also_post_to_game: If True, also post to game thread in addition to map thread (for game start and turn start)
         """
-        logger.info("Updating board for game thread %s (map thread %s), target=%s", 
-                   game_state.game_thread_id, game_state.map_thread_id, target_thread)
+        logger.info("Updating board for game thread %s (map thread %s), target=%s, also_post_to_game=%s", 
+                   game_state.game_thread_id, game_state.map_thread_id, target_thread, also_post_to_game)
         game_config = self.get_game_config(game_state.game_type)
         if not game_config:
             error_msg = f"❌ No game config found for game type: {game_state.game_type}"
@@ -980,8 +1435,26 @@ class GameBoardManager:
         # Log player positions for debugging
         logger.info("Players on board: %s", {pid: (p.grid_position, p.character_name) for pid, p in game_state.players.items()})
         
-        # Regenerate board image with current token positions (this creates a NEW image)
-        board_file = render_game_board(game_state, game_config, self.assets_dir)
+        # Send progress message if we have an error channel (game thread) and it's a Thread or TextChannel
+        progress_msg = None
+        if error_channel and (isinstance(error_channel, discord.Thread) or isinstance(error_channel, discord.TextChannel)):
+            try:
+                progress_msg = await error_channel.send("⏳ Generating board...", allowed_mentions=discord.AllowedMentions.none())
+            except Exception:
+                pass
+        
+        # CRITICAL: Make board rendering async to avoid blocking
+        # Run PIL operations in executor thread to prevent blocking the event loop
+        try:
+            loop = asyncio.get_event_loop()
+            board_file = await loop.run_in_executor(
+                None,
+                lambda: render_game_board(game_state, game_config, self.assets_dir)
+            )
+        except Exception as exc:
+            logger.error("Failed to render board image (async): %s", exc, exc_info=True)
+            board_file = None
+        
         if not board_file:
             error_msg = "❌ Failed to render board image"
             logger.warning(error_msg)
@@ -992,9 +1465,8 @@ class GameBoardManager:
                     pass
             return
         
-        logger.info("Board image regenerated, posting to map thread")
-        
-        # Post new board image (don't delete old ones - they persist for history)
+        # Post to primary target thread (map forum by default)
+        logger.info("Board image regenerated, posting to %s thread", target_thread)
         try:
             # Send the board image file directly (no embed, no URL - just the image)
             # This is a NEW image with updated token positions
@@ -1005,20 +1477,127 @@ class GameBoardManager:
                 allowed_mentions=discord.AllowedMentions.none()
             )
             game_state.board_message_id = board_msg.id  # Store latest for reference
-            await self._save_game_state(game_state)
-            logger.info("Board updated successfully, new message ID: %s", board_msg.id)
+            logger.info("Board updated successfully in %s thread, new message ID: %s", target_thread, board_msg.id)
+            
+            # Delete progress message if it exists
+            if progress_msg:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
         except discord.HTTPException as exc:
-            error_msg = f"❌ Failed to post board image: {exc}"
+            error_msg = f"❌ Failed to post board image to {target_thread} thread: {exc}"
             logger.warning(error_msg)
             if error_channel:
                 try:
                     await error_channel.send(error_msg)
                 except Exception:
                     pass
+            return
+        
+        # If also_post_to_game is True, also post to game thread (for game start and turn start)
+        if also_post_to_game and game_state.game_thread_id and game_state.game_thread_id != target_thread_id:
+            game_thread = self.bot.get_channel(game_state.game_thread_id)
+            if isinstance(game_thread, discord.Thread):
+                try:
+                    # Re-read the board file (or use the same file object if it supports multiple sends)
+                    # Note: discord.File objects can only be sent once, so we need to recreate it
+                    loop = asyncio.get_event_loop()
+                    game_board_file = await loop.run_in_executor(
+                        None,
+                        lambda: render_game_board(game_state, game_config, self.assets_dir)
+                    )
+                    if game_board_file:
+                        await game_thread.send(
+                            file=game_board_file,
+                            allowed_mentions=discord.AllowedMentions.none()
+                        )
+                        logger.info("Board also posted to game thread for visibility")
+                    else:
+                        logger.warning("Failed to generate board file for game thread")
+                except Exception as exc:
+                    logger.exception("CRITICAL: Failed to post board to game thread: %s", exc)
+                    # Try to send error message to game thread
+                    try:
+                        await game_thread.send("❌ Failed to display board image. Check map thread for board updates.", allowed_mentions=discord.AllowedMentions.none())
+                    except Exception:
+                        pass
+        
+        # CRITICAL: Process queued messages after board is shown
+        # This ensures VN messages appear AFTER command output, not interrupting it
+        await self._process_queued_messages(game_state)
+
+    async def _process_queued_messages(self, game_state: GameState) -> None:
+        """Process all queued messages for a game thread after command completes."""
+        thread_id = game_state.game_thread_id
+        if thread_id not in self._message_queues:
+            return
+        
+        queue = self._message_queues[thread_id]
+        if not queue:
+            return
+        
+        logger.info("Processing %d queued message(s) for thread %s", len(queue), thread_id)
+        
+        # Process all queued messages
+        messages_to_process = queue.copy()
+        queue.clear()  # Clear queue immediately to prevent duplicates
+        
+        for message_data in messages_to_process:
+            try:
+                # Recreate a message-like object from stored data
+                class QueuedMessage:
+                    def __init__(self, data):
+                        self.content = data.get('content', '')
+                        self.author = data.get('author')
+                        self.channel = data.get('channel')
+                        self.guild = data.get('guild')
+                        self.reference = data.get('reference')
+                        # Reconstruct attachment objects from stored data
+                        self._attachment_data = data.get('attachments', [])
+                        # Create attachment-like objects for compatibility
+                        self.attachments = []
+                        for att_data in self._attachment_data:
+                            # Create a simple object that mimics discord.Attachment
+                            class AttachmentProxy:
+                                def __init__(self, att_data):
+                                    self.filename = att_data.get('filename', 'unknown')
+                                    self._bytes = att_data.get('bytes', b'')
+                                    self.content_type = att_data.get('content_type')
+                                
+                                async def read(self):
+                                    return self._bytes
+                            
+                            self.attachments.append(AttachmentProxy(att_data))
+                        self.id = data.get('id', 0)
+                    
+                    async def delete(self):
+                        # Message was already deleted, so this is a no-op
+                        pass
+                
+                queued_message = QueuedMessage(message_data)
+                has_attachments = len(queued_message.attachments) > 0
+                logger.debug("Processing queued message from %s: %s (attachments: %d)", 
+                           queued_message.author.id if queued_message.author else "?", 
+                           queued_message.content[:50] if queued_message.content else "(no content)",
+                           len(queued_message.attachments) if has_attachments else 0)
+                
+                # CRITICAL: Check if lock is still held - if so, skip processing (shouldn't happen, but safety check)
+                command_lock = self._get_command_lock(thread_id)
+                if command_lock.locked():
+                    logger.warning("Command lock still held when processing queued messages - skipping to prevent recursion")
+                    continue
+                
+                # Re-call handle_message - it will process the message normally
+                # The message.delete() call in handle_message will fail silently since message is already deleted
+                # CRITICAL: This will process ALL queued messages (including GM/admin) in order
+                # Pass is_queued=True to skip the lock check and prevent re-queuing
+                await self.handle_message(queued_message, command_invoked=False, is_queued=True)
+            except Exception as exc:
+                logger.exception("Error processing queued message from %s: %s", message_data.get('author').id if message_data.get('author') else "unknown", exc)
 
     async def _log_action(self, game_state: GameState, action: str) -> None:
-        """Log a game action."""
-        # TODO: Implement logging to file or channel
+        """Log a game action to the logger."""
         logger.info("Game action [thread %s]: %s", game_state.game_thread_id, action)
 
     # GM Command Methods
@@ -1051,9 +1630,18 @@ class GameBoardManager:
         
         logger.info("command_startgame: STEP 3 - Checking game_type parameter")
         if not game_type:
-            available = ", ".join(self.list_available_games())
+            available = ", ".join(self.list_available_games()) if self.list_available_games() else "No games available"
             logger.warning("command_startgame: STEP 3 FAILED - No game_type provided, available: %s", available)
-            await ctx.reply("Usage: `!startgame <game_type>`\nAvailable games: " + available, mention_author=False)
+            if not self._has_packs:
+                await ctx.reply("❌ **No games available:** No game packs found. Gameboard is disabled.", mention_author=False)
+            else:
+                await ctx.reply("Usage: `!startgame <game_type>`\nAvailable games: " + available, mention_author=False)
+            return
+        
+        # Check if gameboard is disabled (no packs)
+        if not self._has_packs:
+            logger.warning("command_startgame: Gameboard disabled - no packs available")
+            await ctx.reply("❌ **Gameboard disabled:** No game packs found. Please add game pack files to `games/packs/` directory.", mention_author=False)
             return
         
         logger.info("command_startgame: STEP 3 PASSED - game_type='%s'", game_type)
@@ -1124,7 +1712,43 @@ class GameBoardManager:
         
         logger.info("command_startgame: STEP 7 PASSED - Forum channel validated: %s (%s)", forum_channel.name, forum_channel.id)
         
-        logger.info("command_startgame: STEP 8 - Checking bot permissions in forum channel")
+        # Validate map forum channel (separate from game forum)
+        logger.info("command_startgame: STEP 7.5 - Looking up map forum channel")
+        logger.info("command_startgame: Map forum channel ID from config: %s", self.map_forum_channel_id)
+        map_forum_channel = self.bot.get_channel(self.map_forum_channel_id)
+        logger.info("command_startgame: get_channel(%s) returned: %s", self.map_forum_channel_id, map_forum_channel)
+        
+        if not map_forum_channel:
+            logger.error("command_startgame: STEP 7.5 FAILED - Map forum channel %s not found or not accessible by bot", self.map_forum_channel_id)
+            await ctx.reply(
+                f"❌ **Map forum channel not found:** The configured map forum channel (ID: {self.map_forum_channel_id}) doesn't exist or the bot can't access it.\n\n"
+                f"Please check:\n"
+                f"• The channel ID in environment variable `TFBOT_GAME_MAP_FORUM_CHANNEL_ID` is correct\n"
+                f"• The channel still exists\n"
+                f"• The bot has access to the channel",
+                mention_author=False
+            )
+            logger.info("command_startgame: EXIT - Map forum channel not found")
+            return
+        
+        logger.info("command_startgame: STEP 7.5 PASSED - Map forum channel found: %s (type: %s, ID: %s)", 
+                   map_forum_channel.name, type(map_forum_channel).__name__, map_forum_channel.id)
+        
+        logger.info("command_startgame: STEP 7.6 - Validating map forum channel type")
+        if not isinstance(map_forum_channel, discord.ForumChannel):
+            logger.error("command_startgame: STEP 7.6 FAILED - Channel %s is not a forum channel (type: %s)", 
+                        self.map_forum_channel_id, type(map_forum_channel).__name__)
+            await ctx.reply(
+                f"❌ **Invalid map forum channel type:** Channel ID {self.map_forum_channel_id} is not a forum channel.\n\n"
+                f"Please configure a forum channel in environment variable `TFBOT_GAME_MAP_FORUM_CHANNEL_ID`.",
+                mention_author=False
+            )
+            logger.info("command_startgame: EXIT - Invalid map forum channel type")
+            return
+        
+        logger.info("command_startgame: STEP 7.6 PASSED - Map forum channel validated: %s (%s)", map_forum_channel.name, map_forum_channel.id)
+        
+        logger.info("command_startgame: STEP 8 - Checking bot permissions in forum channels")
         if ctx.guild:
             logger.info("command_startgame: Getting bot member for guild %s (bot.user.id: %s)", 
                        ctx.guild.id, self.bot.user.id if self.bot.user else None)
@@ -1234,7 +1858,7 @@ class GameBoardManager:
         # Create TWO separate forum posts in the same channel: one for chat, one for board images
         thread_name = f"{game_config.name} #{game_number} - {ctx.author.display_name}"
         map_thread_name = f"{game_config.name} #{game_number} Map - {ctx.author.display_name}"
-        initial_message = f"🎲 **{game_config.name}** game started by {ctx.author.mention}\n\nUse `!addplayer @user` to add players, then `!assign @user character_name` to assign characters."
+        initial_message = f"🎲 **{game_config.name}** game started by {ctx.author.display_name}\n\nUse `!addplayer @user` to add players, then `!assign @user character_name` to assign characters."
         map_initial_message = f"🗺️ **{game_config.name} Map** - Board updates will appear here.\n\nThis post is read-only. All messages except admin commands will be automatically deleted."
         
         logger.info("command_startgame: Creating game thread: '%s'", thread_name)
@@ -1250,46 +1874,52 @@ class GameBoardManager:
             )
             logger.info("command_startgame: Successfully created game thread: %s (ID: %s)", thread.name, thread.id)
             
-            # Create map thread (for board images only, same channel, different post)
-            logger.info("command_startgame: Attempting to create map thread: '%s'", map_thread_name)
-            map_thread, map_message = await forum_channel.create_thread(
+            # Create map thread (for board images only, in separate map forum channel)
+            logger.info("command_startgame: Attempting to create map thread: '%s' in map forum channel %s", map_thread_name, map_forum_channel.id)
+            map_thread, map_message = await map_forum_channel.create_thread(
                 name=map_thread_name,
                 auto_archive_duration=1440,
                 content=map_initial_message
             )
-            logger.info("command_startgame: Successfully created map thread: %s (ID: %s)", map_thread.name, map_thread.id)
+            logger.info("command_startgame: Successfully created map thread: %s (ID: %s) in map forum channel %s", map_thread.name, map_thread.id, map_forum_channel.id)
         except discord.Forbidden as exc:
+            # Determine which channel had the permission error
             error_msg = (
-                f"❌ **Permission Denied:** The bot doesn't have permission to create threads in the forum channel.\n\n"
-                f"**Required permissions in <#{forum_channel.id}>:**\n"
-                f"• Create Public Threads (or Create Forum Threads)\n"
-                f"• Send Messages in Threads\n"
-                f"• Attach Files\n\n"
-                f"Please check the bot's role permissions and try again."
+                f"❌ **Permission Denied:** The bot doesn't have permission to create threads.\n\n"
+                f"**Required permissions:**\n"
+                f"• In game forum <#{forum_channel.id}>: Create Public Threads, Send Messages in Threads, Attach Files\n"
+                f"• In map forum <#{map_forum_channel.id}>: Create Public Threads, Send Messages in Threads, Attach Files\n\n"
+                f"Please check the bot's role permissions in both forum channels and try again."
             )
             await ctx.reply(error_msg, mention_author=False)
-            logger.error("Permission denied creating game thread in forum channel %s: %s", forum_channel.id, exc)
+            logger.error("Permission denied creating threads (game forum: %s, map forum: %s): %s", forum_channel.id, map_forum_channel.id, exc)
             return
         except discord.HTTPException as exc:
             # Check for specific error codes
             if exc.status == 403:
                 error_msg = (
                     f"❌ **Permission Error (403):** The bot lacks permissions to create threads.\n\n"
-                    f"Please ensure the bot has 'Create Public Threads' (or 'Create Forum Threads') permission in <#{forum_channel.id}>."
+                    f"Please ensure the bot has 'Create Public Threads' (or 'Create Forum Threads') permission in:\n"
+                    f"• Game forum: <#{forum_channel.id}>\n"
+                    f"• Map forum: <#{map_forum_channel.id}>"
                 )
             elif exc.status == 404:
                 error_msg = (
-                    f"❌ **Channel Not Found (404):** The forum channel (ID: {forum_channel.id}) no longer exists.\n\n"
+                    f"❌ **Channel Not Found (404):** One or both forum channels no longer exist.\n\n"
+                    f"• Game forum: {forum_channel.id}\n"
+                    f"• Map forum: {map_forum_channel.id}\n\n"
                     f"Please update the forum channel configuration."
                 )
             else:
                 error_msg = (
                     f"❌ **Failed to create game thread:** {exc}\n\n"
                     f"**Error Code:** {exc.status if hasattr(exc, 'status') else 'Unknown'}\n"
-                    f"**Forum Channel:** <#{forum_channel.id}>\n\n"
+                    f"**Forum Channels:**\n"
+                    f"• Game forum: <#{forum_channel.id}>\n"
+                    f"• Map forum: <#{map_forum_channel.id}>\n\n"
                     f"If this persists, check:\n"
-                    f"• Bot permissions in the forum channel\n"
-                    f"• Forum channel still exists\n"
+                    f"• Bot permissions in both forum channels\n"
+                    f"• Both forum channels still exist\n"
                     f"• Bot has proper role hierarchy"
                 )
             await ctx.reply(error_msg, mention_author=False)
@@ -1307,19 +1937,48 @@ class GameBoardManager:
             map_thread_id=map_thread.id,
             narrator_user_id=ctx.author.id,  # GM becomes narrator by default
             debug_mode=False,  # Default to off
+            turn_count=0,  # Start at turn 0, increments to 1 on first turn completion
+            game_started=False,  # Game starts as not ready - GM must use !start to begin
         )
         
         logger.info("command_startgame: Storing game state in active games")
         self._active_games[thread.id] = game_state
         
-        logger.info("command_startgame: Saving game state to disk")
-        await self._save_game_state(game_state)
-        logger.info("command_startgame: Game state saved")
+        # Send progress message
+        progress_msg = await ctx.reply("⏳ Creating initial board...", mention_author=False)
         
-        # Post initial board
-        logger.info("command_startgame: Updating board with initial state")
-        await self._update_board(game_state)
-        logger.info("command_startgame: Board updated")
+        # Post initial blank board (no players yet - board will update when characters are assigned)
+        logger.info("command_startgame: Creating initial blank board")
+        await self._update_board(game_state, error_channel=ctx.channel)
+        logger.info("command_startgame: Initial blank board created")
+        
+        # Auto-follow both threads for the GM (no pings/notifications)
+        logger.info("command_startgame: Auto-following threads for GM %s", ctx.author.id)
+        try:
+            # Follow game thread for GM using HTTP API
+            await self.bot.http.request(
+                discord.http.Route('PUT', '/channels/{channel_id}/thread-members/{user_id}', 
+                                  channel_id=thread.id, user_id=ctx.author.id)
+            )
+            logger.info("command_startgame: Successfully followed game thread %s for GM %s", thread.id, ctx.author.id)
+        except Exception as exc:
+            logger.warning("command_startgame: Failed to follow game thread %s: %s", thread.id, exc)
+        
+        try:
+            # Follow map thread for GM using HTTP API
+            await self.bot.http.request(
+                discord.http.Route('PUT', '/channels/{channel_id}/thread-members/{user_id}', 
+                                  channel_id=map_thread.id, user_id=ctx.author.id)
+            )
+            logger.info("command_startgame: Successfully followed map thread %s for GM %s", map_thread.id, ctx.author.id)
+        except Exception as exc:
+            logger.warning("command_startgame: Failed to follow map thread %s: %s", map_thread.id, exc)
+        
+        # Delete progress message
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
         
         logger.info("command_startgame: STEP 12 - Sending success message to user")
         try:
@@ -1337,7 +1996,10 @@ class GameBoardManager:
         """List available games."""
         games = self.list_available_games()
         if not games:
-            await ctx.reply("No games configured.", mention_author=False)
+            if not self._has_packs:
+                await ctx.reply("❌ **No games available:** No game packs found. Gameboard is disabled.", mention_author=False)
+            else:
+                await ctx.reply("No games configured.", mention_author=False)
             return
         
         lines = ["**Available Games:**"]
@@ -1371,6 +2033,9 @@ class GameBoardManager:
             await ctx.reply(f"{member.mention} is already in the game.", mention_author=False)
             return
         
+        # Send immediate progress message
+        progress_msg = await ctx.reply("⏳ Adding player...", mention_author=False)
+        
         player = GamePlayer(user_id=member.id, grid_position="A1")
         game_state.players[member.id] = player
         
@@ -1380,10 +2045,15 @@ class GameBoardManager:
         if pack and pack.has_function("on_player_added") and game_config:
             pack.call("on_player_added", game_state, player, game_config)
         
-        await self._save_game_state(game_state)
+        # Check if pack wants board update on player added
+        should_update = False
+        if pack and pack.has_function("should_update_board"):
+            should_update = pack.call("should_update_board", game_state, "player_added")
         
-        # Update board to show the new player token at starting position
-        await self._update_board(game_state, error_channel=ctx.channel)
+        # Board will be updated when character is assigned (not when player is added)
+        # Unless pack specifically requests it
+        if should_update:
+            await self._update_board(game_state, error_channel=ctx.channel)
         
         # If character_name provided, assign character
         if character_name and character_name.strip():
@@ -1406,6 +2076,13 @@ class GameBoardManager:
                 await ctx.reply(f"Added {member.mention} to the game.\n❌ Error: Cannot assign character outside of a server.", mention_author=False)
                 return
             
+            # CRITICAL: Clear any existing game state for this player before creating new one
+            # This ensures we don't have stale state interfering
+            if member.id in game_state.player_states:
+                logger.info("Clearing existing game state for player %s before assignment", member.id)
+                del game_state.player_states[member.id]
+            
+            # CRITICAL: Always create a new state - never reuse old state
             state = await self._create_game_state_for_player(
                 player,
                 member.id,
@@ -1413,19 +2090,33 @@ class GameBoardManager:
                 actual_character_name,
             )
             if not state:
+                logger.error("CRITICAL: Failed to create state for player %s with character %s", member.id, actual_character_name)
                 await ctx.reply(f"Added {member.mention} to the game.\n❌ Error: Failed to create state for character '{character_name}'. Use `!assign @{member.display_name} <character>` to assign later.", mention_author=False)
                 await self._log_action(game_state, f"Player {member.display_name} added (state creation failed)")
                 return
             
-            # Ensure state matches player
+            # CRITICAL: Force state to match player character name BEFORE storing
             if state.character_name != actual_character_name:
+                logger.warning("State character_name mismatch in addplayer! Expected '%s', got '%s'. Fixing...", 
+                            actual_character_name, state.character_name)
                 state.character_name = actual_character_name
                 if character:
                     state.character_folder = character.folder
                     state.character_avatar_path = character.avatar_path
                     state.character_message = character.message or ""
             
+            # CRITICAL: Always store the state - this replaces any old state
             game_state.player_states[member.id] = state
+            logger.info("Stored game state for player %s with character '%s'", member.id, state.character_name)
+            
+            # Final verification - ensure state matches player
+            if state.character_name != actual_character_name or player.character_name != actual_character_name:
+                logger.error("CRITICAL: Verification failed after storing state! player.character_name='%s', state.character_name='%s', actual='%s'", 
+                            player.character_name, state.character_name, actual_character_name)
+                # Force correction
+                player.character_name = actual_character_name
+                state.character_name = actual_character_name
+                game_state.player_states[member.id] = state
             
             # If GM was assigned as a player, remove narrator role
             if member.id == game_state.gm_user_id and game_state.narrator_user_id == member.id:
@@ -1435,8 +2126,19 @@ class GameBoardManager:
             if pack and pack.has_function("on_character_assigned"):
                 pack.call("on_character_assigned", game_state, player, actual_character_name)
             
-            await self._save_game_state(game_state)
-            await self._update_board(game_state, error_channel=ctx.channel)
+            # Check if pack wants board update on character assignment
+            should_update = True
+            if pack and pack.has_function("should_update_board"):
+                should_update = pack.call("should_update_board", game_state, "character_assigned")
+            
+            if should_update:
+                await self._update_board(game_state, error_channel=ctx.channel)
+            
+            # Update progress message
+            try:
+                await progress_msg.edit(content="⏳ Assigning character...")
+            except Exception:
+                pass
             
             # Send transformation message
             try:
@@ -1451,6 +2153,15 @@ class GameBoardManager:
                 character_message = character.message or ""
                 duration_label = "Game"
                 
+                # Get player number for display (always get it, regardless of formatting method)
+                player_number = self._get_player_number(game_state, member.id)
+                if player_number:
+                    player_number_text = f" - Player {player_number}"
+                    logger.info("Assignment message (addplayer): %s assigned as Player %d", member.display_name, player_number)
+                else:
+                    player_number_text = ""
+                    logger.warning("No player number found for %s (user_id=%s) in addplayer - player may not have been properly added to game", member.display_name, member.id)
+                
                 if _format_character_message:
                     response_text = _format_character_message(
                         character_message,
@@ -1459,8 +2170,11 @@ class GameBoardManager:
                         duration_label,
                         actual_character_name,
                     )
+                    # Append player number to formatted message
+                    if player_number_text:
+                        response_text = f"{response_text}{player_number_text}"
                 else:
-                    response_text = f"{original_name} becomes **{actual_character_name}**!"
+                    response_text = f"{member.mention} is now **{actual_character_name}**{player_number_text}!"
                 
                 if _format_special_reroll_hint:
                     special_hint = _format_special_reroll_hint(actual_character_name, character.folder if character else None)
@@ -1471,324 +2185,518 @@ class GameBoardManager:
                     emoji_prefix = _get_magic_emoji(ctx.guild)
                     response_text = f"{emoji_prefix} {response_text}"
                 
+                # Delete progress message before sending final response
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
                 await ctx.reply(response_text, mention_author=False)
             except Exception as msg_exc:
                 logger.exception("Error sending assignment transformation message: %s", msg_exc)
-                await ctx.reply(f"✅ {member.display_name} becomes **{actual_character_name}**!", mention_author=False)
+                # Get player number for fallback message
+                player_number = self._get_player_number(game_state, member.id)
+                if player_number:
+                    player_number_text = f" - Player {player_number}"
+                else:
+                    player_number_text = ""
+                    logger.warning("No player number found for %s in fallback message", member.display_name)
+                # Delete progress message before sending fallback
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                await ctx.reply(f"✅ {member.mention} is now **{actual_character_name}**{player_number_text}!", mention_author=False)
             
             await self._log_action(game_state, f"Player {member.display_name} added and assigned character: {actual_character_name}")
         else:
+            # Delete progress message before sending final response
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
             await ctx.reply(f"Added {member.mention} to the game.", mention_author=False)
             await self._log_action(game_state, f"Player {member.display_name} added")
 
     async def command_assign(self, ctx: commands.Context, member: Optional[discord.Member] = None, *, character_name: str = "") -> None:
-        """Assign a character to a player (GM only)."""
-        try:
-            logger.info("command_assign called by %s, member=%s, character_name=%s", ctx.author.id, member, character_name)
-            
+        """Assign a character to a player (GM only). Supports: !assign @user character OR !assign character_name character OR !assign character_folder character"""
+        async def _impl():
+            try:
+                logger.info("command_assign called by %s, member=%s, character_name=%s", ctx.author.id, member, character_name)
+                
+                if not isinstance(ctx.author, discord.Member):
+                    await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                    return
+                
+                game_state = await self._get_game_state_for_context(ctx)
+                if not game_state:
+                    logger.warning("No game state found for context in thread %s", ctx.channel.id if isinstance(ctx.channel, discord.Thread) else None)
+                    await ctx.reply("No active game in this thread.", mention_author=False)
+                    return
+                
+                logger.debug("Game state found: game_type=%s, gm_user_id=%s", game_state.game_type, game_state.gm_user_id)
+                
+                if not self._is_gm(ctx.author, game_state):
+                    logger.warning("User %s is not GM (GM is %s)", ctx.author.id, game_state.gm_user_id)
+                    await ctx.reply("Only the GM can assign characters.", mention_author=False)
+                    return
+                
+                # If member not provided, try to resolve from character_name (first token)
+                resolved_member = member
+                character_to_assign = character_name.strip()
+                
+                if not resolved_member and character_to_assign:
+                    # Try to parse: !assign target character
+                    tokens = character_to_assign.split(None, 1)  # Split into max 2 parts
+                    if len(tokens) >= 1:
+                        target_token = tokens[0]
+                        if len(tokens) == 2:
+                            # Format: !assign target character_to_assign
+                            resolved_member = self._resolve_target_member(ctx, game_state, target_token)
+                            character_to_assign = tokens[1]
+                        else:
+                            # Only one token - could be target or character
+                            # Try to resolve as target first
+                            resolved_member = self._resolve_target_member(ctx, game_state, target_token)
+                            if resolved_member:
+                                # Successfully resolved as target, but no character specified
+                                await ctx.reply("Usage: `!assign @user <character>` or `!assign character_name <character>` or `!assign character_folder <character>`", mention_author=False)
+                                return
+                            # Not a target, so it's the character name (but we need a target)
+                            await ctx.reply("Usage: `!assign @user <character>` or `!assign character_name <character>` or `!assign character_folder <character>`", mention_author=False)
+                            return
+                
+                if not resolved_member:
+                    await ctx.reply("Usage: `!assign @user <character>` or `!assign character_name <character>` or `!assign character_folder <character>`", mention_author=False)
+                    return
+                
+                if not character_to_assign or not character_to_assign.strip():
+                    await ctx.reply("Usage: `!assign @user <character>` or `!assign character_name <character>` or `!assign character_folder <character>`", mention_author=False)
+                    return
+                
+                character_to_assign = character_to_assign.strip()
+                logger.debug("Assigning character %s to member %s", character_to_assign, resolved_member.id)
+                
+                # Send immediate progress message
+                progress_msg = await ctx.reply("⏳ Assigning character...", mention_author=False)
+                
+                if resolved_member.id not in game_state.players:
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+                    await ctx.reply(f"{resolved_member.mention} is not in the game. Add them first with `!addplayer`.", mention_author=False)
+                    return
+                
+                player = game_state.players[resolved_member.id]
+                
+                # Verify character exists before assigning (uses first name matching like !reroll)
+                character = self._get_character_by_name(character_to_assign)
+                if not character:
+                    # Character not found - show error (no suggestions, just error)
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+                    await ctx.reply(f"❌ Unable to locate '{character_to_assign}'.", mention_author=False)
+                    logger.warning("Character assignment failed: '%s' not found", character_to_assign)
+                    return
+                
+                # Character found - assign it using the character's actual name (for consistency)
+                # This ensures player.character_name matches what's stored in the character object
+                actual_character_name = character.name
+                player.character_name = actual_character_name
+                
+                # Create TransformationState for the player to enable VN mode
+                # CRITICAL: Always create a new state with the correct character name
+                # This ensures state.character_name matches the game-assigned character
+                if not ctx.guild:
+                    await ctx.reply("❌ Error: Cannot assign character outside of a server.", mention_author=False)
+                    return
+                
+                # CRITICAL: Clear any existing game state for this player before creating new one
+                # This ensures we don't have stale state interfering with assignment
+                if resolved_member.id in game_state.player_states:
+                    logger.info("Clearing existing game state for player %s before reassignment", resolved_member.id)
+                    del game_state.player_states[resolved_member.id]
+                
+                state = await self._create_game_state_for_player(
+                    player,
+                    resolved_member.id,
+                    ctx.guild.id,
+                    actual_character_name,  # Use the character's actual name, not the lookup parameter
+                )
+                if not state:
+                    # This should never happen if character lookup worked, but handle it anyway
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+                    logger.error("CRITICAL: Character found but state creation failed for %s with character %s", resolved_member.id, character_to_assign)
+                    await ctx.reply(f"❌ Error: Failed to create state for character '{character_to_assign}'. Assignment not completed.", mention_author=False)
+                    return
+                
+                # CRITICAL: Force state to use the correct character name BEFORE storing
+                # This ensures state.character_name ALWAYS matches player.character_name
+                if state.character_name != actual_character_name:
+                    logger.warning("State character_name mismatch during assignment! Expected '%s', got '%s'. Fixing...", 
+                                actual_character_name, state.character_name)
+                    # Force correct character name
+                    state.character_name = actual_character_name
+                    # Also update character_folder and avatar_path to match
+                    if character:
+                        state.character_folder = character.folder
+                        state.character_avatar_path = character.avatar_path
+                        state.character_message = character.message or ""
+                
+                # CRITICAL: Always store the new state - this replaces any old state
+                game_state.player_states[resolved_member.id] = state
+                logger.info("Assigned character '%s' (lookup: '%s') to player %s (user_id=%s). State stored with character_name='%s'", 
+                           actual_character_name, character_to_assign, resolved_member.display_name, resolved_member.id, state.character_name)
+                
+                # Final verification - state MUST match player
+                if state.character_name != actual_character_name or player.character_name != actual_character_name:
+                    logger.error("CRITICAL: Final verification failed! player.character_name='%s', state.character_name='%s', actual_character_name='%s'", 
+                                player.character_name, state.character_name, actual_character_name)
+                    # Force everything to match
+                    player.character_name = actual_character_name
+                    state.character_name = actual_character_name
+                    game_state.player_states[resolved_member.id] = state
+                    logger.info("Forced correction: player and state now both have character_name='%s'", actual_character_name)
+                
+                # If GM was assigned as a player, remove narrator role
+                if resolved_member.id == game_state.gm_user_id and game_state.narrator_user_id == resolved_member.id:
+                    game_state.narrator_user_id = None
+                    logger.debug("GM assigned as player, removed narrator role")
+                
+                # Call pack's on_character_assigned if it exists
+                pack = get_game_pack(game_state.game_type, self.packs_dir)
+                if pack and pack.has_function("on_character_assigned"):
+                    try:
+                        pack.call("on_character_assigned", game_state, player, actual_character_name)
+                    except KeyError as key_exc:
+                        error_key = str(key_exc)
+                        logger.error("Game pack error in on_character_assigned: KeyError - key '%s' not found in game data. This usually means the player wasn't properly initialized in the game pack.", error_key)
+                        await ctx.reply(f"⚠️ Character assigned, but game pack error: Missing key '{error_key}' in game data. The assignment succeeded, but some game features may not work correctly.", mention_author=False)
+                    except Exception as pack_exc:
+                        logger.error("Game pack error in on_character_assigned: %s (%s)", type(pack_exc).__name__, pack_exc, exc_info=True)
+                        await ctx.reply(f"⚠️ Character assigned, but game pack error: {type(pack_exc).__name__}: {str(pack_exc)}. The assignment succeeded, but some game features may not work correctly.", mention_author=False)
+                
+                # Update progress message
+                try:
+                    await progress_msg.edit(content="⏳ Updating board...")
+                except Exception:
+                    pass
+                
+                # Update board to show the new token (use !savegame to save manually)
+                await self._update_board(game_state, error_channel=ctx.channel)
+                
+                # Delete progress message before sending final response
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                
+                # CRITICAL: Send transformation message as TEXT (from bot, NOT from narrator VN panel)
+                # This is the "roll" announcement - player becomes the character!
+                # The player can then type messages which will show as the character
+                # Bot text messages should NOT be deleted!
+                
+                # Send transformation message as TEXT (like VN roll does) - from bot, not character, not narrator
+                try:
+                    from tfbot.utils import member_profile_name
+                    
+                    # Get helper functions via lazy import
+                    import sys
+                    bot_module = sys.modules.get('bot') or sys.modules.get('__main__')
+                    _format_character_message = getattr(bot_module, '_format_character_message', None)
+                    _get_magic_emoji = getattr(bot_module, '_get_magic_emoji', None)
+                    _format_special_reroll_hint = getattr(bot_module, '_format_special_reroll_hint', None)
+                    
+                    # Format transformation message EXACTLY like VN roll does
+                    original_name = member_profile_name(resolved_member)
+                    character_message = character.message or ""
+                    duration_label = "Game"
+                    
+                    # Get player number for display (always get it, regardless of formatting method)
+                    player_number = self._get_player_number(game_state, resolved_member.id)
+                    if player_number:
+                        player_number_text = f" - Player {player_number}"
+                        logger.info("Assignment message (assign): %s assigned as Player %d", resolved_member.display_name, player_number)
+                    else:
+                        player_number_text = ""
+                        logger.warning("No player number found for %s (user_id=%s) in assign - player may not have been properly added to game", resolved_member.display_name, resolved_member.id)
+                    
+                    if _format_character_message:
+                        response_text = _format_character_message(
+                            character_message,
+                            original_name,
+                            resolved_member.mention,
+                            duration_label,
+                            actual_character_name,
+                        )
+                        # Append player number to formatted message
+                        if player_number_text:
+                            response_text = f"{response_text}{player_number_text}"
+                    else:
+                        # Fallback if function not available
+                        response_text = f"{resolved_member.mention} is now **{actual_character_name}**{player_number_text}!"
+                    
+                    # Add special hint if available (like VN roll does)
+                    if _format_special_reroll_hint:
+                        special_hint = _format_special_reroll_hint(actual_character_name, character.folder if character else None)
+                        if special_hint:
+                            response_text = f"{response_text}\n{special_hint}"
+                    
+                    # Add emoji prefix (like VN roll does)
+                    if _get_magic_emoji and ctx.guild:
+                        emoji_prefix = _get_magic_emoji(ctx.guild)
+                        response_text = f"{emoji_prefix} {response_text}"
+                    
+                    # Send as TEXT message (from bot) - this is the transformation announcement
+                    # CRITICAL: This message should NOT be deleted!
+                    await ctx.reply(response_text, mention_author=False)
+                    logger.info("Assignment transformation message sent as TEXT for %s as %s (Player %s)", resolved_member.display_name, actual_character_name, player_number or "?")
+                    
+                except Exception as msg_exc:
+                    logger.exception("Error sending assignment transformation message: %s", msg_exc)
+                    # Fallback to simple text message
+                    # Get player number for fallback message
+                    player_number = self._get_player_number(game_state, resolved_member.id)
+                    if player_number:
+                        player_number_text = f" - Player {player_number}"
+                    else:
+                        player_number_text = ""
+                        logger.warning("No player number found for %s in fallback message", resolved_member.display_name)
+                    await ctx.reply(f"✅ {resolved_member.mention} is now **{actual_character_name}**{player_number_text}!", mention_author=False)
+                
+                await self._log_action(game_state, f"{resolved_member.display_name} assigned character: {character_to_assign}")
+                logger.info("Successfully assigned character %s to %s", character_to_assign, resolved_member.id)
+            except Exception as exc:
+                logger.exception("Error in command_assign: %s", exc)
+                # Get a more useful error message
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+                
+                # Provide context for common error types
+                if error_type == "KeyError":
+                    error_msg = f"KeyError: Key '{error_msg}' not found. This usually means the game pack data wasn't properly initialized for this player."
+                elif error_type == "AttributeError":
+                    error_msg = f"AttributeError: {error_msg}. This usually means a required attribute is missing."
+                elif error_type == "TypeError":
+                    error_msg = f"TypeError: {error_msg}. This usually means a wrong type was passed to a function."
+                # If error message is just a number (like a user ID), provide more context
+                elif error_msg.isdigit() or (error_msg and len(error_msg) > 10 and error_msg.replace('-', '').isdigit()):
+                    error_msg = f"{error_type}: {error_msg} (this looks like an ID - check if the player was properly initialized)"
+                
+                if not error_msg or error_msg == "None":
+                    error_msg = f"{error_type} occurred"
+                
+                await ctx.reply(f"❌ Error assigning character: {error_msg}", mention_author=False)
+        
+        await self._execute_gameboard_command(ctx, _impl)
+
+    async def command_reroll(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+        """Randomly reroll a player's character (GM only). Supports: !reroll @user OR !reroll character_name OR !reroll character_folder"""
+        async def _impl():
             if not isinstance(ctx.author, discord.Member):
                 await ctx.reply("This command can only be used inside a server.", mention_author=False)
                 return
             
             game_state = await self._get_game_state_for_context(ctx)
             if not game_state:
-                logger.warning("No game state found for context in thread %s", ctx.channel.id if isinstance(ctx.channel, discord.Thread) else None)
                 await ctx.reply("No active game in this thread.", mention_author=False)
                 return
             
-            logger.debug("Game state found: game_type=%s, gm_user_id=%s", game_state.game_type, game_state.gm_user_id)
-            
             if not self._is_gm(ctx.author, game_state):
-                logger.warning("User %s is not GM (GM is %s)", ctx.author.id, game_state.gm_user_id)
-                await ctx.reply("Only the GM can assign characters.", mention_author=False)
+                await ctx.reply("Only the GM can reroll characters.", mention_author=False)
                 return
             
-            if not member:
-                await ctx.reply("Usage: `!assign @user <character>`", mention_author=False)
+            # If member not provided, try to resolve from args (if available)
+            resolved_member = member
+            if not resolved_member:
+                # Check if there's a raw args string we can parse
+                # This would come from bot.py if it passes args
+                # For now, just show usage
+                await ctx.reply("Usage: `!reroll @user` or `!reroll character_name` or `!reroll character_folder`", mention_author=False)
                 return
             
-            if not character_name or not character_name.strip():
-                await ctx.reply("Usage: `!assign @user <character>`", mention_author=False)
-                return
-            
-            character_name = character_name.strip()
-            logger.debug("Assigning character %s to member %s", character_name, member.id)
-            
-            if member.id not in game_state.players:
-                await ctx.reply(f"{member.mention} is not in the game. Add them first with `!addplayer`.", mention_author=False)
-                return
-            
-            player = game_state.players[member.id]
-            
-            # Verify character exists before assigning (uses first name matching like !reroll)
-            character = self._get_character_by_name(character_name)
-            if not character:
-                # Character not found - show error (no suggestions, just error)
-                await ctx.reply(f"❌ Unable to locate '{character_name}'.", mention_author=False)
-                logger.warning("Character assignment failed: '%s' not found", character_name)
-                return
-            
-            # Character found - assign it using the character's actual name (for consistency)
-            # This ensures player.character_name matches what's stored in the character object
-            actual_character_name = character.name
-            player.character_name = actual_character_name
-            
-            # Create TransformationState for the player to enable VN mode
-            # CRITICAL: Always create a new state with the correct character name
-            # This ensures state.character_name matches the game-assigned character
-            if not ctx.guild:
-                await ctx.reply("❌ Error: Cannot assign character outside of a server.", mention_author=False)
-                return
-            
-            state = await self._create_game_state_for_player(
-                player,
-                member.id,
-                ctx.guild.id,
-                actual_character_name,  # Use the character's actual name, not the lookup parameter
-            )
-            if not state:
-                # This should never happen if character lookup worked, but handle it anyway
-                logger.error("CRITICAL: Character found but state creation failed for %s with character %s", member.id, character_name)
-                await ctx.reply(f"❌ Error: Failed to create state for character '{character_name}'. Assignment not completed.", mention_author=False)
-                return
-            
-            # CRITICAL: Force state to use the correct character name BEFORE storing
-            # This ensures state.character_name ALWAYS matches player.character_name
-            if state.character_name != actual_character_name:
-                logger.warning("State character_name mismatch during assignment! Expected '%s', got '%s'. Fixing...", 
-                            actual_character_name, state.character_name)
-                # Force correct character name
-                state.character_name = actual_character_name
-                # Also update character_folder and avatar_path to match
-                if character:
-                    state.character_folder = character.folder
-                    state.character_avatar_path = character.avatar_path
-                    state.character_message = character.message or ""
-            
-            # Store the new state (this replaces any old state)
-            game_state.player_states[member.id] = state
-            logger.info("Assigned character '%s' (lookup: '%s') to player %s (user_id=%s). State stored with character_name='%s'", 
-                       actual_character_name, character_name, member.display_name, member.id, state.character_name)
-            
-            # Final verification - state MUST match player
-            if state.character_name != actual_character_name or player.character_name != actual_character_name:
-                logger.error("CRITICAL: Final verification failed! player.character_name='%s', state.character_name='%s', actual_character_name='%s'", 
-                            player.character_name, state.character_name, actual_character_name)
-                # Force everything to match
-                player.character_name = actual_character_name
-                state.character_name = actual_character_name
-                game_state.player_states[member.id] = state
-            
-            # If GM was assigned as a player, remove narrator role
-            if member.id == game_state.gm_user_id and game_state.narrator_user_id == member.id:
-                game_state.narrator_user_id = None
-                logger.debug("GM assigned as player, removed narrator role")
-            
-            # Call pack's on_character_assigned if it exists
-            pack = get_game_pack(game_state.game_type, self.packs_dir)
-            if pack and pack.has_function("on_character_assigned"):
-                pack.call("on_character_assigned", game_state, player, character_name)
-            
-            await self._save_game_state(game_state)
-            
-            # Update board to show the new token
-            await self._update_board(game_state, error_channel=ctx.channel)
-            
-            # CRITICAL: Send transformation message as TEXT (from bot, NOT from narrator VN panel)
-            # This is the "roll" announcement - player becomes the character!
-            # The player can then type messages which will show as the character
-            # Bot text messages should NOT be deleted!
-            
-            # Send transformation message as TEXT (like VN roll does) - from bot, not character, not narrator
-            try:
-                from tfbot.utils import member_profile_name
+            # Try to resolve if member is None but we have a token
+            # This will be handled by bot.py passing the resolved member, but we can also try here
+                if resolved_member.id not in game_state.players:
+                    await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
+                    return
                 
-                # Get helper functions via lazy import
+                # Get list of available characters from CHARACTER_BY_NAME
                 import sys
-                bot_module = sys.modules.get('bot') or sys.modules.get('__main__')
-                _format_character_message = getattr(bot_module, '_format_character_message', None)
-                _get_magic_emoji = getattr(bot_module, '_get_magic_emoji', None)
-                _format_special_reroll_hint = getattr(bot_module, '_format_special_reroll_hint', None)
+                bot_module = sys.modules.get('bot')
+                if not bot_module:
+                    await ctx.reply("Failed to access character list.", mention_author=False)
+                    return
                 
-                # Format transformation message EXACTLY like VN roll does
-                original_name = member_profile_name(member)
-                character_message = character.message or ""
-                duration_label = "Game"
+                CHARACTER_BY_NAME = getattr(bot_module, 'CHARACTER_BY_NAME', None)
+                if not CHARACTER_BY_NAME:
+                    await ctx.reply("Character list not available.", mention_author=False)
+                    return
                 
-                if _format_character_message:
-                    response_text = _format_character_message(
-                        character_message,
-                        original_name,
-                        member.mention,
-                        duration_label,
-                        actual_character_name,
-                    )
-                else:
-                    # Fallback if function not available
-                    response_text = f"{original_name} becomes **{actual_character_name}**!"
+                # Get all available character names
+                available_characters = list(CHARACTER_BY_NAME.keys())
+                if not available_characters:
+                    await ctx.reply("No characters available for reroll.", mention_author=False)
+                    return
                 
-                # Add special hint if available (like VN roll does)
-                if _format_special_reroll_hint:
-                    special_hint = _format_special_reroll_hint(actual_character_name, character.folder if character else None)
-                    if special_hint:
-                        response_text = f"{response_text}\n{special_hint}"
+                # Randomly select a character
+                old_character = game_state.players[resolved_member.id].character_name
+                new_character = random.choice(available_characters)
                 
-                # Add emoji prefix (like VN roll does)
-                if _get_magic_emoji and ctx.guild:
-                    emoji_prefix = _get_magic_emoji(ctx.guild)
-                    response_text = f"{emoji_prefix} {response_text}"
+                # CRITICAL: Only modify game state, never global state
+                game_state.players[resolved_member.id].character_name = new_character
+                # Note: Auto-save removed - use !savegame to save manually
                 
-                # Send as TEXT message (from bot) - this is the transformation announcement
-                # CRITICAL: This message should NOT be deleted!
-                await ctx.reply(response_text, mention_author=False)
-                logger.info("Assignment transformation message sent as TEXT for %s as %s", member.display_name, actual_character_name)
-                
-            except Exception as msg_exc:
-                logger.exception("Error sending assignment transformation message: %s", msg_exc)
-                # Fallback to simple text message
-                await ctx.reply(f"✅ {member.display_name} becomes **{actual_character_name}**!", mention_author=False)
-            
-            await self._log_action(game_state, f"{member.display_name} assigned character: {character_name}")
-            logger.info("Successfully assigned character %s to %s", character_name, member.id)
-        except Exception as exc:
-            logger.exception("Error in command_assign: %s", exc)
-            # Get a more useful error message
-            error_type = type(exc).__name__
-            error_msg = str(exc)
-            # If error message is just a number (like a user ID), provide more context
-            if error_msg.isdigit() or (error_msg and len(error_msg) > 10 and error_msg.replace('-', '').isdigit()):
-                error_msg = f"{error_type}: {error_msg}"
-            if not error_msg or error_msg == "None":
-                error_msg = f"{error_type} occurred"
-            await ctx.reply(f"❌ Error assigning character: {error_msg}", mention_author=False)
-
-    async def command_reroll(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-        """Randomly reroll a player's character (GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+                await ctx.reply(
+                    f"Rerolled {resolved_member.mention}'s character from {old_character or 'none'} to {new_character}.",
+                    mention_author=False
+                )
+                await self._log_action(game_state, f"{resolved_member.display_name} rerolled from {old_character} to {new_character}")
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can reroll characters.", mention_author=False)
-            return
-        
-        if not member:
-            await ctx.reply("Usage: `!reroll @user`", mention_author=False)
-            return
-        
-        if member.id not in game_state.players:
-            await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
-            return
-        
-        # Get list of available characters from CHARACTER_BY_NAME
-        import sys
-        bot_module = sys.modules.get('bot')
-        if not bot_module:
-            await ctx.reply("Failed to access character list.", mention_author=False)
-            return
-        
-        CHARACTER_BY_NAME = getattr(bot_module, 'CHARACTER_BY_NAME', None)
-        if not CHARACTER_BY_NAME:
-            await ctx.reply("Character list not available.", mention_author=False)
-            return
-        
-        # Get all available character names
-        available_characters = list(CHARACTER_BY_NAME.keys())
-        if not available_characters:
-            await ctx.reply("No characters available for reroll.", mention_author=False)
-            return
-        
-        # Randomly select a character
-        old_character = game_state.players[member.id].character_name
-        new_character = random.choice(available_characters)
-        
-        # CRITICAL: Only modify game state, never global state
-        game_state.players[member.id].character_name = new_character
-        await self._save_game_state(game_state)
-        
-        await ctx.reply(
-            f"Rerolled {member.mention}'s character from {old_character or 'none'} to {new_character}.",
-            mention_author=False
-        )
-        await self._log_action(game_state, f"{member.display_name} rerolled from {old_character} to {new_character}")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_swap(self, ctx: commands.Context, member1: Optional[discord.Member] = None, member2: Optional[discord.Member] = None) -> None:
         """Swap characters between two players (GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can swap characters.", mention_author=False)
+                return
+            
+            if not member1 or not member2:
+                await ctx.reply("Usage: `!swap @user1 @user2`", mention_author=False)
+                return
+            
+            if member1.id not in game_state.players or member2.id not in game_state.players:
+                await ctx.reply("Both players must be in the game.", mention_author=False)
+                return
+            
+            # Swap characters
+            char1 = game_state.players[member1.id].character_name
+            char2 = game_state.players[member2.id].character_name
+            game_state.players[member1.id].character_name = char2
+            game_state.players[member2.id].character_name = char1
+            
+            # Note: Auto-save removed - use !savegame to save manually
+            await ctx.reply(f"Swapped characters: {member1.mention} ↔ {member2.mention}", mention_author=False)
+            await self._log_action(game_state, f"{member1.display_name} and {member2.display_name} swapped characters")
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can swap characters.", mention_author=False)
-            return
-        
-        if not member1 or not member2:
-            await ctx.reply("Usage: `!swap @user1 @user2`", mention_author=False)
-            return
-        
-        if member1.id not in game_state.players or member2.id not in game_state.players:
-            await ctx.reply("Both players must be in the game.", mention_author=False)
-            return
-        
-        # Swap characters
-        char1 = game_state.players[member1.id].character_name
-        char2 = game_state.players[member2.id].character_name
-        game_state.players[member1.id].character_name = char2
-        game_state.players[member2.id].character_name = char1
-        
-        await self._save_game_state(game_state)
-        await ctx.reply(f"Swapped characters: {member1.mention} ↔ {member2.mention}", mention_author=False)
-        await self._log_action(game_state, f"{member1.display_name} and {member2.display_name} swapped characters")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_movetoken(self, ctx: commands.Context, member: Optional[discord.Member] = None, *, position: str = "") -> None:
-        """Move a player's token (GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+        """Move a player's token (GM only). Supports: !movetoken @user <coord> OR !movetoken character_name <coord> OR !movetoken character_folder <coord>"""
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can move tokens.", mention_author=False)
+                return
+            
+            # If member not provided, try to resolve from position (first token)
+            resolved_member = member
+            position_value = position.strip()
+            
+            if not resolved_member and position_value:
+                # Try to parse: !movetoken target position
+                tokens = position_value.split(None, 1)  # Split into max 2 parts
+                if len(tokens) == 2:
+                    # Format: !movetoken target position
+                    target_token = tokens[0]
+                    position_value = tokens[1]
+                    resolved_member = self._resolve_target_member(ctx, game_state, target_token)
+                    if not resolved_member:
+                        await ctx.reply(f"Could not find player '{target_token}'. Use `@user`, character name, or character folder.", mention_author=False)
+                        return
+                else:
+                    # Only one token - could be target or position
+                    # Try to resolve as target first
+                    resolved_member = self._resolve_target_member(ctx, game_state, tokens[0])
+                    if resolved_member:
+                        # Successfully resolved as target, but no position specified
+                        await ctx.reply("Usage: `!movetoken @user <coord>` or `!movetoken character_name <coord>` or `!movetoken character_folder <coord>` (e.g., `!movetoken @user A1`)", mention_author=False)
+                        return
+                    # Not a target, so it's the position (but we need a target)
+                    await ctx.reply("Usage: `!movetoken @user <coord>` or `!movetoken character_name <coord>` or `!movetoken character_folder <coord>` (e.g., `!movetoken @user A1`)", mention_author=False)
+                    return
+            
+            if not resolved_member or not position_value:
+                await ctx.reply("Usage: `!movetoken @user <coord>` or `!movetoken character_name <coord>` or `!movetoken character_folder <coord>` (e.g., `!movetoken @user A1`)", mention_author=False)
+                return
+            
+            if resolved_member.id not in game_state.players:
+                await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
+                return
+            
+            position_value = position_value.strip().upper()
+            game_config = self.get_game_config(game_state.game_type)
+            if not game_config:
+                await ctx.reply("Game configuration not found.", mention_author=False)
+                return
+            
+            # Validate coordinate using core validation
+            if not validate_coordinate(position_value, game_config):
+                await ctx.reply(f"Invalid coordinate: `{position_value}`. Check bounds and blocked cells.", mention_author=False)
+                return
+            
+            # Validate move using pack-specific validation (if available)
+            pack = get_game_pack(game_state.game_type, self.packs_dir)
+            if pack and pack.has_function("validate_move"):
+                is_valid, error_msg = pack.call("validate_move", game_state, game_state.players[resolved_member.id], position_value, game_config)
+                if not is_valid:
+                    await ctx.reply(error_msg or f"Invalid move: `{position_value}`", mention_author=False)
+                    return
+            
+            old_pos = game_state.players[resolved_member.id].grid_position
+            game_state.players[resolved_member.id].grid_position = position_value
+            
+            # CRITICAL: Update tile_numbers in game data to match GM movement
+            # This ensures GM movement persists through dice rolls
+            pack = get_game_pack(game_state.game_type, self.packs_dir)
+            if pack and hasattr(pack.module, 'alphanumeric_to_tile_number'):
+                # Get the function from the pack module
+                alphanumeric_to_tile_number = getattr(pack.module, 'alphanumeric_to_tile_number')
+                tile_number = alphanumeric_to_tile_number(position_value, game_config)
+                if tile_number is not None:
+                    # Update game data tile_numbers - use pack's get_game_data function
+                    if hasattr(pack.module, 'get_game_data'):
+                        get_game_data = getattr(pack.module, 'get_game_data')
+                        data = get_game_data(game_state)
+                        data['tile_numbers'][resolved_member.id] = tile_number
+                        logger.info("Updated tile_number for player %s to %d (GM movement to %s)", resolved_member.id, tile_number, position_value)
+                    else:
+                        logger.warning("Pack %s does not have get_game_data function, cannot update tile_numbers", game_state.game_type)
+            
+            # Check if pack wants board update on move
+            should_update = True
+            if pack and pack.has_function("should_update_board"):
+                should_update = pack.call("should_update_board", game_state, "move")
+            
+            if should_update:
+                await self._update_board(game_state, error_channel=ctx.channel)
+            await ctx.reply(f"Moved {resolved_member.mention}'s token from {old_pos} to {position_value}.", mention_author=False)
+            await self._log_action(game_state, f"{resolved_member.display_name} token moved to {position_value}")
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can move tokens.", mention_author=False)
-            return
-        
-        if not member or not position:
-            await ctx.reply("Usage: `!movetoken @user <coord>` (e.g., `!movetoken @user A1`)", mention_author=False)
-            return
-        
-        if member.id not in game_state.players:
-            await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
-            return
-        
-        position = position.strip().upper()
-        game_config = self.get_game_config(game_state.game_type)
-        if not game_config:
-            await ctx.reply("Game configuration not found.", mention_author=False)
-            return
-        
-        if not validate_coordinate(position, game_config):
-            await ctx.reply(f"Invalid coordinate: `{position}`. Check bounds and blocked cells.", mention_author=False)
-            return
-        
-        old_pos = game_state.players[member.id].grid_position
-        game_state.players[member.id].grid_position = position
-        await self._save_game_state(game_state)
-        await self._update_board(game_state, error_channel=ctx.channel)
-        await ctx.reply(f"Moved {member.mention}'s token from {old_pos} to {position}.", mention_author=False)
-        await self._log_action(game_state, f"{member.display_name} token moved to {position}")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_dice(self, ctx: commands.Context, target_player: Optional[discord.Member] = None) -> None:
         """
@@ -1796,254 +2704,456 @@ class GameBoardManager:
         
         GM can use: !dice @playername to force a roll for that player (skips turn order).
         """
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if game_state.is_locked:
-            await ctx.reply("Game is locked.", mention_author=False)
-            return
-        
-        # Check if GM is forcing a roll for another player
-        is_gm_override = False
-        if target_player and self._is_gm(ctx.author, game_state):
-            # GM override - roll for the target player
-            if target_player.id not in game_state.players:
-                await ctx.reply(f"{target_player.display_name} is not in this game.", mention_author=False)
-                return
-            player = game_state.players[target_player.id]
-            is_gm_override = True
-        else:
-            # Normal player roll
-            if ctx.author.id not in game_state.players:
-                await ctx.reply("You're not in this game.", mention_author=False)
-                return
-            player = game_state.players[ctx.author.id]
-        
-        game_config = self.get_game_config(game_state.game_type)
-        if not game_config:
-            await ctx.reply("Game configuration not found.", mention_author=False)
-            return
-        
-        dice_count = int(game_config.dice.get("count", 1))
-        dice_faces = int(game_config.dice.get("faces", 6))
-        
-        rolls = [random.randint(1, dice_faces) for _ in range(dice_count)]
-        total = sum(rolls)
-        
-        if dice_count == 1:
-            result = f"Rolled: **{rolls[0]}**"
-        else:
-            rolls_str = ", ".join(str(r) for r in rolls)
-            result = f"Rolled: {rolls_str} = **{total}**"
-        
-        auto_move_requested = False
-        turn_complete_requested = False
-        summary_msg = None
-
-        # Call pack's on_dice_rolled if it exists
-        pack = get_game_pack(game_state.game_type, self.packs_dir)
-        if pack and pack.has_function("on_dice_rolled"):
-            pack_result = pack.call("on_dice_rolled", game_state, player, total, game_config)
-            if pack_result:
-                # Unpack new return signature: (message, should_auto_move, transformation_char, is_turn_complete)
-                if len(pack_result) == 4:
-                    pack_msg, should_auto_move, transformation_char, is_turn_complete = pack_result
-                elif len(pack_result) == 2:
-                    # Legacy format for backwards compatibility
-                    pack_msg, should_auto_move = pack_result
-                    transformation_char = None
-                    is_turn_complete = False
+        async def _impl():
+            # CRITICAL: Wrap entire function in try-except to prevent crashes
+            try:
+                game_state = await self._get_game_state_for_context(ctx)
+                if not game_state:
+                    await ctx.reply("No active game in this thread.", mention_author=False)
+                    return
+                
+                if game_state.is_locked:
+                    await ctx.reply("Game is locked.", mention_author=False)
+                    return
+                
+                # Check if GM is forcing a roll for another player
+                is_gm_override = False
+                is_gm = self._is_gm(ctx.author, game_state)
+                
+                if target_player and is_gm:
+                    # GM override - roll for the target player (bypasses game_started check)
+                    if target_player.id not in game_state.players:
+                        await ctx.reply(f"{target_player.display_name} is not in this game.", mention_author=False)
+                        return
+                    player = game_state.players[target_player.id]
+                    is_gm_override = True
+                elif is_gm and not target_player:
+                    # GM rolling for themselves - check if they're a player
+                    if ctx.author.id in game_state.players:
+                        player = game_state.players[ctx.author.id]
+                        # GM can roll even if game hasn't started
+                        is_gm_override = True
+                    else:
+                        # GM is not a player - they can't roll
+                        await ctx.reply("You're not a player in this game. Use `!dice @player` or `!dice character_name` to roll for a player.", mention_author=False)
+                        return
                 else:
-                    pack_msg = None
-                    should_auto_move = False
-                    transformation_char = None
-                    is_turn_complete = False
+                    # Normal player roll - check if game has started
+                    if not game_state.game_started:
+                        await ctx.reply("⏸️ Game hasn't started yet! The GM needs to use `!start` to begin the game.", mention_author=False)
+                        return
+                    
+                    if ctx.author.id not in game_state.players:
+                        await ctx.reply("You're not in this game.", mention_author=False)
+                        return
+                    player = game_state.players[ctx.author.id]
                 
-                if pack_msg:
-                    result = f"{result}\n{pack_msg}"
+                game_config = self.get_game_config(game_state.game_type)
+                if not game_config:
+                    await ctx.reply("Game configuration not found.", mention_author=False)
+                    return
                 
-                # Apply transformation if needed
-                if transformation_char:
-                    # Create transformation state for the player
-                    state = await self._create_game_state_for_player(
-                        player,
-                        player.user_id,
-                        ctx.guild.id if ctx.guild else 0,
-                        transformation_char
-                    )
-                    if state:
-                        game_state.player_states[player.user_id] = state
-                        # Send VN panel for transformation
-                        from tfbot.panels import render_vn_panel, parse_discord_formatting, prepare_custom_emoji_images
-                        from tfbot.utils import member_profile_name
+                dice_count = int(game_config.dice.get("count", 1))
+                dice_faces = int(game_config.dice.get("faces", 6))
+                
+                rolls = [random.randint(1, dice_faces) for _ in range(dice_count)]
+                total = sum(rolls)
+                
+                if dice_count == 1:
+                    result = f"Rolled: **{rolls[0]}**"
+                else:
+                    rolls_str = ", ".join(str(r) for r in rolls)
+                    result = f"Rolled: {rolls_str} = **{total}**"
+                
+                auto_move_requested = False
+                turn_complete_requested = False
+                summary_msg = None
+
+                # Call pack's on_dice_rolled if it exists
+                pack = get_game_pack(game_state.game_type, self.packs_dir)
+                if pack and pack.has_function("on_dice_rolled"):
+                    try:
+                        pack_result = pack.call("on_dice_rolled", game_state, player, total, game_config)
+                    except Exception as exc:
+                        logger.exception("CRITICAL: Error in pack.on_dice_rolled: %s", exc)
+                        try:
+                            await ctx.reply(f"❌ Error processing dice roll: {exc}", mention_author=False)
+                        except Exception:
+                            pass
+                        return
+                    if pack_result:
+                        # Unpack new return signature: (message, should_auto_move, transformation_char, is_turn_complete)
+                        if len(pack_result) == 4:
+                            pack_msg, should_auto_move, transformation_char, is_turn_complete = pack_result
+                        elif len(pack_result) == 2:
+                            # Legacy format for backwards compatibility
+                            pack_msg, should_auto_move = pack_result
+                            transformation_char = None
+                            is_turn_complete = False
+                        else:
+                            pack_msg = None
+                            should_auto_move = False
+                            transformation_char = None
+                            is_turn_complete = False
                         
-                        # Format transformation message like VN roll
-                        import sys
-                        bot_module = sys.modules.get('bot') or sys.modules.get('__main__')
-                        _format_character_message = getattr(bot_module, '_format_character_message', None)
-                        _get_magic_emoji = getattr(bot_module, '_get_magic_emoji', None)
+                        if pack_msg:
+                            result = f"{result}\n{pack_msg}"
                         
-                        if _format_character_message and state.character_name:
-                            transform_msg = _format_character_message(
-                                state.character_name,
-                                player.character_name if hasattr(player, 'character_name') else None,
-                                _get_magic_emoji() if _get_magic_emoji else ""
+                        # Apply transformation if needed
+                        if transformation_char:
+                            # Create transformation state for the player
+                            state = await self._create_game_state_for_player(
+                                player,
+                                player.user_id,
+                                ctx.guild.id if ctx.guild else 0,
+                                transformation_char
                             )
-                        else:
-                            transform_msg = f"Transformed to {transformation_char}!"
+                            if state:
+                                game_state.player_states[player.user_id] = state
+                                # Send VN panel for transformation
+                                from tfbot.panels import render_vn_panel, parse_discord_formatting, prepare_custom_emoji_images
+                                from tfbot.utils import member_profile_name
+                                
+                                # Format transformation message like VN roll
+                                import sys
+                                bot_module = sys.modules.get('bot') or sys.modules.get('__main__')
+                                _format_character_message = getattr(bot_module, '_format_character_message', None)
+                                _get_magic_emoji = getattr(bot_module, '_get_magic_emoji', None)
+                                
+                                if _format_character_message and state.character_name:
+                                    transform_msg = _format_character_message(
+                                        state.character_name,
+                                        player.character_name if hasattr(player, 'character_name') else None,
+                                        _get_magic_emoji() if _get_magic_emoji else ""
+                                    )
+                                else:
+                                    transform_msg = f"Transformed to {transformation_char}!"
+                                
+                                formatted_segments = parse_discord_formatting(transform_msg)
+                                custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
+                                
+                                vn_file = render_vn_panel(
+                                    state=state,
+                                    message_content=transform_msg,
+                                    character_display_name=state.character_name,
+                                    original_name=member_profile_name(ctx.guild.get_member(player.user_id)) if ctx.guild else f"User {player.user_id}",
+                                    attachment_id=str(ctx.message.id),
+                                    formatted_segments=formatted_segments,
+                                    custom_emoji_images=custom_emoji_images,
+                                    reply_context=None,
+                                )
+                                
+                                if vn_file:
+                                    await ctx.channel.send(files=[vn_file], allowed_mentions=discord.AllowedMentions.none())
+                                else:
+                                    # Fallback to text
+                                    await ctx.channel.send(transform_msg, allowed_mentions=discord.AllowedMentions.none())
                         
-                        formatted_segments = parse_discord_formatting(transform_msg)
-                        custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
+                        if should_auto_move:
+                            auto_move_requested = True
                         
-                        vn_file = render_vn_panel(
-                            state=state,
-                            message_content=transform_msg,
-                            character_display_name=state.character_name,
-                            original_name=member_profile_name(ctx.guild.get_member(player.user_id)) if ctx.guild else f"User {player.user_id}",
-                            attachment_id=str(ctx.message.id),
-                            formatted_segments=formatted_segments,
-                            custom_emoji_images=custom_emoji_images,
-                            reply_context=None,
-                        )
-                        
-                        if vn_file:
-                            await ctx.channel.send(files=[vn_file], allowed_mentions=discord.AllowedMentions.none())
-                        else:
-                            # Fallback to text
-                            await ctx.channel.send(transform_msg, allowed_mentions=discord.AllowedMentions.none())
+                        # Handle turn completion
+                        if is_turn_complete:
+                            turn_complete_requested = True
+                            # Get turn summary from pack
+                            if pack and pack.has_function("get_turn_summary"):
+                                summary_msg = pack.call("get_turn_summary", game_state, game_config)
+
+                # Get player number from player_numbers dict (based on add order)
+                player_number = self._get_player_number(game_state, player.user_id)
+                player_number_text = f" (Player {player_number})" if player_number else ""
                 
-                if should_auto_move:
-                    auto_move_requested = True
+                # Build embed with roll result and player's current board position
+                embed_color = discord.Color.random()
+                player_position = player.grid_position or "Unknown"
+                embed_description = f"{result}\n\n**New Position:** `{player_position}`"
+                roll_embed = discord.Embed(
+                    title=f"Dice Roll{player_number_text}",
+                    description=embed_description,
+                    color=embed_color,
+                )
+                face_file = None
+                face_attachment_url = None
+                if player.character_name:
+                    face_path = _resolve_face_cache_path(player.character_name)
+                    if face_path and face_path.exists():
+                        face_filename = f"dice_face_{player.user_id}.png"
+                        face_file = discord.File(face_path, filename=face_filename)
+                        face_attachment_url = f"attachment://{face_filename}"
+                        roll_embed.set_thumbnail(url=face_attachment_url)
+                        roll_embed.set_author(name=player.character_name, icon_url=face_attachment_url)
+                if not face_file:
+                    player_member = None
+                    if ctx.guild:
+                        if isinstance(ctx.channel, discord.Thread):
+                            player_member = ctx.channel.guild.get_member(player.user_id)
+                        else:
+                            player_member = ctx.guild.get_member(player.user_id)
+                    if player_member:
+                        avatar_url = player_member.display_avatar.url
+                        roll_embed.set_author(name=player_member.display_name, icon_url=avatar_url)
+                        roll_embed.set_thumbnail(url=avatar_url)
+                    else:
+                        roll_embed.set_author(name=getattr(ctx.author, "display_name", "Dice Roller"))
+                reply_kwargs = {
+                    "embed": roll_embed,
+                    "mention_author": False,
+                }
+                if face_file:
+                    reply_kwargs["file"] = face_file
+                try:
+                    await ctx.reply(**reply_kwargs)
+                except Exception as exc:
+                    logger.exception("CRITICAL: Error sending dice roll reply: %s", exc)
+                    return
+
+                # Update board(s) and handle summaries after showing the roll result
+                # CRITICAL: Only update board ONCE per dice roll
+                # - If turn completes: Update ONCE at turn end (includes movement)
+                # - If turn doesn't complete but player moved: Update ONCE for movement
+                has_separate_map_thread = bool(
+                    game_state.map_thread_id
+                    and game_state.game_thread_id
+                    and game_state.map_thread_id != game_state.game_thread_id
+                )
                 
-                # Handle turn completion
-                if is_turn_complete:
-                    turn_complete_requested = True
-                    # Get turn summary from pack
-                    if pack and pack.has_function("get_turn_summary"):
-                        summary_msg = pack.call("get_turn_summary", game_state, game_config)
+                # Check for win condition and game end (stored in pack data by on_dice_rolled)
+                game_ended = False
+                has_winners = False
+                if pack and hasattr(game_state, '_pack_data'):
+                    pack_data = game_state._pack_data
+                    game_ended = pack_data.get('game_ended', False)
+                    winners = pack_data.get('winners', [])
+                    has_winners = len(winners) > 0
+                
+                # CRITICAL: Only update board ONCE per dice roll
+                if turn_complete_requested:
+                    # Turn is completing - update board ONCE at end of turn (includes all movement)
+                    if summary_msg:
+                        await ctx.channel.send(summary_msg, allowed_mentions=discord.AllowedMentions.none())
+                    if pack and pack.has_function("advance_turn"):
+                        pack.call("advance_turn", game_state)
+                    
+                    # Increment turn count and auto-save at end of turn
+                    game_state.turn_count += 1
+                    await self._save_auto_save(game_state, ctx)
+                    logger.info("Turn %d completed, auto-save created", game_state.turn_count)
+                    
+                    # Update board ONCE at end of turn (this includes all movement from the turn)
+                    # CRITICAL: Always post to game thread at turn end for visibility
+                    also_post_to_game = True  # Always show board in game thread at turn end
+                    try:
+                        await self._update_board(game_state, error_channel=ctx.channel, target_thread="map", also_post_to_game=also_post_to_game)
+                        if game_ended:
+                            logger.info("Board updated at end of turn %d - game ended", game_state.turn_count)
+                        elif has_winners:
+                            logger.info("Board updated at end of turn %d - winner(s) detected", game_state.turn_count)
+                        else:
+                            logger.info("Board updated at end of turn %d", game_state.turn_count)
+                    except Exception as exc:
+                        logger.exception("CRITICAL: Error updating board at turn end: %s", exc)
+                        try:
+                            await ctx.reply("❌ Error updating board. The turn was processed, but the board may not have updated.", mention_author=False)
+                        except Exception:
+                            pass
+                elif auto_move_requested:
+                    # Turn not completing but player moved - update board ONCE for movement
+                    # CRITICAL: Always post to game thread when player moves (for visibility)
+                    target_thread = "map" if has_separate_map_thread else "game"
+                    also_post_to_game = True  # Always show board in game thread when player moves
+                    try:
+                        await self._update_board(game_state, error_channel=ctx.channel, target_thread=target_thread, also_post_to_game=also_post_to_game)
+                        logger.info("Board updated after movement (turn not complete)")
+                    except Exception as exc:
+                        logger.exception("CRITICAL: Error updating board after movement: %s", exc)
+                        try:
+                            await ctx.reply("❌ Error updating board. The roll was processed, but the board may not have updated.", mention_author=False)
+                        except Exception:
+                            pass
+                
+                try:
+                    await self._log_action(game_state, f"{ctx.author.display_name} rolled {result}")
+                except Exception as exc:
+                    logger.exception("Error logging dice roll action: %s", exc)
+            except Exception as exc:
+                # CRITICAL: Catch any unhandled exceptions in the entire function to prevent crashes
+                logger.exception("CRITICAL: Unhandled error in command_dice: %s", exc)
+                try:
+                    await ctx.reply("❌ An unexpected error occurred during the dice roll. The roll may have been processed, but some features may not have worked correctly.", mention_author=False)
+                except Exception:
+                    pass
+        
+        # CRITICAL: Use command lock to prevent concurrent execution and ensure proper ordering
+        # This ensures player commands don't interrupt GM commands and board updates happen in order
+        if isinstance(ctx.channel, discord.Thread):
+            thread_id = ctx.channel.id
+            command_lock = self._get_command_lock(thread_id)
+            
+            # Check if lock is already held (GM command is processing)
+            if command_lock.locked():
+                logger.debug("Blocking player dice command from %s - GM command is processing", ctx.author.id)
+                await ctx.reply("⏸️ A command is currently processing. Please wait until it completes and the board is shown.", mention_author=False)
+                return
+            
+            # Acquire lock and execute - this ensures all messages from this command appear in order
+            async with command_lock:
+                await _impl()
+        else:
+            # Not in a thread, execute without lock
+            await _impl()
 
-        # Build embed with roll result and player's current board position
-        embed_color = discord.Color.random()
-        player_position = player.grid_position or "Unknown"
-        embed_description = f"{result}\n\n**New Position:** `{player_position}`"
-        roll_embed = discord.Embed(
-            title="Dice Roll",
-            description=embed_description,
-            color=embed_color,
-        )
-        face_file = None
-        face_attachment_url = None
-        if player.character_name:
-            face_path = _resolve_face_cache_path(player.character_name)
-            if face_path and face_path.exists():
-                face_filename = f"dice_face_{player.user_id}.png"
-                face_file = discord.File(face_path, filename=face_filename)
-                face_attachment_url = f"attachment://{face_filename}"
-                roll_embed.set_thumbnail(url=face_attachment_url)
-                roll_embed.set_author(name=player.character_name, icon_url=face_attachment_url)
-        if not face_file:
-            player_member = None
-            if ctx.guild:
-                if isinstance(ctx.channel, discord.Thread):
-                    player_member = ctx.channel.guild.get_member(player.user_id)
-                else:
-                    player_member = ctx.guild.get_member(player.user_id)
-            if player_member:
-                avatar_url = player_member.display_avatar.url
-                roll_embed.set_author(name=player_member.display_name, icon_url=avatar_url)
-                roll_embed.set_thumbnail(url=avatar_url)
-            else:
-                roll_embed.set_author(name=getattr(ctx.author, "display_name", "Dice Roller"))
-        reply_kwargs = {
-            "embed": roll_embed,
-            "mention_author": False,
-        }
-        if face_file:
-            reply_kwargs["file"] = face_file
-        await ctx.reply(**reply_kwargs)
-
-        # Update board(s) and handle summaries after showing the roll result
-        board_posted_to_game = False
-        has_separate_map_thread = bool(
-            game_state.map_thread_id
-            and game_state.game_thread_id
-            and game_state.map_thread_id != game_state.game_thread_id
-        )
-        if auto_move_requested:
-            target_thread = "map" if has_separate_map_thread else "game"
-            await self._update_board(game_state, error_channel=ctx.channel, target_thread=target_thread)
-            if target_thread == "game":
-                board_posted_to_game = True
-            await self._save_game_state(game_state)
-
-        if turn_complete_requested:
-            if summary_msg and not board_posted_to_game:
-                await self._update_board(game_state, error_channel=ctx.channel, target_thread="game")
-                board_posted_to_game = True
-            if summary_msg:
-                await ctx.channel.send(summary_msg, allowed_mentions=discord.AllowedMentions.none())
-            if pack and pack.has_function("advance_turn"):
-                pack.call("advance_turn", game_state)
-            await self._save_game_state(game_state)
-        await self._log_action(game_state, f"{ctx.author.display_name} rolled {result}")
+    async def command_start(self, ctx: commands.Context) -> None:
+        """Start the game - render board and allow dice rolls (GM only)."""
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can start the game.", mention_author=False)
+                return
+        
+            if game_state.is_locked:
+                await ctx.reply("Game is locked and cannot be started.", mention_author=False)
+                return
+            
+            if game_state.game_started:
+                await ctx.reply("Game has already started! Use `!endgame` to end it first.", mention_author=False)
+                return
+            
+            # Check if there are any players with assigned characters
+            players_with_characters = [p for p in game_state.players.values() if p.character_name]
+            if not players_with_characters:
+                await ctx.reply("⚠️ No players have been assigned characters yet. Assign characters before starting the game.", mention_author=False)
+                return
+        
+            # Mark game as started
+            game_state.game_started = True
+            
+            # Send "Starting game..." message first
+            await ctx.reply("Starting game...", mention_author=False)
+            
+            # Send start message
+            player_count = len(players_with_characters)
+            player_list = ", ".join([f"**{p.character_name}**" for p in players_with_characters])
+            await ctx.reply(
+                f"🎮 **Game Started!**\n\n"
+                f"Players ready ({player_count}): {player_list}\n\n"
+                f"Turn 1 can now begin! Players can use `!dice` to roll.",
+                mention_author=False
+            )
+            
+            # Determine if we have separate map thread
+            has_separate_map_thread = bool(
+                game_state.map_thread_id
+                and game_state.game_thread_id
+                and game_state.map_thread_id != game_state.game_thread_id
+            )
+            
+            # Always post to map forum, and also post to game thread for visibility at game start
+            # Map follows text messages
+            await self._update_board(game_state, error_channel=ctx.channel, target_thread="map", also_post_to_game=has_separate_map_thread)
+            
+            await self._log_action(game_state, f"Game started by {ctx.author.display_name} with {player_count} players")
+            logger.info("Game started: %d players ready, turn 1 can begin", player_count)
+        
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_endgame(self, ctx: commands.Context) -> None:
         """End the current game and lock the thread (GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
-        
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can end games.", mention_author=False)
-            return
-        
-        game_state.is_locked = True
-        await self._save_game_state(game_state)
-        
-        # Lock the thread
-        if isinstance(ctx.channel, discord.Thread):
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can end games.", mention_author=False)
+                return
+            
+            game_state.is_locked = True
+            # Note: Auto-save removed - use !savegame to save manually
+            
+            # Unfollow both threads for the GM (no pings/notifications)
+            logger.info("command_endgame: Auto-unfollowing threads for GM %s", ctx.author.id)
+            
+            # Unfollow game thread for GM
             try:
-                await ctx.channel.edit(locked=True)
-            except discord.HTTPException as exc:
-                logger.warning("Failed to lock thread: %s", exc)
+                await self.bot.http.request(
+                    discord.http.Route('DELETE', '/channels/{channel_id}/thread-members/{user_id}', 
+                                      channel_id=game_state.game_thread_id, user_id=ctx.author.id)
+                )
+                logger.info("command_endgame: Successfully unfollowed game thread %s for GM %s", game_state.game_thread_id, ctx.author.id)
+            except Exception as exc:
+                logger.warning("command_endgame: Failed to unfollow game thread %s: %s", game_state.game_thread_id, exc)
+            
+            # Unfollow map thread for GM
+            try:
+                await self.bot.http.request(
+                    discord.http.Route('DELETE', '/channels/{channel_id}/thread-members/{user_id}', 
+                                      channel_id=game_state.map_thread_id, user_id=ctx.author.id)
+                )
+                logger.info("command_endgame: Successfully unfollowed map thread %s for GM %s", game_state.map_thread_id, ctx.author.id)
+            except Exception as exc:
+                logger.warning("command_endgame: Failed to unfollow map thread %s: %s", game_state.map_thread_id, exc)
+            
+            # Lock the thread
+            if isinstance(ctx.channel, discord.Thread):
+                try:
+                    await ctx.channel.edit(locked=True)
+                except discord.HTTPException as exc:
+                    logger.warning("Failed to lock thread: %s", exc)
+            
+            await ctx.reply("Game ended. Thread locked.", mention_author=False)
+            await self._log_action(game_state, f"Game ended by {ctx.author.display_name}")
         
-        await ctx.reply("Game ended. Thread locked.", mention_author=False)
-        await self._log_action(game_state, f"Game ended by {ctx.author.display_name}")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_removeplayer(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-        """Remove a player from the game (GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+        """Remove a player from the game (GM only). Supports: !removeplayer @user OR !removeplayer character_name OR !removeplayer character_folder"""
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can remove players.", mention_author=False)
+                return
+            
+            # If member not provided, we can't resolve from empty args - show usage
+            # (bot.py should handle parsing and pass member, but we can add fallback)
+            resolved_member = member
+            if not resolved_member:
+                await ctx.reply("Usage: `!removeplayer @user` or `!removeplayer character_name` or `!removeplayer character_folder`", mention_author=False)
+                return
+            
+            # Try to resolve if member is None (would need args parsing in bot.py)
+            # For now, just use the provided member
+            
+            if resolved_member.id not in game_state.players:
+                await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
+                return
+            
+            del game_state.players[resolved_member.id]
+            # Note: Auto-save removed - use !savegame to save manually
+            await ctx.reply(f"Removed {resolved_member.mention} from the game.", mention_author=False)
+            await self._log_action(game_state, f"Player {resolved_member.display_name} removed")
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can remove players.", mention_author=False)
-            return
-        
-        if not member:
-            await ctx.reply("Usage: `!removeplayer @user`", mention_author=False)
-            return
-        
-        if member.id not in game_state.players:
-            await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
-            return
-        
-        del game_state.players[member.id]
-        await self._save_game_state(game_state)
-        await ctx.reply(f"Removed {member.mention} from the game.", mention_author=False)
-        await self._log_action(game_state, f"Player {member.display_name} removed")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_bg_list(self, ctx: commands.Context) -> None:
         """List available backgrounds (game-specific, isolated from global VN)."""
@@ -2089,53 +3199,80 @@ class GameBoardManager:
             header = ""  # Only show header once
 
     async def command_bg(self, ctx: commands.Context, target: Optional[discord.Member] = None, *, bg_id: str = "") -> None:
-        """Set background for a player or all players (GM only) - game-specific, isolated."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+        """Set background for a player or all players (GM only). Supports: !bg @user <number> OR !bg character_name <number> OR !bg character_folder <number> OR !bg all <number>"""
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can set backgrounds.", mention_author=False)
+                return
+            
+            bg_id_str = bg_id.strip()
+            if not bg_id_str:
+                await self.command_bg_list(ctx)
+                return
+            
+            # Try to parse: !bg target bg_id OR !bg all bg_id
+            tokens = bg_id_str.split(None, 1)  # Split into max 2 parts
+            resolved_target = target
+            bg_id_value = bg_id_str
+            
+            if not resolved_target and len(tokens) >= 1:
+                first_token = tokens[0].lower()
+                if first_token == "all":
+                    # Format: !bg all <number>
+                    resolved_target = None  # None means "all"
+                    if len(tokens) == 2:
+                        bg_id_value = tokens[1]
+                    else:
+                        await ctx.reply("Usage: `!bg all <number>`", mention_author=False)
+                        return
+                elif len(tokens) == 2:
+                    # Format: !bg target bg_id
+                    target_token = tokens[0]
+                    bg_id_value = tokens[1]
+                    resolved_target = self._resolve_target_member(ctx, game_state, target_token)
+                    if not resolved_target:
+                        await ctx.reply(f"Could not find player '{target_token}'. Use `@user`, character name, character folder, or `all`.", mention_author=False)
+                        return
+            
+            try:
+                bg_id_int = int(bg_id_value)
+            except ValueError:
+                await ctx.reply("Background ID must be a number.", mention_author=False)
+                return
+            
+            # Validate background ID exists
+            from tfbot.panels import list_background_choices
+            choices = list_background_choices()
+            if bg_id_int < 1 or bg_id_int > len(choices):
+                await ctx.reply(f"Background ID must be between 1 and {len(choices)}.", mention_author=False)
+                return
+            
+            # Check if target is None (meaning "all" was passed)
+            if resolved_target is None:
+                # Set for all players (game-specific only, doesn't touch global state)
+                for player in game_state.players.values():
+                    player.background_id = bg_id_int
+                await ctx.reply(f"Set background {bg_id_int} for all players (game VN only).", mention_author=False)
+                await self._log_action(game_state, f"All players background set to {bg_id_int}")
+            elif resolved_target.id in game_state.players:
+                game_state.players[resolved_target.id].background_id = bg_id_int
+                await ctx.reply(f"Set background {bg_id_int} for {resolved_target.mention} (game VN only).", mention_author=False)
+                await self._log_action(game_state, f"{resolved_target.display_name} background set to {bg_id_int}")
+            else:
+                await ctx.reply(f"{resolved_target.mention} is not in the game.", mention_author=False)
+            
+            # Note: Auto-save removed - use !savegame to save manually
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can set backgrounds.", mention_author=False)
-            return
-        
-        bg_id = bg_id.strip()
-        if not bg_id:
-            await self.command_bg_list(ctx)
-            return
-        
-        try:
-            bg_id_int = int(bg_id)
-        except ValueError:
-            await ctx.reply("Background ID must be a number.", mention_author=False)
-            return
-        
-        # Validate background ID exists
-        from tfbot.panels import list_background_choices
-        choices = list_background_choices()
-        if bg_id_int < 1 or bg_id_int > len(choices):
-            await ctx.reply(f"Background ID must be between 1 and {len(choices)}.", mention_author=False)
-            return
-        
-        # Check if target is None (meaning "all" was passed as string)
-        if target is None:
-            # Set for all players (game-specific only, doesn't touch global state)
-            for player in game_state.players.values():
-                player.background_id = bg_id_int
-            await self._save_game_state(game_state)
-            await ctx.reply(f"Set background {bg_id_int} for all players (game VN only).", mention_author=False)
-            await self._log_action(game_state, f"All players background set to {bg_id_int}")
-        elif target.id in game_state.players:
-            game_state.players[target.id].background_id = bg_id_int
-            await self._save_game_state(game_state)
-            await ctx.reply(f"Set background {bg_id_int} for {target.mention} (game VN only).", mention_author=False)
-            await self._log_action(game_state, f"{target.display_name} background set to {bg_id_int}")
-        else:
-            await ctx.reply(f"{target.mention} is not in the game.", mention_author=False)
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_outfit_list(self, ctx: commands.Context, character_name: Optional[str] = None) -> None:
         """List available outfits for a character (game-specific, isolated from global VN)."""
@@ -2171,69 +3308,107 @@ class GameBoardManager:
         await ctx.reply("\n".join(lines) + "\n\nUse `!outfit @user <outfit>` to set.", mention_author=False)
 
     async def command_outfit(self, ctx: commands.Context, member: Optional[discord.Member] = None, *, outfit_name: str = "") -> None:
-        """Set outfit for a player (GM only) - game-specific, isolated from global VN."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
-        
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can set outfits.", mention_author=False)
-            return
-        
-        if not member:
-            # Show list of current players
-            await self.command_outfit_list(ctx)
-            return
-        
-        if not outfit_name:
-            # Show outfits for this player's character
-            if member.id not in game_state.players:
-                await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
+        """Set outfit for a player (GM only). Supports: !outfit @user <outfit> OR !outfit character_name <outfit> OR !outfit character_folder <outfit>"""
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
                 return
-            player = game_state.players[member.id]
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can set outfits.", mention_author=False)
+                return
+            
+            # If member not provided, try to resolve from outfit_name (first token)
+            resolved_member = member
+            outfit_to_set = outfit_name.strip()
+            
+            if not resolved_member and outfit_to_set:
+                # Try to parse: !outfit target outfit
+                tokens = outfit_to_set.split(None, 1)  # Split into max 2 parts
+                if len(tokens) >= 1:
+                    target_token = tokens[0]
+                    if len(tokens) == 2:
+                        # Format: !outfit target outfit_to_set
+                        resolved_member = self._resolve_target_member(ctx, game_state, target_token)
+                        outfit_to_set = tokens[1]
+                    else:
+                        # Only one token - could be target or outfit
+                        # Try to resolve as target first
+                        resolved_member = self._resolve_target_member(ctx, game_state, target_token)
+                        if resolved_member:
+                            # Successfully resolved as target, but no outfit specified - show list
+                            if resolved_member.id not in game_state.players:
+                                await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
+                                return
+                            player = game_state.players[resolved_member.id]
+                            if not player.character_name:
+                                await ctx.reply(f"{resolved_member.mention} doesn't have a character assigned yet.", mention_author=False)
+                                return
+                            await self.command_outfit_list(ctx, character_name=player.character_name)
+                            return
+                        # Not a target, so it's the outfit name (but we need a target)
+                        await ctx.reply("Usage: `!outfit @user <outfit>` or `!outfit character_name <outfit>` or `!outfit character_folder <outfit>`", mention_author=False)
+                        return
+            
+            if not resolved_member:
+                # Show list of current players
+                await self.command_outfit_list(ctx)
+                return
+            
+            if not outfit_to_set:
+                # Show outfits for this player's character
+                if resolved_member.id not in game_state.players:
+                    await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
+                    return
+                player = game_state.players[resolved_member.id]
+                if not player.character_name:
+                    await ctx.reply(f"{resolved_member.mention} doesn't have a character assigned yet.", mention_author=False)
+                    return
+                await self.command_outfit_list(ctx, character_name=player.character_name)
+                return
+            
+            if resolved_member.id not in game_state.players:
+                await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
+                return
+            
+            player = game_state.players[resolved_member.id]
             if not player.character_name:
-                await ctx.reply(f"{member.mention} doesn't have a character assigned yet.", mention_author=False)
+                await ctx.reply(f"{resolved_member.mention} doesn't have a character assigned yet. Use `!assign` first.", mention_author=False)
                 return
-            await self.command_outfit_list(ctx, character_name=player.character_name)
-            return
+            
+            # Set outfit (game-specific only, doesn't touch global vn_outfit_selection)
+            game_state.players[resolved_member.id].outfit_name = outfit_to_set.strip()
+            # Note: Auto-save removed - use !savegame to save manually
+            await ctx.reply(f"Set outfit '{outfit_to_set}' for {resolved_member.mention} (game VN only).", mention_author=False)
+            await self._log_action(game_state, f"{resolved_member.display_name} outfit set to {outfit_to_set}")
         
-        if member.id not in game_state.players:
-            await ctx.reply(f"{member.mention} is not in the game.", mention_author=False)
-            return
-        
-        player = game_state.players[member.id]
-        if not player.character_name:
-            await ctx.reply(f"{member.mention} doesn't have a character assigned yet. Use `!assign` first.", mention_author=False)
-            return
-        
-        # Set outfit (game-specific only, doesn't touch global vn_outfit_selection)
-        game_state.players[member.id].outfit_name = outfit_name.strip()
-        await self._save_game_state(game_state)
-        await ctx.reply(f"Set outfit '{outfit_name}' for {member.mention} (game VN only).", mention_author=False)
-        await self._log_action(game_state, f"{member.display_name} outfit set to {outfit_name}")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_savegame(self, ctx: commands.Context) -> None:
         """Save the current game state (GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can save games.", mention_author=False)
+                return
+            
+            await self._save_game_state(game_state)
+            await ctx.reply("Game state saved.", mention_author=False)
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the GM can save games.", mention_author=False)
-            return
-        
-        await self._save_game_state(game_state)
-        await ctx.reply("Game state saved.", mention_author=False)
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_loadgame(self, ctx: commands.Context, state_file: str = "") -> None:
         """Load a saved game state (GM only)."""
@@ -2311,6 +3486,7 @@ class GameBoardManager:
                 board_message_id=data.get("board_message_id"),
                 is_locked=bool(data.get("is_locked", False)),
                 debug_mode=bool(data.get("debug_mode", False)),
+                game_started=bool(data.get("game_started", False)),  # Default to False for old saves
             )
             
             # Replace active game state in memory
@@ -2355,8 +3531,7 @@ class GameBoardManager:
         rules_text += "**Gameplay:**\n"
         rules_text += "• Roll dice with `!dice` on your turn\n"
         rules_text += "• Move forward by the number rolled\n"
-        rules_text += "• Land on snakes to slide down, ladders to climb up\n"
-        rules_text += "• Transform when landing on colored tiles\n\n"
+        rules_text += "• Land on snakes to slide down, ladders to climb up\n\n"
         
         # Snakes and ladders
         snakes = rules.get("snakes", {})
@@ -2367,28 +3542,6 @@ class GameBoardManager:
                 rules_text += f"• {len(snakes)} snakes on the board (slide down)\n"
             if ladders:
                 rules_text += f"• {len(ladders)} ladders on the board (climb up)\n"
-            rules_text += "\n"
-        
-        # Tile effects (simplified)
-        tile_colors = rules.get("tile_colors", {})
-        if tile_colors:
-            rules_text += "**Tile Effects:**\n"
-            effect_descriptions = {
-                "yellow": "🟡 Random transform",
-                "blue": "🔵 Age change",
-                "dark_blue": "🔵 Age change",
-                "purple": "🟣 Revert to real body",
-                "red": "🔴 Transform other (GM)",
-                "green": "🟢 Body swap (GM)",
-                "orange": "🟠 Gender swap",
-                "pink": "🩷 Mind change"
-            }
-            shown_effects = set()
-            for color, effect in tile_colors.items():
-                if effect not in shown_effects:
-                    desc = effect_descriptions.get(color, f"{effect}")
-                    rules_text += f"• {desc}\n"
-                    shown_effects.add(effect)
             rules_text += "\n"
         
         # Starting position
@@ -2404,76 +3557,82 @@ class GameBoardManager:
 
     async def command_debug(self, ctx: commands.Context) -> None:
         """Toggle debug mode on/off (Admin & GM only). Shows coordinate labels on board."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            # Check if user is admin or GM
+            is_admin_user = is_admin(ctx.author)
+            is_gm = self._is_gm(ctx.author, game_state)
+            
+            if not (is_admin_user or is_gm):
+                await ctx.reply("Only admins and GMs can toggle debug mode.", mention_author=False)
+                return
+            
+            # Toggle debug mode
+            game_state.debug_mode = not game_state.debug_mode
+            # Note: Auto-save removed - use !savegame to save manually
+            
+            status = "ON" if game_state.debug_mode else "OFF"
+            await ctx.reply(f"Debug mode is now **{status}**. Board will show coordinate labels when debug is enabled.", mention_author=False)
+            
+            # Update board to show/hide debug layer
+            await self._update_board(game_state, error_channel=ctx.channel)
+            await self._log_action(game_state, f"Debug mode toggled {status} by {ctx.author.display_name}")
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        # Check if user is admin or GM
-        is_admin_user = is_admin(ctx.author)
-        is_gm = self._is_gm(ctx.author, game_state)
-        
-        if not (is_admin_user or is_gm):
-            await ctx.reply("Only admins and GMs can toggle debug mode.", mention_author=False)
-            return
-        
-        # Toggle debug mode
-        game_state.debug_mode = not game_state.debug_mode
-        await self._save_game_state(game_state)
-        
-        status = "ON" if game_state.debug_mode else "OFF"
-        await ctx.reply(f"Debug mode is now **{status}**. Board will show coordinate labels when debug is enabled.", mention_author=False)
-        
-        # Update board to show/hide debug layer
-        await self._update_board(game_state, error_channel=ctx.channel)
-        await self._log_action(game_state, f"Debug mode toggled {status} by {ctx.author.display_name}")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_transfergm(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
         """Transfer GM role to another user (current GM only)."""
-        if not isinstance(ctx.author, discord.Member):
-            await ctx.reply("This command can only be used inside a server.", mention_author=False)
-            return
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the current GM can transfer the GM role.", mention_author=False)
+                return
+            
+            if not member:
+                await ctx.reply("Usage: `!transfergm @user`", mention_author=False)
+                return
+            
+            if member.id == game_state.gm_user_id:
+                await ctx.reply("That user is already the GM.", mention_author=False)
+                return
+            
+            # Transfer GM role
+            old_gm_id = game_state.gm_user_id
+            game_state.gm_user_id = member.id
+            
+            # If old GM was narrator and not a player, transfer narrator to new GM
+            old_gm_player = game_state.players.get(old_gm_id)
+            if game_state.narrator_user_id == old_gm_id and not (old_gm_player and old_gm_player.character_name):
+                # Old GM was narrator and not a player - transfer narrator role
+                new_gm_player = game_state.players.get(member.id)
+                if not (new_gm_player and new_gm_player.character_name):
+                    # New GM is not a player - make them narrator
+                    game_state.narrator_user_id = member.id
+                else:
+                    # New GM is a player - remove narrator role
+                    game_state.narrator_user_id = None
+            
+            # Note: Auto-save removed - use !savegame to save manually
+            await ctx.reply(f"GM role transferred to {member.mention}.", mention_author=False)
+            await self._log_action(game_state, f"GM role transferred from {ctx.author.display_name} to {member.display_name}")
         
-        game_state = await self._get_game_state_for_context(ctx)
-        if not game_state:
-            await ctx.reply("No active game in this thread.", mention_author=False)
-            return
-        
-        if not self._is_gm(ctx.author, game_state):
-            await ctx.reply("Only the current GM can transfer the GM role.", mention_author=False)
-            return
-        
-        if not member:
-            await ctx.reply("Usage: `!transfergm @user`", mention_author=False)
-            return
-        
-        if member.id == game_state.gm_user_id:
-            await ctx.reply("That user is already the GM.", mention_author=False)
-            return
-        
-        # Transfer GM role
-        old_gm_id = game_state.gm_user_id
-        game_state.gm_user_id = member.id
-        
-        # If old GM was narrator and not a player, transfer narrator to new GM
-        old_gm_player = game_state.players.get(old_gm_id)
-        if game_state.narrator_user_id == old_gm_id and not (old_gm_player and old_gm_player.character_name):
-            # Old GM was narrator and not a player - transfer narrator role
-            new_gm_player = game_state.players.get(member.id)
-            if not (new_gm_player and new_gm_player.character_name):
-                # New GM is not a player - make them narrator
-                game_state.narrator_user_id = member.id
-            else:
-                # New GM is a player - remove narrator role
-                game_state.narrator_user_id = None
-        
-        await self._save_game_state(game_state)
-        await ctx.reply(f"GM role transferred to {member.mention}.", mention_author=False)
-        await self._log_action(game_state, f"GM role transferred from {ctx.author.display_name} to {member.display_name}")
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_help(self, ctx: commands.Context) -> None:
         """Show available player commands."""
@@ -2483,30 +3642,47 @@ class GameBoardManager:
             return
         
         help_text = """**Player Commands:**
-`!dice` or `!roll` - Roll dice
+`!dice` - Roll dice (follows turn order)
+`!dice @player` or `!dice character_name` - GM can force a roll for a player
 `!rules` - Show game rules
 `!help` - Show this help
 
-**GM Commands:**
-`!startgame <game_type>` - Start a new game (GM only)
+**Game Management (GM Only):**
+`!startgame <game_type>` - Start a new game (Admin only, becomes GM)
+`!start` - Begin the game - render board and enable dice rolls
+`!endgame` - End the game and lock the thread
 `!transfergm @user` - Transfer GM role to another user
-`!endgame` - End the current game
-`!listgames` - List available games
-`!addplayer @user` - Add a player
-`!removeplayer @user` - Remove a player
-`!assign @user <character>` - Assign character
-`!reroll @user` - Reroll a player's character
-`!swap @user1 @user2` - Swap characters
-`!movetoken @user <coord>` - Move token (e.g., A1)
-`!bg @user <id>` or `!bg all <id>` - Set background
-`!outfit @user <outfit>` - Set outfit
-`!savegame` - Save game state
-`!loadgame <file>` - Load game state"""
+`!listgames` - List available game types
+
+**Player Management (GM Only):**
+`!addplayer @user [character]` - Add a player (optionally assign character)
+`!removeplayer @user` - Remove a player from the game
+`!assign @user <character>` - Assign character to a player
+`!assign character_name <character>` - Assign by character name
+`!reroll @user` - Randomly reroll a player's character
+`!swap @user1 @user2` - Swap characters between two players
+
+**Token Movement (GM Only):**
+`!movetoken @user <coord>` - Manually move token (e.g., A1, B5)
+`!movetoken character_name <coord>` - Move by character name
+
+**Visual Customization (GM Only):**
+`!bg @user <bg_id>` or `!bg all <bg_id>` - Set background
+`!bg_list` - List available backgrounds
+`!outfit @user <outfit>` - Set outfit for a player
+`!outfit_list [character]` - List available outfits
+
+**Save/Load (GM Only):**
+`!savegame` - Manually save game state
+`!loadgame <file>` - Load saved game state (Admin only)
+
+**Debug (GM/Admin):**
+`!debug` - Toggle debug mode (shows coordinate labels)
+
+**Notes:**
+- Commands are case-insensitive (!start, !START, !Start all work)
+- GM commands support @user mentions, character names, or character folders
+- Auto-save occurs at the end of each turn
+- Game backgrounds/outfits are isolated from VN mode"""
         
         await ctx.reply(help_text, mention_author=False)
-
-    # Commands will be registered here
-    def register_commands(self) -> None:
-        """Register all game commands."""
-        # TODO: Implement command registration
-        pass

@@ -41,6 +41,8 @@ class GameState:
     narrator_user_id: Optional[int] = None  # User ID of narrator (GM unless GM is a player)
     player_states: Dict[int, "TransformationState"] = field(default_factory=dict)  # Player user_id -> TransformationState
     debug_mode: bool = False    # Debug mode: shows coordinate labels on board
+    turn_count: int = 0  # Current turn number (increments each turn)
+    game_started: bool = False  # Game ready to start - blocks dice rolls until GM issues !start command
 
 
 @dataclass
