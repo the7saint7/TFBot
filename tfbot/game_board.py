@@ -323,6 +323,110 @@ def render_game_board(
     draw = ImageDraw.Draw(board)
     board_width, board_height = board.size
     
+    # Get tile dimensions from config (needed for debug layer)
+    grid_config = game_config.grid
+    tile_width = int(grid_config.get("tile_width", 60))
+    tile_height = int(grid_config.get("tile_height", 60))
+    rows = int(grid_config.get("rows", 10))
+    cols = int(grid_config.get("cols", 10))
+    
+    # Draw debug layer if enabled (after board image, before tokens)
+    if game_state.debug_mode:
+        try:
+            from PIL import ImageFont
+        except ImportError:
+            ImageFont = None
+        
+        # Try to load a font, fall back to default if not available
+        try:
+            # Try to use a default font
+            font = ImageFont.truetype("arial.ttf", 12) if ImageFont else None
+        except (OSError, IOError):
+            try:
+                # Try alternative font paths
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12) if ImageFont else None
+            except (OSError, IOError):
+                font = ImageFont.load_default() if ImageFont else None
+        
+        # Draw debug layer: red outlines and coordinate labels for all tiles
+        for row in range(1, rows + 1):  # 1-indexed rows
+            for col in range(1, cols + 1):  # 1-indexed columns
+                # Convert to alphanumeric coordinate
+                col_letter = chr(ord('A') + col - 1)
+                coord = f"{col_letter}{row}"
+                
+                # Get pixel position for this coordinate
+                pixel_pos = alphanumeric_to_pixel(
+                    coord,
+                    game_config,
+                    board_width,
+                    board_height,
+                )
+                
+                if not pixel_pos:
+                    continue
+                
+                pixel_x, pixel_y = pixel_pos
+                
+                # Draw red rectangle outline for the tile
+                # Calculate tile bounds (centered on pixel position)
+                half_width = tile_width // 2
+                half_height = tile_height // 2
+                rect_left = pixel_x - half_width
+                rect_top = pixel_y - half_height
+                rect_right = pixel_x + half_width
+                rect_bottom = pixel_y + half_height
+                
+                # Draw red outline (2px width)
+                draw.rectangle(
+                    [rect_left, rect_top, rect_right, rect_bottom],
+                    outline=(255, 0, 0),  # Red
+                    width=2
+                )
+                
+                # Draw coordinate label text
+                label_text = coord
+                if font:
+                    # Get text bounding box to center it
+                    try:
+                        bbox = draw.textbbox((0, 0), label_text, font=font)
+                        text_width = bbox[2] - bbox[0]
+                        text_height = bbox[3] - bbox[1]
+                    except AttributeError:
+                        # Fallback for older PIL versions
+                        text_width, text_height = draw.textsize(label_text, font=font)
+                else:
+                    # Rough estimate if no font
+                    text_width = len(label_text) * 6
+                    text_height = 12
+                
+                # Center text in tile
+                text_x = pixel_x - (text_width // 2)
+                text_y = pixel_y - (text_height // 2)
+                
+                # Draw text with red color and white outline for visibility
+                # Draw outline (white) by drawing text in multiple positions
+                outline_color = (255, 255, 255)  # White
+                text_color = (255, 0, 0)  # Red
+                for adj_x in [-1, 0, 1]:
+                    for adj_y in [-1, 0, 1]:
+                        if adj_x != 0 or adj_y != 0:
+                            draw.text(
+                                (text_x + adj_x, text_y + adj_y),
+                                label_text,
+                                fill=outline_color,
+                                font=font
+                            )
+                # Draw main text
+                draw.text(
+                    (text_x, text_y),
+                    label_text,
+                    fill=text_color,
+                    font=font
+                )
+        
+        logger.info("Debug layer drawn: showing all tile coordinates")
+    
     # Color palette for players
     colors = [
         (255, 0, 0),    # Red
@@ -344,10 +448,7 @@ def render_game_board(
             players_by_position[player.grid_position] = []
         players_by_position[player.grid_position].append(player)
     
-    # Get tile dimensions from config
-    grid_config = game_config.grid
-    tile_width = int(grid_config.get("tile_width", 60))
-    tile_height = int(grid_config.get("tile_height", 60))
+    # Tile dimensions already retrieved above for debug layer
     
     # Render tokens grouped by position
     for grid_pos, players_at_pos in players_by_position.items():

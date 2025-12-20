@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import importlib.util
 import io
 import json
@@ -6203,8 +6203,21 @@ async def prefix_rerollnonadmin_command(ctx: commands.Context) -> None:
 @guard_prefix_command_channel
 async def prefix_startgame_command(ctx: commands.Context, *, game_type: str = "") -> None:
     """Start a new game (GM only)."""
+    import logging
+    logger = logging.getLogger("tfbot.games")
+    logger.info("prefix_startgame_command: Entry point - game_type='%s', GAME_BOARD_MANAGER=%s", game_type, GAME_BOARD_MANAGER is not None)
+    
     if GAME_BOARD_MANAGER:
-        await GAME_BOARD_MANAGER.command_startgame(ctx, game_type=game_type)
+        logger.info("prefix_startgame_command: Calling GAME_BOARD_MANAGER.command_startgame")
+        try:
+            await GAME_BOARD_MANAGER.command_startgame(ctx, game_type=game_type)
+            logger.info("prefix_startgame_command: command_startgame completed")
+        except Exception as exc:
+            logger.error("prefix_startgame_command: Exception in command_startgame: %s", exc, exc_info=True)
+            raise
+    else:
+        logger.error("prefix_startgame_command: GAME_BOARD_MANAGER is None - game board not initialized!")
+        await ctx.reply("❌ Game board system is not initialized. Please check bot configuration.", mention_author=False)
 
 
 @bot.command(name="endgame")
@@ -6228,10 +6241,10 @@ async def prefix_listgames_command(ctx: commands.Context) -> None:
 @bot.command(name="addplayer")
 @commands.guild_only()
 @guard_prefix_command_channel
-async def prefix_addplayer_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-    """Add a player to the game (GM only)."""
+async def prefix_addplayer_command(ctx: commands.Context, member: Optional[discord.Member] = None, *, character_name: str = "") -> None:
+    """Add a player to the game (GM only). Optional: assign character with !addplayer @user character_name"""
     if GAME_BOARD_MANAGER:
-        await GAME_BOARD_MANAGER.command_addplayer(ctx, member=member)
+        await GAME_BOARD_MANAGER.command_addplayer(ctx, member=member, character_name=character_name)
 
 
 @bot.command(name="removeplayer")
@@ -6267,6 +6280,15 @@ async def prefix_transfergm_command(ctx: commands.Context, member: Optional[disc
     """Transfer GM role to another user (current GM only)."""
     if GAME_BOARD_MANAGER:
         await GAME_BOARD_MANAGER.command_transfergm(ctx, member=member)
+
+
+@bot.command(name="debug")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_debug_command(ctx: commands.Context) -> None:
+    """Toggle debug mode on/off (Admin & GM only). Shows coordinate labels on board."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_debug(ctx)
 
 
 
@@ -7242,7 +7264,26 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
 
 
 def main():
-    bot.run(DISCORD_TOKEN)
+    try:
+        bot.run(DISCORD_TOKEN)
+    except discord.errors.HTTPException as e:
+        if e.status == 429:
+            logger.error(
+                "Discord API rate limit error (429). This usually happens when:\n"
+                "1. Multiple bot instances are running with the same token\n"
+                "2. The bot was restarted too many times in quick succession\n"
+                "3. The token is being used by another application\n\n"
+                "Please wait 5-10 minutes before trying again, and ensure only one instance is running."
+            )
+            sys.exit(1)
+        else:
+            logger.error("Discord HTTP error: %s", e)
+            raise
+    except KeyboardInterrupt:
+        logger.info("Bot shutdown requested by user")
+    except Exception as e:
+        logger.exception("Unexpected error during bot startup: %s", e)
+        raise
 
 
 if __name__ == "__main__":

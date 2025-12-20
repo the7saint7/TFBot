@@ -4,10 +4,10 @@
   "grid": {
     "rows": 10,
     "cols": 10,
-    "tile_width": 60,
-    "tile_height": 60,
-    "start_x": 50,
-    "start_y": 50,
+    "tile_width": 88,
+    "tile_height": 88,
+    "start_x": 25,
+    "start_y": 213,
     "blocked_cells": []
   },
   "dice": {

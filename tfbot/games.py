@@ -15,7 +15,7 @@ import discord
 from discord.ext import commands
 
 from .game_models import GameConfig, GamePlayer, GameState
-from .game_board import render_game_board, validate_coordinate
+from .game_board import render_game_board, validate_coordinate, _resolve_face_cache_path
 from .game_pack_loader import get_game_pack
 from .utils import is_admin, int_from_env, path_from_env
 from .models import TransformationState
@@ -165,6 +165,7 @@ class GameBoardManager:
                     board_message_id=data.get("board_message_id"),
                     is_locked=bool(data.get("is_locked", False)),
                     narrator_user_id=data.get("narrator_user_id"),
+                    debug_mode=bool(data.get("debug_mode", False)),
                 )
                 
                 # Recreate player_states for players with assigned characters (like RP mode)
@@ -266,11 +267,12 @@ class GameBoardManager:
                         game_type=str(data.get("game_type", matched_game_type)),
                         map_thread_id=data.get("map_thread_id"),
                         players=players,
-                        current_turn=data.get("current_turn"),
-                        board_message_id=data.get("board_message_id"),
-                        is_locked=bool(data.get("is_locked", False)),
-                        narrator_user_id=narrator_user_id,
-                        player_states={},  # Will be recreated below
+                    current_turn=data.get("current_turn"),
+                    board_message_id=data.get("board_message_id"),
+                    is_locked=bool(data.get("is_locked", False)),
+                    narrator_user_id=narrator_user_id,
+                    debug_mode=bool(data.get("debug_mode", False)),
+                    player_states={},  # Will be recreated below
                     )
                     
                     # Recreate player_states for players with assigned characters (like RP mode)
@@ -333,6 +335,7 @@ class GameBoardManager:
             gm_user_id=gm_user_id,
             game_type=matched_game_type,
             narrator_user_id=gm_user_id,  # GM becomes narrator by default
+            debug_mode=False,  # Default to off
         )
         
         self._active_games[thread.id] = game_state
@@ -913,6 +916,7 @@ class GameBoardManager:
                 "board_message_id": game_state.board_message_id,
                 "is_locked": game_state.is_locked,
                 "narrator_user_id": game_state.narrator_user_id,
+                "debug_mode": game_state.debug_mode,
                 "players": {
                     str(user_id): {
                         "user_id": player.user_id,
@@ -1020,46 +1024,173 @@ class GameBoardManager:
     # GM Command Methods
     async def command_startgame(self, ctx: commands.Context, game_type: str = "") -> None:
         """Start a new game or resume an existing game. Only admins can start games, and they become the GM."""
+        logger.info("=" * 80)
+        logger.info("command_startgame: ENTRY - called by %s (%s) in channel %s with game_type='%s'", 
+                   ctx.author.id, ctx.author.display_name, ctx.channel.id if ctx.channel else None, game_type)
+        logger.info("command_startgame: Context - guild=%s, channel_type=%s", 
+                   ctx.guild.id if ctx.guild else None, type(ctx.channel).__name__ if ctx.channel else None)
+        
+        logger.info("command_startgame: STEP 1 - Checking if author is guild member")
         if not isinstance(ctx.author, discord.Member):
+            logger.warning("command_startgame: STEP 1 FAILED - Not a guild member (author type: %s)", type(ctx.author).__name__)
             await ctx.reply("This command can only be used inside a server.", mention_author=False)
             return
         
+        logger.info("command_startgame: STEP 1 PASSED - Author is guild member")
+        logger.info("command_startgame: STEP 2 - Checking admin status for user %s", ctx.author.id)
+        
         # Only admins can start new games (they become the GM)
-        if not is_admin(ctx.author):
+        is_admin_result = is_admin(ctx.author)
+        logger.info("command_startgame: is_admin(%s) = %s", ctx.author.id, is_admin_result)
+        if not is_admin_result:
+            logger.warning("command_startgame: STEP 2 FAILED - User %s is not admin", ctx.author.id)
             await ctx.reply("Only admins can start new games. The admin who starts the game becomes the GM.", mention_author=False)
             return
         
+        logger.info("command_startgame: STEP 2 PASSED - User %s is admin, proceeding", ctx.author.id)
+        
+        logger.info("command_startgame: STEP 3 - Checking game_type parameter")
         if not game_type:
-            await ctx.reply("Usage: `!startgame <game_type>`\nAvailable games: " + ", ".join(self.list_available_games()), mention_author=False)
+            available = ", ".join(self.list_available_games())
+            logger.warning("command_startgame: STEP 3 FAILED - No game_type provided, available: %s", available)
+            await ctx.reply("Usage: `!startgame <game_type>`\nAvailable games: " + available, mention_author=False)
             return
         
+        logger.info("command_startgame: STEP 3 PASSED - game_type='%s'", game_type)
+        logger.info("command_startgame: STEP 4 - Looking up game config for type '%s'", game_type)
+        logger.info("command_startgame: Available game configs: %s", list(self._game_configs.keys()))
         game_config = self.get_game_config(game_type)
         if not game_config:
-            await ctx.reply(f"Unknown game type: `{game_type}`. Available: " + ", ".join(self.list_available_games()), mention_author=False)
+            available = ", ".join(self.list_available_games())
+            logger.error("command_startgame: STEP 4 FAILED - Unknown game type '%s', available: %s", game_type, available)
+            await ctx.reply(f"Unknown game type: `{game_type}`. Available: " + available, mention_author=False)
             return
         
-        # Check if we're in an existing game thread - if so, just resume it
+        logger.info("command_startgame: STEP 4 PASSED - Game config found for '%s' (name: %s)", game_type, game_config.name)
+        
+        logger.info("command_startgame: STEP 5 - Checking if in existing game thread")
+        logger.info("command_startgame: Channel type: %s, channel ID: %s", type(ctx.channel).__name__, ctx.channel.id if ctx.channel else None)
         if isinstance(ctx.channel, discord.Thread):
+            logger.info("command_startgame: STEP 5 - In a thread, checking for existing game state")
             existing_state = await self._detect_and_load_game_thread(ctx.channel)
             if existing_state:
+                logger.info("command_startgame: STEP 5 - Found existing game state in thread %s, resuming", ctx.channel.id)
                 await ctx.reply(f"✅ Game already exists in this thread! Resuming game. Use `!addplayer` and `!assign` to continue.", mention_author=False)
                 # Update board if needed
                 if not existing_state.board_message_id:
+                    logger.info("command_startgame: Updating board for existing game")
                     await self._update_board(existing_state, error_channel=ctx.channel)
+                logger.info("command_startgame: EXIT - Resumed existing game")
                 return
+            logger.info("command_startgame: STEP 5 - No existing game state found in thread, continuing")
+        else:
+            logger.info("command_startgame: STEP 5 - Not in a thread, will create new game")
         
-        # Check if forum channel exists
+        logger.info("command_startgame: STEP 6 - Looking up forum channel")
+        logger.info("command_startgame: Forum channel ID from config: %s", self.forum_channel_id)
+        logger.info("command_startgame: Bot has %d guilds", len(self.bot.guilds))
+        
         forum_channel = self.bot.get_channel(self.forum_channel_id)
+        logger.info("command_startgame: get_channel(%s) returned: %s", self.forum_channel_id, forum_channel)
+        
+        if not forum_channel:
+            logger.error("command_startgame: STEP 6 FAILED - Forum channel %s not found or not accessible by bot", self.forum_channel_id)
+            logger.error("command_startgame: Bot guilds: %s", [g.id for g in self.bot.guilds])
+            await ctx.reply(
+                f"❌ **Forum channel not found:** The configured forum channel (ID: {self.forum_channel_id}) doesn't exist or the bot can't access it.\n\n"
+                f"Please check:\n"
+                f"• The channel ID in `games/game_config.json` is correct\n"
+                f"• The channel still exists\n"
+                f"• The bot has access to the channel",
+                mention_author=False
+            )
+            logger.info("command_startgame: EXIT - Forum channel not found")
+            return
+        
+        logger.info("command_startgame: STEP 6 PASSED - Forum channel found: %s (type: %s, ID: %s)", 
+                   forum_channel.name, type(forum_channel).__name__, forum_channel.id)
+        
+        logger.info("command_startgame: STEP 7 - Validating channel type")
         if not isinstance(forum_channel, discord.ForumChannel):
-            await ctx.reply("Forum channel not configured or not found.", mention_author=False)
+            logger.error("command_startgame: STEP 7 FAILED - Channel %s is not a forum channel (type: %s)", 
+                        self.forum_channel_id, type(forum_channel).__name__)
+            await ctx.reply(
+                f"❌ **Invalid channel type:** Channel ID {self.forum_channel_id} is not a forum channel.\n\n"
+                f"Please configure a forum channel in `games/game_config.json`.",
+                mention_author=False
+            )
+            logger.info("command_startgame: EXIT - Invalid channel type")
+            return
+        
+        logger.info("command_startgame: STEP 7 PASSED - Forum channel validated: %s (%s)", forum_channel.name, forum_channel.id)
+        
+        logger.info("command_startgame: STEP 8 - Checking bot permissions in forum channel")
+        if ctx.guild:
+            logger.info("command_startgame: Getting bot member for guild %s (bot.user.id: %s)", 
+                       ctx.guild.id, self.bot.user.id if self.bot.user else None)
+            bot_member = ctx.guild.get_member(self.bot.user.id) if self.bot.user else None
+            if not bot_member:
+                logger.error("command_startgame: STEP 8 FAILED - Bot member not found in guild (bot.user.id: %s)", 
+                           self.bot.user.id if self.bot.user else None)
+                await ctx.reply("❌ **Error:** Bot member not found in guild. This is unusual.", mention_author=False)
+                logger.info("command_startgame: EXIT - Bot member not found")
+                return
+            else:
+                logger.info("command_startgame: Bot member found: %s", bot_member.display_name)
+                logger.info("command_startgame: Checking permissions for bot in forum channel")
+                channel_perms = forum_channel.permissions_for(bot_member)
+                missing_perms = []
+                
+                logger.info("command_startgame: Permission check results:")
+                # For forum channels, use create_public_threads (not create_forum_threads)
+                has_create_threads = getattr(channel_perms, 'create_public_threads', False)
+                logger.info("  - create_public_threads: %s", has_create_threads)
+                logger.info("  - send_messages_in_threads: %s", channel_perms.send_messages_in_threads)
+                logger.info("  - attach_files: %s", channel_perms.attach_files)
+                logger.info("  - view_channel: %s", channel_perms.view_channel)
+                
+                if not has_create_threads:
+                    missing_perms.append("Create Public Threads")
+                if not channel_perms.send_messages_in_threads:
+                    missing_perms.append("Send Messages in Threads")
+                if not channel_perms.attach_files:
+                    missing_perms.append("Attach Files")
+                if not channel_perms.view_channel:
+                    missing_perms.append("View Channel")
+                
+                if missing_perms:
+                    perm_list = ", ".join(missing_perms)
+                    logger.error("command_startgame: STEP 8 FAILED - Bot missing permissions: %s", perm_list)
+                    await ctx.reply(
+                        f"❌ **Permission Error:** The bot is missing required permissions in the forum channel:\n"
+                        f"**Missing:** {perm_list}\n\n"
+                        f"Please ensure the bot has the following permissions in <#{forum_channel.id}>:\n"
+                        f"• Create Public Threads (or Create Forum Threads)\n"
+                        f"• Send Messages in Threads\n"
+                        f"• Attach Files\n"
+                        f"• View Channel",
+                        mention_author=False
+                    )
+                    logger.info("command_startgame: EXIT - Missing permissions")
+                    return
+                logger.info("command_startgame: STEP 8 PASSED - All required permissions present")
+        else:
+            logger.error("command_startgame: STEP 8 FAILED - No guild context available for permission check")
+            await ctx.reply("❌ **Error:** No guild context available.", mention_author=False)
+            logger.info("command_startgame: EXIT - No guild context")
             return
         
         # Generate unique game number by checking existing threads
+        logger.info("command_startgame: Generating unique game number")
         game_number = 1
         game_prefix = f"{game_config.name} #"
+        logger.debug("command_startgame: Game prefix: '%s'", game_prefix)
         try:
+            logger.debug("command_startgame: Checking archived threads")
             # Fetch recent threads to find highest number
+            archived_count = 0
             async for thread in forum_channel.archived_threads(limit=100):
+                archived_count += 1
                 if thread.name.startswith(game_prefix):
                     try:
                         # Extract number from thread name like "Snakes and Ladders #123 - Username"
@@ -1069,11 +1200,17 @@ class GameBoardManager:
                             thread_num = int(num_part)
                             if thread_num >= game_number:
                                 game_number = thread_num + 1
-                    except (ValueError, IndexError):
+                                logger.debug("command_startgame: Found game number %d in archived thread", thread_num)
+                    except (ValueError, IndexError) as e:
+                        logger.debug("command_startgame: Failed to parse thread name '%s': %s", thread.name, e)
                         pass
+            logger.debug("command_startgame: Checked %d archived threads", archived_count)
             
             # Also check active threads
-            for thread in forum_channel.threads:
+            logger.debug("command_startgame: Checking active threads")
+            active_threads = forum_channel.threads
+            logger.debug("command_startgame: Found %d active threads", len(active_threads))
+            for thread in active_threads:
                 if thread.name.startswith(game_prefix):
                     try:
                         parts = thread.name.split("#", 1)
@@ -1082,13 +1219,17 @@ class GameBoardManager:
                             thread_num = int(num_part)
                             if thread_num >= game_number:
                                 game_number = thread_num + 1
-                    except (ValueError, IndexError):
+                                logger.debug("command_startgame: Found game number %d in active thread", thread_num)
+                    except (ValueError, IndexError) as e:
+                        logger.debug("command_startgame: Failed to parse thread name '%s': %s", thread.name, e)
                         pass
+            logger.info("command_startgame: Generated game number: %d", game_number)
         except Exception as exc:
-            logger.warning("Failed to check existing threads for game number: %s", exc)
+            logger.error("command_startgame: Failed to check existing threads for game number: %s", exc, exc_info=True)
             # Fallback to timestamp-based number
             import time
             game_number = int(time.time()) % 100000
+            logger.warning("command_startgame: Using fallback game number: %d", game_number)
         
         # Create TWO separate forum posts in the same channel: one for chat, one for board images
         thread_name = f"{game_config.name} #{game_number} - {ctx.author.display_name}"
@@ -1096,25 +1237,67 @@ class GameBoardManager:
         initial_message = f"🎲 **{game_config.name}** game started by {ctx.author.mention}\n\nUse `!addplayer @user` to add players, then `!assign @user character_name` to assign characters."
         map_initial_message = f"🗺️ **{game_config.name} Map** - Board updates will appear here.\n\nThis post is read-only. All messages except admin commands will be automatically deleted."
         
+        logger.info("command_startgame: Creating game thread: '%s'", thread_name)
+        logger.debug("command_startgame: Thread name length: %d, Map thread name length: %d", len(thread_name), len(map_thread_name))
+        
         try:
             # Create game thread (for chat/commands)
+            logger.info("command_startgame: Attempting to create game thread in forum channel %s", forum_channel.id)
             thread, message = await forum_channel.create_thread(
                 name=thread_name,
                 auto_archive_duration=1440,
                 content=initial_message
             )
+            logger.info("command_startgame: Successfully created game thread: %s (ID: %s)", thread.name, thread.id)
             
             # Create map thread (for board images only, same channel, different post)
+            logger.info("command_startgame: Attempting to create map thread: '%s'", map_thread_name)
             map_thread, map_message = await forum_channel.create_thread(
                 name=map_thread_name,
                 auto_archive_duration=1440,
                 content=map_initial_message
             )
+            logger.info("command_startgame: Successfully created map thread: %s (ID: %s)", map_thread.name, map_thread.id)
+        except discord.Forbidden as exc:
+            error_msg = (
+                f"❌ **Permission Denied:** The bot doesn't have permission to create threads in the forum channel.\n\n"
+                f"**Required permissions in <#{forum_channel.id}>:**\n"
+                f"• Create Public Threads (or Create Forum Threads)\n"
+                f"• Send Messages in Threads\n"
+                f"• Attach Files\n\n"
+                f"Please check the bot's role permissions and try again."
+            )
+            await ctx.reply(error_msg, mention_author=False)
+            logger.error("Permission denied creating game thread in forum channel %s: %s", forum_channel.id, exc)
+            return
         except discord.HTTPException as exc:
-            await ctx.reply(f"Failed to create game thread: {exc}", mention_author=False)
+            # Check for specific error codes
+            if exc.status == 403:
+                error_msg = (
+                    f"❌ **Permission Error (403):** The bot lacks permissions to create threads.\n\n"
+                    f"Please ensure the bot has 'Create Public Threads' (or 'Create Forum Threads') permission in <#{forum_channel.id}>."
+                )
+            elif exc.status == 404:
+                error_msg = (
+                    f"❌ **Channel Not Found (404):** The forum channel (ID: {forum_channel.id}) no longer exists.\n\n"
+                    f"Please update the forum channel configuration."
+                )
+            else:
+                error_msg = (
+                    f"❌ **Failed to create game thread:** {exc}\n\n"
+                    f"**Error Code:** {exc.status if hasattr(exc, 'status') else 'Unknown'}\n"
+                    f"**Forum Channel:** <#{forum_channel.id}>\n\n"
+                    f"If this persists, check:\n"
+                    f"• Bot permissions in the forum channel\n"
+                    f"• Forum channel still exists\n"
+                    f"• Bot has proper role hierarchy"
+                )
+            await ctx.reply(error_msg, mention_author=False)
+            logger.error("HTTPException creating game thread: %s (status: %s)", exc, getattr(exc, 'status', 'unknown'))
             return
         
         # Create game state with both threads (same channel, different posts)
+        logger.info("command_startgame: Creating game state with threads: game=%s, map=%s", thread.id, map_thread.id)
         game_state = GameState(
             game_thread_id=thread.id,
             forum_channel_id=forum_channel.id,
@@ -1123,16 +1306,32 @@ class GameBoardManager:
             game_type=game_type,
             map_thread_id=map_thread.id,
             narrator_user_id=ctx.author.id,  # GM becomes narrator by default
+            debug_mode=False,  # Default to off
         )
         
+        logger.info("command_startgame: Storing game state in active games")
         self._active_games[thread.id] = game_state
+        
+        logger.info("command_startgame: Saving game state to disk")
         await self._save_game_state(game_state)
+        logger.info("command_startgame: Game state saved")
         
         # Post initial board
+        logger.info("command_startgame: Updating board with initial state")
         await self._update_board(game_state)
+        logger.info("command_startgame: Board updated")
         
-        await ctx.reply(f"Game started! Thread: {thread.mention}", mention_author=False)
+        logger.info("command_startgame: STEP 12 - Sending success message to user")
+        try:
+            await ctx.reply(f"Game started! Thread: {thread.mention}", mention_author=False)
+            logger.info("command_startgame: Success message sent")
+        except Exception as exc:
+            logger.error("command_startgame: Failed to send success message: %s", exc, exc_info=True)
+        
         await self._log_action(game_state, f"Game started by {ctx.author.display_name}")
+        logger.info("=" * 80)
+        logger.info("command_startgame: EXIT - Command completed successfully")
+        logger.info("=" * 80)
 
     async def command_listgames(self, ctx: commands.Context) -> None:
         """List available games."""
@@ -1149,8 +1348,8 @@ class GameBoardManager:
         
         await ctx.reply("\n".join(lines), mention_author=False)
 
-    async def command_addplayer(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-        """Add a player to the game (GM only)."""
+    async def command_addplayer(self, ctx: commands.Context, member: Optional[discord.Member] = None, *, character_name: str = "") -> None:
+        """Add a player to the game (GM only). Optional: assign character with !addplayer @user character_name"""
         if not isinstance(ctx.author, discord.Member):
             await ctx.reply("This command can only be used inside a server.", mention_author=False)
             return
@@ -1165,7 +1364,7 @@ class GameBoardManager:
             return
         
         if not member:
-            await ctx.reply("Usage: `!addplayer @user`", mention_author=False)
+            await ctx.reply("Usage: `!addplayer @user [character_name]`\nExample: `!addplayer @user kiyoshi`", mention_author=False)
             return
         
         if member.id in game_state.players:
@@ -1186,8 +1385,101 @@ class GameBoardManager:
         # Update board to show the new player token at starting position
         await self._update_board(game_state, error_channel=ctx.channel)
         
-        await ctx.reply(f"Added {member.mention} to the game.", mention_author=False)
-        await self._log_action(game_state, f"Player {member.display_name} added")
+        # If character_name provided, assign character
+        if character_name and character_name.strip():
+            character_name = character_name.strip()
+            logger.info("command_addplayer: Auto-assigning character '%s' to %s", character_name, member.id)
+            
+            # Verify character exists
+            character = self._get_character_by_name(character_name)
+            if not character:
+                await ctx.reply(f"Added {member.mention} to the game.\n❌ Unable to locate character '{character_name}'. Use `!assign @{member.display_name} <character>` to assign later.", mention_author=False)
+                await self._log_action(game_state, f"Player {member.display_name} added (character '{character_name}' not found)")
+                return
+            
+            # Assign character using the same logic as command_assign
+            actual_character_name = character.name
+            player.character_name = actual_character_name
+            
+            # Create TransformationState for the player
+            if not ctx.guild:
+                await ctx.reply(f"Added {member.mention} to the game.\n❌ Error: Cannot assign character outside of a server.", mention_author=False)
+                return
+            
+            state = await self._create_game_state_for_player(
+                player,
+                member.id,
+                ctx.guild.id,
+                actual_character_name,
+            )
+            if not state:
+                await ctx.reply(f"Added {member.mention} to the game.\n❌ Error: Failed to create state for character '{character_name}'. Use `!assign @{member.display_name} <character>` to assign later.", mention_author=False)
+                await self._log_action(game_state, f"Player {member.display_name} added (state creation failed)")
+                return
+            
+            # Ensure state matches player
+            if state.character_name != actual_character_name:
+                state.character_name = actual_character_name
+                if character:
+                    state.character_folder = character.folder
+                    state.character_avatar_path = character.avatar_path
+                    state.character_message = character.message or ""
+            
+            game_state.player_states[member.id] = state
+            
+            # If GM was assigned as a player, remove narrator role
+            if member.id == game_state.gm_user_id and game_state.narrator_user_id == member.id:
+                game_state.narrator_user_id = None
+            
+            # Call pack's on_character_assigned if it exists
+            if pack and pack.has_function("on_character_assigned"):
+                pack.call("on_character_assigned", game_state, player, actual_character_name)
+            
+            await self._save_game_state(game_state)
+            await self._update_board(game_state, error_channel=ctx.channel)
+            
+            # Send transformation message
+            try:
+                from tfbot.utils import member_profile_name
+                import sys
+                bot_module = sys.modules.get('bot') or sys.modules.get('__main__')
+                _format_character_message = getattr(bot_module, '_format_character_message', None)
+                _get_magic_emoji = getattr(bot_module, '_get_magic_emoji', None)
+                _format_special_reroll_hint = getattr(bot_module, '_format_special_reroll_hint', None)
+                
+                original_name = member_profile_name(member)
+                character_message = character.message or ""
+                duration_label = "Game"
+                
+                if _format_character_message:
+                    response_text = _format_character_message(
+                        character_message,
+                        original_name,
+                        member.mention,
+                        duration_label,
+                        actual_character_name,
+                    )
+                else:
+                    response_text = f"{original_name} becomes **{actual_character_name}**!"
+                
+                if _format_special_reroll_hint:
+                    special_hint = _format_special_reroll_hint(actual_character_name, character.folder if character else None)
+                    if special_hint:
+                        response_text = f"{response_text}\n{special_hint}"
+                
+                if _get_magic_emoji and ctx.guild:
+                    emoji_prefix = _get_magic_emoji(ctx.guild)
+                    response_text = f"{emoji_prefix} {response_text}"
+                
+                await ctx.reply(response_text, mention_author=False)
+            except Exception as msg_exc:
+                logger.exception("Error sending assignment transformation message: %s", msg_exc)
+                await ctx.reply(f"✅ {member.display_name} becomes **{actual_character_name}**!", mention_author=False)
+            
+            await self._log_action(game_state, f"Player {member.display_name} added and assigned character: {actual_character_name}")
+        else:
+            await ctx.reply(f"Added {member.mention} to the game.", mention_author=False)
+            await self._log_action(game_state, f"Player {member.display_name} added")
 
     async def command_assign(self, ctx: commands.Context, member: Optional[discord.Member] = None, *, character_name: str = "") -> None:
         """Assign a character to a player (GM only)."""
@@ -1546,6 +1838,10 @@ class GameBoardManager:
             rolls_str = ", ".join(str(r) for r in rolls)
             result = f"Rolled: {rolls_str} = **{total}**"
         
+        auto_move_requested = False
+        turn_complete_requested = False
+        summary_msg = None
+
         # Call pack's on_dice_rolled if it exists
         pack = get_game_pack(game_state.game_type, self.packs_dir)
         if pack and pack.has_function("on_dice_rolled"):
@@ -1619,26 +1915,78 @@ class GameBoardManager:
                             await ctx.channel.send(transform_msg, allowed_mentions=discord.AllowedMentions.none())
                 
                 if should_auto_move:
-                    await self._update_board(game_state, error_channel=ctx.channel, target_thread="map")
-                    await self._save_game_state(game_state)
+                    auto_move_requested = True
                 
                 # Handle turn completion
                 if is_turn_complete:
+                    turn_complete_requested = True
                     # Get turn summary from pack
                     if pack and pack.has_function("get_turn_summary"):
                         summary_msg = pack.call("get_turn_summary", game_state, game_config)
-                        if summary_msg:
-                            # Send turn summary to game thread with board image
-                            await self._update_board(game_state, error_channel=ctx.channel, target_thread="game")
-                            await ctx.channel.send(summary_msg, allowed_mentions=discord.AllowedMentions.none())
-                    
-                    # Advance turn
-                    if pack and pack.has_function("advance_turn"):
-                        pack.call("advance_turn", game_state)
-                    
-                    await self._save_game_state(game_state)
-        
-        await ctx.reply(result, mention_author=False)
+
+        # Build embed with roll result and player's current board position
+        embed_color = discord.Color.random()
+        player_position = player.grid_position or "Unknown"
+        embed_description = f"{result}\n\n**New Position:** `{player_position}`"
+        roll_embed = discord.Embed(
+            title="Dice Roll",
+            description=embed_description,
+            color=embed_color,
+        )
+        face_file = None
+        face_attachment_url = None
+        if player.character_name:
+            face_path = _resolve_face_cache_path(player.character_name)
+            if face_path and face_path.exists():
+                face_filename = f"dice_face_{player.user_id}.png"
+                face_file = discord.File(face_path, filename=face_filename)
+                face_attachment_url = f"attachment://{face_filename}"
+                roll_embed.set_thumbnail(url=face_attachment_url)
+                roll_embed.set_author(name=player.character_name, icon_url=face_attachment_url)
+        if not face_file:
+            player_member = None
+            if ctx.guild:
+                if isinstance(ctx.channel, discord.Thread):
+                    player_member = ctx.channel.guild.get_member(player.user_id)
+                else:
+                    player_member = ctx.guild.get_member(player.user_id)
+            if player_member:
+                avatar_url = player_member.display_avatar.url
+                roll_embed.set_author(name=player_member.display_name, icon_url=avatar_url)
+                roll_embed.set_thumbnail(url=avatar_url)
+            else:
+                roll_embed.set_author(name=getattr(ctx.author, "display_name", "Dice Roller"))
+        reply_kwargs = {
+            "embed": roll_embed,
+            "mention_author": False,
+        }
+        if face_file:
+            reply_kwargs["file"] = face_file
+        await ctx.reply(**reply_kwargs)
+
+        # Update board(s) and handle summaries after showing the roll result
+        board_posted_to_game = False
+        has_separate_map_thread = bool(
+            game_state.map_thread_id
+            and game_state.game_thread_id
+            and game_state.map_thread_id != game_state.game_thread_id
+        )
+        if auto_move_requested:
+            target_thread = "map" if has_separate_map_thread else "game"
+            await self._update_board(game_state, error_channel=ctx.channel, target_thread=target_thread)
+            if target_thread == "game":
+                board_posted_to_game = True
+            await self._save_game_state(game_state)
+
+        if turn_complete_requested:
+            if summary_msg and not board_posted_to_game:
+                await self._update_board(game_state, error_channel=ctx.channel, target_thread="game")
+                board_posted_to_game = True
+            if summary_msg:
+                await ctx.channel.send(summary_msg, allowed_mentions=discord.AllowedMentions.none())
+            if pack and pack.has_function("advance_turn"):
+                pack.call("advance_turn", game_state)
+            await self._save_game_state(game_state)
         await self._log_action(game_state, f"{ctx.author.display_name} rolled {result}")
 
     async def command_endgame(self, ctx: commands.Context) -> None:
@@ -1962,6 +2310,7 @@ class GameBoardManager:
                 current_turn=data.get("current_turn"),
                 board_message_id=data.get("board_message_id"),
                 is_locked=bool(data.get("is_locked", False)),
+                debug_mode=bool(data.get("debug_mode", False)),
             )
             
             # Replace active game state in memory
@@ -2052,6 +2401,36 @@ class GameBoardManager:
             rules_text = rules_text[:1950] + "\n\n*(Rules truncated - ask GM for full details)*"
         
         await ctx.reply(rules_text, mention_author=False)
+
+    async def command_debug(self, ctx: commands.Context) -> None:
+        """Toggle debug mode on/off (Admin & GM only). Shows coordinate labels on board."""
+        if not isinstance(ctx.author, discord.Member):
+            await ctx.reply("This command can only be used inside a server.", mention_author=False)
+            return
+        
+        game_state = await self._get_game_state_for_context(ctx)
+        if not game_state:
+            await ctx.reply("No active game in this thread.", mention_author=False)
+            return
+        
+        # Check if user is admin or GM
+        is_admin_user = is_admin(ctx.author)
+        is_gm = self._is_gm(ctx.author, game_state)
+        
+        if not (is_admin_user or is_gm):
+            await ctx.reply("Only admins and GMs can toggle debug mode.", mention_author=False)
+            return
+        
+        # Toggle debug mode
+        game_state.debug_mode = not game_state.debug_mode
+        await self._save_game_state(game_state)
+        
+        status = "ON" if game_state.debug_mode else "OFF"
+        await ctx.reply(f"Debug mode is now **{status}**. Board will show coordinate labels when debug is enabled.", mention_author=False)
+        
+        # Update board to show/hide debug layer
+        await self._update_board(game_state, error_channel=ctx.channel)
+        await self._log_action(game_state, f"Debug mode toggled {status} by {ctx.author.display_name}")
 
     async def command_transfergm(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
         """Transfer GM role to another user (current GM only)."""

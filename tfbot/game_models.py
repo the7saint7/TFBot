@@ -40,6 +40,7 @@ class GameState:
     is_locked: bool = False     # Game ended - thread locked but viewable
     narrator_user_id: Optional[int] = None  # User ID of narrator (GM unless GM is a player)
     player_states: Dict[int, "TransformationState"] = field(default_factory=dict)  # Player user_id -> TransformationState
+    debug_mode: bool = False    # Debug mode: shows coordinate labels on board
 
 
 @dataclass
