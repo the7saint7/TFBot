@@ -3080,19 +3080,24 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
         game_state = GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
         if game_state:
-            # Parse member from args if provided
+            # Parse member from args if provided (supports @user OR character_name)
             target_member = None
+            token = None
             if args:
+                args_stripped = args.strip()
                 # Try to extract member mention from args
                 import re
-                mention_match = re.search(r'<@!?(\d+)>', args)
+                mention_match = re.search(r'<@!?(\d+)>', args_stripped)
                 if mention_match:
                     member_id = int(mention_match.group(1))
                     if ctx.guild:
                         target_member = ctx.guild.get_member(member_id)
+                else:
+                    # Not a mention, treat as character name token
+                    token = args_stripped
             
             # Route to gameboard reroll
-            await GAME_BOARD_MANAGER.command_reroll(ctx, member=target_member)
+            await GAME_BOARD_MANAGER.command_reroll(ctx, member=target_member, token=token)
             return None
     
     roleplay_dm_override = (
@@ -6248,6 +6253,22 @@ async def prefix_start_command(ctx: commands.Context) -> None:
     if GAME_BOARD_MANAGER:
         await GAME_BOARD_MANAGER.command_start(ctx)
 
+@bot.command(name="pause")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_pause_command(ctx: commands.Context) -> None:
+    """Pause the game (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_pause(ctx)
+
+@bot.command(name="resume")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_resume_command(ctx: commands.Context) -> None:
+    """Resume the game (GM only)."""
+    if GAME_BOARD_MANAGER:
+        await GAME_BOARD_MANAGER.command_resume(ctx)
+
 
 @bot.command(name="listgames")
 @commands.guild_only()
@@ -6270,10 +6291,47 @@ async def prefix_addplayer_command(ctx: commands.Context, member: Optional[disco
 @bot.command(name="removeplayer")
 @commands.guild_only()
 @guard_prefix_command_channel
-async def prefix_removeplayer_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+async def prefix_removeplayer_command(ctx: commands.Context, *, args: str = "") -> None:
     """Remove a player from the game (GM only)."""
     if GAME_BOARD_MANAGER:
-        await GAME_BOARD_MANAGER.command_removeplayer(ctx, member=member)
+        # Check if this is a game thread - if so, delegate to gameboard manager
+        if isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+            # Parse arguments for gameboard mode (supports @user OR character_name)
+            target_member = None
+            token = None
+            if args:
+                args_stripped = args.strip()
+                # Try to extract member mention from args
+                import re
+                mention_match = re.search(r'<@!?(\d+)>', args_stripped)
+                if mention_match:
+                    member_id = int(mention_match.group(1))
+                    if ctx.guild:
+                        target_member = ctx.guild.get_member(member_id)
+                else:
+                    # Not a mention, treat as character name token
+                    token = args_stripped
+            
+            await GAME_BOARD_MANAGER.command_removeplayer(ctx, member=target_member, token=token)
+        else:
+            # Not a game thread, try to parse as member
+            if args:
+                import re
+                mention_match = re.search(r'<@!?(\d+)>', args.strip())
+                if mention_match:
+                    member_id = int(mention_match.group(1))
+                    if ctx.guild:
+                        member = ctx.guild.get_member(member_id)
+                        if member:
+                            await GAME_BOARD_MANAGER.command_removeplayer(ctx, member=member)
+                        else:
+                            await ctx.reply("Could not find member.", mention_author=False)
+                    else:
+                        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                else:
+                    await ctx.reply("Usage: `!removeplayer @user`", mention_author=False)
+            else:
+                await ctx.reply("Usage: `!removeplayer @user`", mention_author=False)
 
 
 @bot.command(name="assign")
@@ -6326,24 +6384,28 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     
     # Check if this is a game thread - if so, delegate to gameboard manager
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        # Parse arguments for gameboard mode (expects @user1 @user2)
+        # Parse arguments for gameboard mode (supports @user1 @user2 OR character1 character2)
         tokens = [token for token in args.split() if token.strip()]
         member1 = None
         member2 = None
+        token1 = None
+        token2 = None
         
-        if tokens:
+        if len(tokens) >= 2:
+            token1 = tokens[0]
+            token2 = tokens[1]
+            # Try to resolve as members first
             user_id1 = _extract_user_id_from_token(tokens[0])
             if user_id1 and ctx.guild:
                 member1 = ctx.guild.get_member(user_id1)
-        if len(tokens) > 1:
             user_id2 = _extract_user_id_from_token(tokens[1])
             if user_id2 and ctx.guild:
                 member2 = ctx.guild.get_member(user_id2)
         
-        if member1 and member2:
-            await GAME_BOARD_MANAGER.command_swap(ctx, member1=member1, member2=member2)
+        if len(tokens) >= 2:
+            await GAME_BOARD_MANAGER.command_swap(ctx, member1=member1, member2=member2, token1=token1, token2=token2)
         else:
-            await ctx.reply("Usage: `!swap @user1 @user2`", mention_author=False)
+            await ctx.reply("Usage: `!swap @user1 @user2` or `!swap character1 character2`", mention_author=False)
         return
     
     # Normal VN mode swap - swap transformations between two characters/users

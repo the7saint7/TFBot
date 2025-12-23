@@ -43,6 +43,7 @@ class GameState:
     debug_mode: bool = False    # Debug mode: shows coordinate labels on board
     turn_count: int = 0  # Current turn number (increments each turn)
     game_started: bool = False  # Game ready to start - blocks dice rolls until GM issues !start command
+    is_paused: bool = False  # Game paused - blocks dice rolls (GM can still force rolls)
 
 
 @dataclass
