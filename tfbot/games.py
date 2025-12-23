@@ -514,6 +514,9 @@ class GameBoardManager:
             logger.error("State character_name mismatch! Expected '%s', got '%s'", character.name, state.character_name)
             state.character_name = character.name  # Fix it
         
+        # Preserve original identity for VN panels (used during swaps)
+        state.identity_display_name = state.identity_display_name or character.name
+        
         # CRITICAL: Verify all required fields are present for VN rendering
         if not state.character_avatar_path:
             logger.error("State missing character_avatar_path! Character: %s", character.name)
@@ -796,7 +799,7 @@ class GameBoardManager:
             background_path = self._get_game_background_path(player.background_id)
             
             # Get character display name (used for logging and display)
-            character_display_name = player.character_name  # Use player's character name (source of truth)
+            character_display_name = state.identity_display_name or player.character_name
             
             # Render VN panel (only if VN style is enabled)
             files = []
@@ -1079,6 +1082,71 @@ class GameBoardManager:
         if pack and pack.has_function("get_player_number"):
             return pack.call("get_player_number", game_state, user_id)
         return None
+    
+    def _swap_pack_player_metadata(self, game_state: GameState, user_id1: int, user_id2: int) -> None:
+        """Swap per-pack metadata (tile numbers, turn order, player numbers)."""
+        pack = get_game_pack(game_state.game_type, self.packs_dir)
+        if not pack:
+            return
+        pack_module = getattr(pack, "module", None)
+        if not pack_module:
+            return
+        get_game_data = getattr(pack_module, "get_game_data", None)
+        if not callable(get_game_data):
+            return
+        
+        try:
+            data = get_game_data(game_state)
+        except Exception as exc:
+            logger.warning("Failed to fetch pack data during swap: %s", exc)
+            return
+        if not isinstance(data, dict):
+            return
+        
+        def _swap_dict_entry(mapping: Dict[int, object]) -> None:
+            if not isinstance(mapping, dict):
+                return
+            val1 = mapping.get(user_id1)
+            val2 = mapping.get(user_id2)
+            if val1 is None and val2 is None:
+                return
+            mapping[user_id1], mapping[user_id2] = val2, val1
+        
+        def _swap_list_entries(seq: List[int]) -> None:
+            if not isinstance(seq, list):
+                return
+            for idx, value in enumerate(seq):
+                if value == user_id1:
+                    seq[idx] = user_id2
+                elif value == user_id2:
+                    seq[idx] = user_id1
+        
+        tile_numbers = data.get("tile_numbers")
+        if isinstance(tile_numbers, dict):
+            _swap_dict_entry(tile_numbers)
+        
+        player_numbers = data.get("player_numbers")
+        if isinstance(player_numbers, dict):
+            _swap_dict_entry(player_numbers)
+        
+        turn_order = data.get("turn_order")
+        if isinstance(turn_order, list):
+            try:
+                idx1 = turn_order.index(user_id1)
+                idx2 = turn_order.index(user_id2)
+            except ValueError:
+                idx1 = idx2 = None
+            if idx1 is not None and idx2 is not None:
+                turn_order[idx1], turn_order[idx2] = turn_order[idx2], turn_order[idx1]
+        
+        for list_key in ("players_rolled_this_turn", "winners", "players_reached_end_this_turn"):
+            seq = data.get(list_key)
+            if isinstance(seq, list):
+                _swap_list_entries(seq)
+        
+        goal_reached_turn = data.get("goal_reached_turn")
+        if isinstance(goal_reached_turn, dict):
+            _swap_dict_entry(goal_reached_turn)
 
     def list_available_games(self) -> List[str]:
         """Get list of available game types."""
@@ -2564,6 +2632,7 @@ class GameBoardManager:
                     state.character_folder = character.folder
                     state.character_avatar_path = character.avatar_path or ""
                     state.character_message = character.message or ""
+                    state.identity_display_name = new_character
             
             # Update board to show new character image
             await self._update_board(game_state, error_channel=ctx.channel)
@@ -2666,7 +2735,7 @@ class GameBoardManager:
                     is_inanimate=char2_inanimate,
                     inanimate_responses=char2_responses,
                     form_owner_user_id=state2.form_owner_user_id or resolved_member2.id,
-                    identity_display_name=identity1,  # Preserve user's original identity
+                    identity_display_name=identity1,  # Keep player's original identity
                     is_pillow=state1.is_pillow,
                 )
                 
@@ -2686,13 +2755,16 @@ class GameBoardManager:
                     is_inanimate=char1_inanimate,
                     inanimate_responses=char1_responses,
                     form_owner_user_id=state1.form_owner_user_id or resolved_member1.id,
-                    identity_display_name=identity2,  # Preserve user's original identity
+                    identity_display_name=identity2,  # Keep player's original identity
                     is_pillow=state2.is_pillow,
                 )
                 
                 # Update player_states
                 game_state.player_states[resolved_member1.id] = new_state1
                 game_state.player_states[resolved_member2.id] = new_state2
+            
+            # Update pack-specific metadata (tile numbers, turn order, etc.)
+            self._swap_pack_player_metadata(game_state, resolved_member1.id, resolved_member2.id)
             
             # Update board to show swapped positions and character images
             await self._update_board(game_state, error_channel=ctx.channel)
@@ -2921,6 +2993,20 @@ class GameBoardManager:
                         
                         if pack_msg:
                             result = f"{result}\n{pack_msg}"
+                            
+                            special_notice = pack_msg.strip()
+                            if (
+                                not auto_move_requested
+                                and not turn_complete_requested
+                                and not transformation_char
+                                and (
+                                    special_notice.startswith("You've already rolled this turn! Wait for the turn summary.")
+                                    or special_notice.startswith("It's not your turn yet!")
+                                    or special_notice.startswith("All players have rolled! Turn summary should be shown.")
+                                )
+                            ):
+                                await ctx.reply(pack_msg, mention_author=False)
+                                return
                         
                         # Apply transformation if needed
                         if transformation_char:
