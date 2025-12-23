@@ -200,6 +200,7 @@ class GameBoardManager:
                     debug_mode=bool(data.get("debug_mode", False)),
                     turn_count=int(data.get("turn_count", 0)),
                     game_started=bool(data.get("game_started", False)),  # Default to False for old saves
+                    is_paused=bool(data.get("is_paused", False)),  # Default to False for old saves
                 )
                 
                 # Recreate player_states for players with assigned characters (like RP mode)
@@ -311,6 +312,7 @@ class GameBoardManager:
                     narrator_user_id=narrator_user_id,
                     debug_mode=bool(data.get("debug_mode", False)),
                     game_started=bool(data.get("game_started", False)),  # Default to False for old saves
+                    is_paused=bool(data.get("is_paused", False)),  # Default to False for old saves
                     player_states={},  # Will be recreated below
                     )
                     
@@ -376,6 +378,7 @@ class GameBoardManager:
             narrator_user_id=gm_user_id,  # GM becomes narrator by default
             debug_mode=False,  # Default to off
             game_started=False,  # Game starts as not ready - GM must use !start to begin
+            is_paused=False,  # Game starts unpaused
         )
         
         self._active_games[thread.id] = game_state
@@ -1118,6 +1121,12 @@ class GameBoardManager:
         # Acquire lock and execute - this ensures all messages from this command appear in order
         async with command_lock:
             await coro()
+        
+        # CRITICAL: Process queued messages after command completes
+        # This ensures messages sent during command processing are re-printed in order
+        game_state = await self._get_game_state_for_context(ctx)
+        if game_state:
+            await self._process_queued_messages(game_state)
     
     def _resolve_target_member(
         self, 
@@ -1351,6 +1360,7 @@ class GameBoardManager:
                     "debug_mode": game_state.debug_mode,
                     "turn_count": game_state.turn_count,
                     "game_started": game_state.game_started,
+                    "is_paused": game_state.is_paused,
                     "players": {
                         str(user_id): {
                             "user_id": player.user_id,
@@ -1938,6 +1948,7 @@ class GameBoardManager:
             narrator_user_id=ctx.author.id,  # GM becomes narrator by default
             debug_mode=False,  # Default to off
             turn_count=0,  # Start at turn 0, increments to 1 on first turn completion
+            is_paused=False,  # Game starts unpaused
             game_started=False,  # Game starts as not ready - GM must use !start to begin
         )
         
@@ -2495,7 +2506,7 @@ class GameBoardManager:
         
         await self._execute_gameboard_command(ctx, _impl)
 
-    async def command_reroll(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+    async def command_reroll(self, ctx: commands.Context, member: Optional[discord.Member] = None, token: Optional[str] = None) -> None:
         """Randomly reroll a player's character (GM only). Supports: !reroll @user OR !reroll character_name OR !reroll character_folder"""
         async def _impl():
             if not isinstance(ctx.author, discord.Member):
@@ -2511,57 +2522,68 @@ class GameBoardManager:
                 await ctx.reply("Only the GM can reroll characters.", mention_author=False)
                 return
             
-            # If member not provided, try to resolve from args (if available)
+            # Resolve member from token if provided, otherwise use provided member
             resolved_member = member
+            if token and not resolved_member:
+                resolved_member = self._resolve_target_member(ctx, game_state, token)
+            
             if not resolved_member:
-                # Check if there's a raw args string we can parse
-                # This would come from bot.py if it passes args
-                # For now, just show usage
                 await ctx.reply("Usage: `!reroll @user` or `!reroll character_name` or `!reroll character_folder`", mention_author=False)
                 return
             
-            # Try to resolve if member is None but we have a token
-            # This will be handled by bot.py passing the resolved member, but we can also try here
-                if resolved_member.id not in game_state.players:
-                    await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
-                    return
-                
-                # Get list of available characters from CHARACTER_BY_NAME
-                import sys
-                bot_module = sys.modules.get('bot')
-                if not bot_module:
-                    await ctx.reply("Failed to access character list.", mention_author=False)
-                    return
-                
-                CHARACTER_BY_NAME = getattr(bot_module, 'CHARACTER_BY_NAME', None)
-                if not CHARACTER_BY_NAME:
-                    await ctx.reply("Character list not available.", mention_author=False)
-                    return
-                
-                # Get all available character names
-                available_characters = list(CHARACTER_BY_NAME.keys())
-                if not available_characters:
-                    await ctx.reply("No characters available for reroll.", mention_author=False)
-                    return
-                
-                # Randomly select a character
-                old_character = game_state.players[resolved_member.id].character_name
-                new_character = random.choice(available_characters)
-                
-                # CRITICAL: Only modify game state, never global state
-                game_state.players[resolved_member.id].character_name = new_character
-                # Note: Auto-save removed - use !savegame to save manually
-                
-                await ctx.reply(
-                    f"Rerolled {resolved_member.mention}'s character from {old_character or 'none'} to {new_character}.",
-                    mention_author=False
-                )
-                await self._log_action(game_state, f"{resolved_member.display_name} rerolled from {old_character} to {new_character}")
+            if resolved_member.id not in game_state.players:
+                await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
+                return
+            
+            # Get list of available characters from CHARACTER_BY_NAME
+            import sys
+            bot_module = sys.modules.get('bot')
+            if not bot_module:
+                await ctx.reply("Failed to access character list.", mention_author=False)
+                return
+            
+            CHARACTER_BY_NAME = getattr(bot_module, 'CHARACTER_BY_NAME', None)
+            if not CHARACTER_BY_NAME:
+                await ctx.reply("Character list not available.", mention_author=False)
+                return
+            
+            # Get all available character names
+            available_characters = list(CHARACTER_BY_NAME.keys())
+            if not available_characters:
+                await ctx.reply("No characters available for reroll.", mention_author=False)
+                return
+            
+            # Randomly select a character
+            old_character = game_state.players[resolved_member.id].character_name
+            new_character = random.choice(available_characters)
+            
+            # CRITICAL: Only modify game state, never global state
+            game_state.players[resolved_member.id].character_name = new_character
+            
+            # Update player state if it exists
+            if resolved_member.id in game_state.player_states:
+                state = game_state.player_states[resolved_member.id]
+                character = self._get_character_by_name(new_character)
+                if character:
+                    state.character_name = new_character
+                    state.character_folder = character.folder
+                    state.character_avatar_path = character.avatar_path or ""
+                    state.character_message = character.message or ""
+            
+            # Update board to show new character image
+            await self._update_board(game_state, error_channel=ctx.channel)
+            
+            # Note: Auto-save removed - use !savegame to save manually
+            await ctx.reply(
+                f"Rerolled {resolved_member.mention}'s character from {old_character or 'none'} to {new_character}.",
+                mention_author=False
+            )
+            await self._log_action(game_state, f"{resolved_member.display_name} rerolled from {old_character} to {new_character}")
         
         await self._execute_gameboard_command(ctx, _impl)
 
-    async def command_swap(self, ctx: commands.Context, member1: Optional[discord.Member] = None, member2: Optional[discord.Member] = None) -> None:
-        """Swap characters between two players (GM only)."""
+    async def command_swap(self, ctx: commands.Context, member1: Optional[discord.Member] = None, member2: Optional[discord.Member] = None, token1: Optional[str] = None, token2: Optional[str] = None) -> None:
+        """Swap characters between two players (GM only). Supports: !swap @user1 @user2 OR !swap character1 character2"""
         async def _impl():
             if not isinstance(ctx.author, discord.Member):
                 await ctx.reply("This command can only be used inside a server.", mention_author=False)
@@ -2576,23 +2598,113 @@ class GameBoardManager:
                 await ctx.reply("Only the GM can swap characters.", mention_author=False)
                 return
             
-            if not member1 or not member2:
-                await ctx.reply("Usage: `!swap @user1 @user2`", mention_author=False)
+            # Resolve members from tokens if provided, otherwise use provided members
+            resolved_member1 = member1
+            resolved_member2 = member2
+            
+            if token1 and not resolved_member1:
+                resolved_member1 = self._resolve_target_member(ctx, game_state, token1)
+            if token2 and not resolved_member2:
+                resolved_member2 = self._resolve_target_member(ctx, game_state, token2)
+            
+            if not resolved_member1 or not resolved_member2:
+                await ctx.reply("Usage: `!swap @user1 @user2` or `!swap character1 character2`", mention_author=False)
                 return
             
-            if member1.id not in game_state.players or member2.id not in game_state.players:
+            if resolved_member1.id not in game_state.players or resolved_member2.id not in game_state.players:
                 await ctx.reply("Both players must be in the game.", mention_author=False)
                 return
             
             # Swap characters
-            char1 = game_state.players[member1.id].character_name
-            char2 = game_state.players[member2.id].character_name
-            game_state.players[member1.id].character_name = char2
-            game_state.players[member2.id].character_name = char1
+            char1 = game_state.players[resolved_member1.id].character_name
+            char2 = game_state.players[resolved_member2.id].character_name
+            game_state.players[resolved_member1.id].character_name = char2
+            game_state.players[resolved_member2.id].character_name = char1
+            
+            # Swap grid positions (board locations) - true body swap
+            pos1 = game_state.players[resolved_member1.id].grid_position
+            pos2 = game_state.players[resolved_member2.id].grid_position
+            game_state.players[resolved_member1.id].grid_position = pos2
+            game_state.players[resolved_member2.id].grid_position = pos1
+            
+            # Swap TransformationState objects in game_state.player_states (preserve user identity)
+            state1 = game_state.player_states.get(resolved_member1.id)
+            state2 = game_state.player_states.get(resolved_member2.id)
+            
+            if state1 and state2:
+                # Extract character data from both states
+                char1_name = state1.character_name
+                char1_folder = state1.character_folder
+                char1_avatar = state1.character_avatar_path
+                char1_message = state1.character_message
+                char1_inanimate = state1.is_inanimate
+                char1_responses = state1.inanimate_responses
+                
+                char2_name = state2.character_name
+                char2_folder = state2.character_folder
+                char2_avatar = state2.character_avatar_path
+                char2_message = state2.character_message
+                char2_inanimate = state2.is_inanimate
+                char2_responses = state2.inanimate_responses
+                
+                # Preserve user identity (original_display_name, identity_display_name, etc.)
+                identity1 = state1.identity_display_name or state1.character_name
+                identity2 = state2.identity_display_name or state2.character_name
+                
+                # Create new states with swapped character data but preserved user identity
+                from tfbot.models import TransformationState
+                from datetime import datetime, timezone
+                
+                new_state1 = TransformationState(
+                    user_id=resolved_member1.id,
+                    guild_id=state1.guild_id,
+                    character_name=char2_name,
+                    character_folder=char2_folder,
+                    character_avatar_path=char2_avatar,
+                    character_message=char2_message,
+                    original_nick=state1.original_nick,
+                    started_at=state1.started_at,
+                    expires_at=state1.expires_at,
+                    duration_label=state1.duration_label,
+                    avatar_applied=state1.avatar_applied,
+                    original_display_name=state1.original_display_name,
+                    is_inanimate=char2_inanimate,
+                    inanimate_responses=char2_responses,
+                    form_owner_user_id=state2.form_owner_user_id or resolved_member2.id,
+                    identity_display_name=identity1,  # Preserve user's original identity
+                    is_pillow=state1.is_pillow,
+                )
+                
+                new_state2 = TransformationState(
+                    user_id=resolved_member2.id,
+                    guild_id=state2.guild_id,
+                    character_name=char1_name,
+                    character_folder=char1_folder,
+                    character_avatar_path=char1_avatar,
+                    character_message=char1_message,
+                    original_nick=state2.original_nick,
+                    started_at=state2.started_at,
+                    expires_at=state2.expires_at,
+                    duration_label=state2.duration_label,
+                    avatar_applied=state2.avatar_applied,
+                    original_display_name=state2.original_display_name,
+                    is_inanimate=char1_inanimate,
+                    inanimate_responses=char1_responses,
+                    form_owner_user_id=state1.form_owner_user_id or resolved_member1.id,
+                    identity_display_name=identity2,  # Preserve user's original identity
+                    is_pillow=state2.is_pillow,
+                )
+                
+                # Update player_states
+                game_state.player_states[resolved_member1.id] = new_state1
+                game_state.player_states[resolved_member2.id] = new_state2
+            
+            # Update board to show swapped positions and character images
+            await self._update_board(game_state, error_channel=ctx.channel)
             
             # Note: Auto-save removed - use !savegame to save manually
-            await ctx.reply(f"Swapped characters: {member1.mention} ↔ {member2.mention}", mention_author=False)
-            await self._log_action(game_state, f"{member1.display_name} and {member2.display_name} swapped characters")
+            await ctx.reply(f"Swapped characters and positions: {resolved_member1.mention} ↔ {resolved_member2.mention}", mention_author=False)
+            await self._log_action(game_state, f"{resolved_member1.display_name} and {resolved_member2.display_name} swapped characters and positions")
         
         await self._execute_gameboard_command(ctx, _impl)
 
@@ -2716,10 +2828,26 @@ class GameBoardManager:
                     await ctx.reply("Game is locked.", mention_author=False)
                     return
                 
-                # Check if GM is forcing a roll for another player
-                is_gm_override = False
+                # Check if game is paused - delete dice commands silently (unless GM override)
                 is_gm = self._is_gm(ctx.author, game_state)
+                is_gm_override = False
                 
+                if game_state.is_paused:
+                    # If GM is forcing a roll for another player, allow it
+                    if target_player and is_gm:
+                        is_gm_override = True
+                    elif is_gm and not target_player and ctx.author.id in game_state.players:
+                        # GM rolling for themselves - allow it
+                        is_gm_override = True
+                    else:
+                        # Game is paused and not GM override - delete message silently
+                        try:
+                            await ctx.message.delete()
+                        except discord.HTTPException:
+                            pass
+                        return
+                
+                # Check if GM is forcing a roll for another player
                 if target_player and is_gm:
                     # GM override - roll for the target player (bypasses game_started check)
                     if target_player.id not in game_state.players:
@@ -3032,8 +3160,9 @@ class GameBoardManager:
                 await ctx.reply("⚠️ No players have been assigned characters yet. Assign characters before starting the game.", mention_author=False)
                 return
         
-            # Mark game as started
+            # Mark game as started and unpause
             game_state.game_started = True
+            game_state.is_paused = False
             
             # Send "Starting game..." message first
             await ctx.reply("Starting game...", mention_author=False)
@@ -3118,7 +3247,7 @@ class GameBoardManager:
         
         await self._execute_gameboard_command(ctx, _impl)
 
-    async def command_removeplayer(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+    async def command_removeplayer(self, ctx: commands.Context, member: Optional[discord.Member] = None, token: Optional[str] = None) -> None:
         """Remove a player from the game (GM only). Supports: !removeplayer @user OR !removeplayer character_name OR !removeplayer character_folder"""
         async def _impl():
             if not isinstance(ctx.author, discord.Member):
@@ -3134,15 +3263,14 @@ class GameBoardManager:
                 await ctx.reply("Only the GM can remove players.", mention_author=False)
                 return
             
-            # If member not provided, we can't resolve from empty args - show usage
-            # (bot.py should handle parsing and pass member, but we can add fallback)
+            # Resolve member from token if provided, otherwise use provided member
             resolved_member = member
+            if token and not resolved_member:
+                resolved_member = self._resolve_target_member(ctx, game_state, token)
+            
             if not resolved_member:
                 await ctx.reply("Usage: `!removeplayer @user` or `!removeplayer character_name` or `!removeplayer character_folder`", mention_author=False)
                 return
-            
-            # Try to resolve if member is None (would need args parsing in bot.py)
-            # For now, just use the provided member
             
             if resolved_member.id not in game_state.players:
                 await ctx.reply(f"{resolved_member.mention} is not in the game.", mention_author=False)
@@ -3487,6 +3615,7 @@ class GameBoardManager:
                 is_locked=bool(data.get("is_locked", False)),
                 debug_mode=bool(data.get("debug_mode", False)),
                 game_started=bool(data.get("game_started", False)),  # Default to False for old saves
+                is_paused=bool(data.get("is_paused", False)),  # Default to False for old saves
             )
             
             # Replace active game state in memory
@@ -3554,6 +3683,70 @@ class GameBoardManager:
             rules_text = rules_text[:1950] + "\n\n*(Rules truncated - ask GM for full details)*"
         
         await ctx.reply(rules_text, mention_author=False)
+
+    async def command_pause(self, ctx: commands.Context) -> None:
+        """Pause the game - blocks dice rolls (GM only)."""
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can pause the game.", mention_author=False)
+                return
+            
+            if game_state.is_locked:
+                await ctx.reply("Game is locked and cannot be paused.", mention_author=False)
+                return
+            
+            if not game_state.game_started:
+                await ctx.reply("Game hasn't started yet. Use `!start` to begin the game.", mention_author=False)
+                return
+            
+            if game_state.is_paused:
+                await ctx.reply("Game is already paused.", mention_author=False)
+                return
+            
+            game_state.is_paused = True
+            await ctx.reply("⏸️ Game paused. Dice rolls are blocked until resumed.", mention_author=False)
+            await self._log_action(game_state, "Game paused")
+        
+        await self._execute_gameboard_command(ctx, _impl)
+    
+    async def command_resume(self, ctx: commands.Context) -> None:
+        """Resume the game - allows dice rolls again (GM only)."""
+        async def _impl():
+            if not isinstance(ctx.author, discord.Member):
+                await ctx.reply("This command can only be used inside a server.", mention_author=False)
+                return
+            
+            game_state = await self._get_game_state_for_context(ctx)
+            if not game_state:
+                await ctx.reply("No active game in this thread.", mention_author=False)
+                return
+            
+            if not self._is_gm(ctx.author, game_state):
+                await ctx.reply("Only the GM can resume the game.", mention_author=False)
+                return
+            
+            if game_state.is_locked:
+                await ctx.reply("Game is locked and cannot be resumed.", mention_author=False)
+                return
+            
+            if not game_state.is_paused:
+                await ctx.reply("Game is not paused.", mention_author=False)
+                return
+            
+            game_state.is_paused = False
+            await ctx.reply("▶️ Game resumed. Dice rolls are now allowed.", mention_author=False)
+            await self._log_action(game_state, "Game resumed")
+        
+        await self._execute_gameboard_command(ctx, _impl)
 
     async def command_debug(self, ctx: commands.Context) -> None:
         """Toggle debug mode on/off (Admin & GM only). Shows coordinate labels on board."""
@@ -3643,46 +3836,46 @@ class GameBoardManager:
         
         help_text = """**Player Commands:**
 `!dice` - Roll dice (follows turn order)
-`!dice @player` or `!dice character_name` - GM can force a roll for a player
+`!dice @player` or `!dice character_name` - GM can force a roll
 `!rules` - Show game rules
 `!help` - Show this help
 
 **Game Management (GM Only):**
-`!startgame <game_type>` - Start a new game (Admin only, becomes GM)
-`!start` - Begin the game - render board and enable dice rolls
-`!endgame` - End the game and lock the thread
-`!transfergm @user` - Transfer GM role to another user
-`!listgames` - List available game types
+`!startgame <game_type>` - Start new game (Admin only)
+`!start` - Begin game (also resumes if paused)
+`!pause` - Pause game (blocks dice rolls)
+`!resume` - Resume game (allows dice rolls)
+`!endgame` - End game and lock thread
+`!transfergm @user` - Transfer GM role
+`!listgames` - List available games
 
 **Player Management (GM Only):**
-`!addplayer @user [character]` - Add a player (optionally assign character)
-`!removeplayer @user` - Remove a player from the game
-`!assign @user <character>` - Assign character to a player
-`!assign character_name <character>` - Assign by character name
-`!reroll @user` - Randomly reroll a player's character
-`!swap @user1 @user2` - Swap characters between two players
+`!addplayer @user [character]` - Add player
+`!removeplayer @user` or `character_name` - Remove player
+`!assign @user <character>` or `character_name <character>` - Assign character
+`!reroll @user` or `character_name` - Reroll character
+`!swap @user1 @user2` or `character1 character2` - Swap characters & positions
 
 **Token Movement (GM Only):**
-`!movetoken @user <coord>` - Manually move token (e.g., A1, B5)
-`!movetoken character_name <coord>` - Move by character name
+`!movetoken @user <coord>` or `character_name <coord>` - Move token (e.g., A1)
 
 **Visual Customization (GM Only):**
-`!bg @user <bg_id>` or `!bg all <bg_id>` - Set background
-`!bg_list` - List available backgrounds
-`!outfit @user <outfit>` - Set outfit for a player
-`!outfit_list [character]` - List available outfits
+`!bg @user <bg_id>` or `all <bg_id>` - Set background
+`!bg_list` - List backgrounds
+`!outfit @user <outfit>` - Set outfit
+`!outfit_list [character]` - List outfits
 
 **Save/Load (GM Only):**
-`!savegame` - Manually save game state
-`!loadgame <file>` - Load saved game state (Admin only)
+`!savegame` - Save game state
+`!loadgame <file>` - Load game state (Admin only)
 
 **Debug (GM/Admin):**
-`!debug` - Toggle debug mode (shows coordinate labels)
+`!debug` - Toggle debug mode
 
 **Notes:**
-- Commands are case-insensitive (!start, !START, !Start all work)
-- GM commands support @user mentions, character names, or character folders
-- Auto-save occurs at the end of each turn
-- Game backgrounds/outfits are isolated from VN mode"""
+- Commands are case-insensitive
+- GM commands support @user, character names, or folders
+- `!swap` swaps characters AND board positions
+- When paused, `!dice` deleted silently (GM can force rolls)"""
         
         await ctx.reply(help_text, mention_author=False)
