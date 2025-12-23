@@ -1864,8 +1864,14 @@ class GameBoardManager:
         # Create TWO separate forum posts in the same channel: one for chat, one for board images
         thread_name = f"{game_config.name} #{game_number} - {ctx.author.display_name}"
         map_thread_name = f"{game_config.name} #{game_number} Map - {ctx.author.display_name}"
-        initial_message = f"🎲 **{game_config.name}** game started by {ctx.author.display_name}\n\nUse `!addplayer @user` to add players, then `!assign @user character_name` to assign characters."
-        map_initial_message = f"🗺️ **{game_config.name} Map** - Board updates will appear here.\n\nThis post is read-only. All messages except admin commands will be automatically deleted."
+        initial_message = (
+            f"🎲 **{game_config.name}** game started by {ctx.author.display_name}\n\n"
+            f"Use `!addplayer @user` to add players, then `!assign @user character_name` to assign characters."
+        )
+        map_initial_message = (
+            f"🗺️ **{game_config.name} Map** - Board updates will appear here.\n\n"
+            f"This post is read-only. All messages except admin commands will be automatically deleted."
+        )
         
         logger.info("command_startgame: Creating game thread: '%s'", thread_name)
         logger.debug("command_startgame: Thread name length: %d, Map thread name length: %d", len(thread_name), len(map_thread_name))
@@ -1879,6 +1885,14 @@ class GameBoardManager:
                 content=initial_message
             )
             logger.info("command_startgame: Successfully created game thread: %s (ID: %s)", thread.name, thread.id)
+            # Edit in GM mention after creation to avoid ping
+            if isinstance(ctx.author, discord.Member):
+                try:
+                    mention_content = f"{ctx.author.mention}\n\n{initial_message}"
+                    await message.edit(content=mention_content)
+                    logger.debug("command_startgame: Added GM mention to game thread via edit")
+                except Exception as exc:
+                    logger.warning("command_startgame: Failed to edit game thread message with GM mention: %s", exc)
             
             # Create map thread (for board images only, in separate map forum channel)
             logger.info("command_startgame: Attempting to create map thread: '%s' in map forum channel %s", map_thread_name, map_forum_channel.id)
@@ -1888,6 +1902,13 @@ class GameBoardManager:
                 content=map_initial_message
             )
             logger.info("command_startgame: Successfully created map thread: %s (ID: %s) in map forum channel %s", map_thread.name, map_thread.id, map_forum_channel.id)
+            if isinstance(ctx.author, discord.Member):
+                try:
+                    mention_content = f"{ctx.author.mention}\n\n{map_initial_message}"
+                    await map_message.edit(content=mention_content)
+                    logger.debug("command_startgame: Added GM mention to map thread via edit")
+                except Exception as exc:
+                    logger.warning("command_startgame: Failed to edit map thread message with GM mention: %s", exc)
         except discord.Forbidden as exc:
             # Determine which channel had the permission error
             error_msg = (
@@ -1958,28 +1979,6 @@ class GameBoardManager:
         logger.info("command_startgame: Creating initial blank board")
         await self._update_board(game_state, error_channel=ctx.channel)
         logger.info("command_startgame: Initial blank board created")
-        
-        # Auto-follow both threads for the GM (no pings/notifications)
-        logger.info("command_startgame: Auto-following threads for GM %s", ctx.author.id)
-        try:
-            # Follow game thread for GM using HTTP API
-            await self.bot.http.request(
-                discord.http.Route('PUT', '/channels/{channel_id}/thread-members/{user_id}', 
-                                  channel_id=thread.id, user_id=ctx.author.id)
-            )
-            logger.info("command_startgame: Successfully followed game thread %s for GM %s", thread.id, ctx.author.id)
-        except Exception as exc:
-            logger.warning("command_startgame: Failed to follow game thread %s: %s", thread.id, exc)
-        
-        try:
-            # Follow map thread for GM using HTTP API
-            await self.bot.http.request(
-                discord.http.Route('PUT', '/channels/{channel_id}/thread-members/{user_id}', 
-                                  channel_id=map_thread.id, user_id=ctx.author.id)
-            )
-            logger.info("command_startgame: Successfully followed map thread %s for GM %s", map_thread.id, ctx.author.id)
-        except Exception as exc:
-            logger.warning("command_startgame: Failed to follow map thread %s: %s", map_thread.id, exc)
         
         # Delete progress message
         try:
@@ -3214,29 +3213,6 @@ class GameBoardManager:
             
             game_state.is_locked = True
             # Note: Auto-save removed - use !savegame to save manually
-            
-            # Unfollow both threads for the GM (no pings/notifications)
-            logger.info("command_endgame: Auto-unfollowing threads for GM %s", ctx.author.id)
-            
-            # Unfollow game thread for GM
-            try:
-                await self.bot.http.request(
-                    discord.http.Route('DELETE', '/channels/{channel_id}/thread-members/{user_id}', 
-                                      channel_id=game_state.game_thread_id, user_id=ctx.author.id)
-                )
-                logger.info("command_endgame: Successfully unfollowed game thread %s for GM %s", game_state.game_thread_id, ctx.author.id)
-            except Exception as exc:
-                logger.warning("command_endgame: Failed to unfollow game thread %s: %s", game_state.game_thread_id, exc)
-            
-            # Unfollow map thread for GM
-            try:
-                await self.bot.http.request(
-                    discord.http.Route('DELETE', '/channels/{channel_id}/thread-members/{user_id}', 
-                                      channel_id=game_state.map_thread_id, user_id=ctx.author.id)
-                )
-                logger.info("command_endgame: Successfully unfollowed map thread %s for GM %s", game_state.map_thread_id, ctx.author.id)
-            except Exception as exc:
-                logger.warning("command_endgame: Failed to unfollow map thread %s: %s", game_state.map_thread_id, exc)
             
             # Lock the thread
             if isinstance(ctx.channel, discord.Thread):
