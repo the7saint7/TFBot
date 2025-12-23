@@ -766,23 +766,23 @@ class GameBoardManager:
             bot_module = sys.modules.get('bot') or sys.modules.get('__main__')
             MESSAGE_STYLE = getattr(bot_module, 'MESSAGE_STYLE', 'classic') if bot_module else 'classic'
             
-            # Clean message content
+            # Clean message content - match VN bot exactly
             cleaned_content = message.content.strip() if message.content else ""
-            cleaned_content, _ = strip_urls(cleaned_content)
+            cleaned_content, has_links = strip_urls(cleaned_content)
             cleaned_content = cleaned_content.strip()
             
             # Check if message has attachments (images) - these should be allowed even without text
-            has_attachments = message.attachments and len(message.attachments) > 0
+            has_attachments = bool(message.attachments)
             
             if not cleaned_content and not has_attachments:
                 # No content and no attachments - ignore
                 return True
             
-            # Use cleaned_content for display (or placeholder if only attachments)
-            display_content = cleaned_content if cleaned_content else ("(image)" if has_attachments else "")
+            # Match VN bot: description = cleaned_content if cleaned_content else "*no message content*"
+            description = cleaned_content if cleaned_content else "*no message content*"
             
-            # Parse formatting
-            formatted_segments = parse_discord_formatting(display_content) if display_content else []
+            # Parse formatting - use cleaned_content directly (like VN bot)
+            formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else None
             custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments) if formatted_segments else {}
             
             # Get reply context if message is a reply
@@ -861,7 +861,7 @@ class GameBoardManager:
                     
                     vn_file = render_vn_panel(
                         state=state,
-                        message_content=display_content,
+                        message_content=cleaned_content,
                         character_display_name=character_display_name,
                         original_name=message.author.display_name,
                         attachment_id=str(message.id),
@@ -880,7 +880,7 @@ class GameBoardManager:
                     # Restore original function (critical for isolation)
                     panels_module.get_selected_background_path = original_func
             
-            # If we have files to send, send them and delete original
+            # If we have files to send, send them and handle original message like VN bot
             if files:
                 logger.info("Sending VN panel file for game player %s as %s", message.author.id, character_display_name)
                 send_kwargs: Dict[str, object] = {
@@ -888,73 +888,50 @@ class GameBoardManager:
                     "allowed_mentions": discord.AllowedMentions.none(),
                 }
                 
-                # Include message attachments (images) if present
-                if has_attachments:
-                    # Download and attach original message attachments
-                    attachment_files = []
-                    for attachment in message.attachments:
-                        try:
-                            # Download attachment
-                            attachment_bytes = await attachment.read()
-                            attachment_file = discord.File(
-                                io.BytesIO(attachment_bytes),
-                                filename=attachment.filename
-                            )
-                            attachment_files.append(attachment_file)
-                        except Exception as exc:
-                            logger.warning("Failed to download attachment %s: %s", attachment.filename, exc)
-                    
-                    if attachment_files:
-                        # Add attachments to files list
-                        send_kwargs["files"] = files + attachment_files
-                        logger.info("Including %d attachment(s) with VN panel", len(attachment_files))
-                
                 # Preserve reply reference if present
                 if message.reference:
                     send_kwargs["reference"] = message.reference
                 
+                # Match VN bot: preserve_original = has_attachments or has_links
+                preserve_original = has_attachments or has_links
+                deleted = False
+                
                 try:
                     await message.channel.send(**send_kwargs)
                     logger.info("Successfully sent VN panel for game player %s", message.author.id)
-                    # Delete original message
-                    try:
-                        await message.delete()
-                    except discord.HTTPException:
-                        pass  # Message might already be deleted
+                    
+                    # Handle original message - match VN bot behavior exactly
+                    if not preserve_original:
+                        # No attachments and no links - delete original message
+                        deleted = True
+                        try:
+                            await message.delete()
+                        except discord.Forbidden:
+                            deleted = False
+                            logger.debug(
+                                "Missing permission to delete message %s for game relay in channel %s",
+                                message.id,
+                                message.channel.id,
+                            )
+                        except discord.HTTPException as exc:
+                            deleted = False
+                            logger.warning("Failed to delete message %s: %s", message.id, exc)
+                    
+                    # After sending, if has_attachments and not has_links, edit to placeholder (match VN bot)
+                    if has_attachments and not has_links:
+                        placeholder = "\u200b"
+                        if message.content != placeholder:
+                            try:
+                                await message.edit(content=placeholder, attachments=message.attachments, suppress=True)
+                            except discord.HTTPException as exc:
+                                logger.debug("Unable to clear attachment message %s: %s", message.id, exc)
                 except discord.HTTPException as exc:
                     logger.error("Failed to send game VN panel: %s", exc, exc_info=True)
             elif has_attachments:
-                # No VN panel but message has attachments - send attachments as-is (for images without text)
-                logger.info("Sending attachments only (no VN panel) for game player %s", message.author.id)
-                attachment_files = []
-                for attachment in message.attachments:
-                    try:
-                        attachment_bytes = await attachment.read()
-                        attachment_file = discord.File(
-                            io.BytesIO(attachment_bytes),
-                            filename=attachment.filename
-                        )
-                        attachment_files.append(attachment_file)
-                    except Exception as exc:
-                        logger.warning("Failed to download attachment %s: %s", attachment.filename, exc)
-                
-                if attachment_files:
-                    send_kwargs = {
-                        "files": attachment_files,
-                        "allowed_mentions": discord.AllowedMentions.none(),
-                    }
-                    if message.reference:
-                        send_kwargs["reference"] = message.reference
-                    
-                    try:
-                        await message.channel.send(**send_kwargs)
-                        # Delete original message
-                        try:
-                            await message.delete()
-                        except discord.HTTPException:
-                            pass
-                    except Exception as exc:
-                        logger.error("Failed to send attachments: %s", exc, exc_info=True)
+                # No VN panel but message has attachments - preserve original message (match VN bot)
+                # VN bot doesn't delete messages with attachments unless they interrupt calculations
+                logger.info("Preserving message with attachments (no VN panel) for game player %s", message.author.id)
+                # Don't delete - attachments should remain in original message
             else:
                 logger.warning("No VN panel file created for game player %s as %s (MESSAGE_STYLE=%s, files=%s)", 
                              message.author.id, character_display_name, MESSAGE_STYLE, len(files) if 'files' in locals() else 0)
@@ -2895,24 +2872,17 @@ class GameBoardManager:
                     await ctx.reply("Game is locked.", mention_author=False)
                     return
                 
-                # Check if game is paused - delete dice commands silently (unless GM override)
+                # Check if game is paused - block dice commands for everyone (including GM/admin)
+                if game_state.is_paused:
+                    # Game is paused - delete message silently
+                    try:
+                        await ctx.message.delete()
+                    except discord.HTTPException:
+                        pass
+                    return
+                
                 is_gm = self._is_gm(ctx.author, game_state)
                 is_gm_override = False
-                
-                if game_state.is_paused:
-                    # If GM is forcing a roll for another player, allow it
-                    if target_player and is_gm:
-                        is_gm_override = True
-                    elif is_gm and not target_player and ctx.author.id in game_state.players:
-                        # GM rolling for themselves - allow it
-                        is_gm_override = True
-                    else:
-                        # Game is paused and not GM override - delete message silently
-                        try:
-                            await ctx.message.delete()
-                        except discord.HTTPException:
-                            pass
-                        return
                 
                 # Check if GM is forcing a roll for another player
                 if target_player and is_gm:
@@ -3180,6 +3150,60 @@ class GameBoardManager:
                         except Exception:
                             pass
                 
+                # After board/turn handling, show next turn info or game over standings
+                try:
+                    if pack and hasattr(pack, "get_game_data"):
+                        data = pack.get_game_data(game_state)
+                        game_ended = data.get("game_ended", False)
+                        goal_turns = data.get("goal_reached_turn", {}) or {}
+                        turn_order = data.get("turn_order", [])
+                        player_numbers = data.get("player_numbers", {})
+                        turn_order_index = {uid: idx for idx, uid in enumerate(turn_order)}
+                        
+                        if game_ended:
+                            # Build finish order sorted by turn reached, then turn order
+                            ordered_finishers = sorted(
+                                goal_turns.items(),
+                                key=lambda item: (
+                                    item[1],
+                                    turn_order_index.get(item[0], 10_000_000),
+                                    item[0],
+                                ),
+                            )
+                            lines = ["🏁 **Game Over! All players reached the goal.**", "", "**Finish order:**"]
+                            for rank, (user_id, turn_num) in enumerate(ordered_finishers, start=1):
+                                player_obj = game_state.players.get(user_id)
+                                pnum = player_numbers.get(user_id, "?")
+                                name = player_obj.character_name if player_obj and player_obj.character_name else f"Player {pnum}"
+                                mention = f"<@{user_id}>"
+                                lines.append(f"{rank}) {name} (Player {pnum}) {mention} — Turn {turn_num}")
+                            await ctx.channel.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
+                        else:
+                            players_rolled = set(data.get("players_rolled_this_turn", []))
+                            # Skip players who already reached the goal (win_tile from rules)
+                            rules = game_config.rules or {}
+                            win_tile = int(rules.get("win_tile", 100))
+                            pending = []
+                            for user_id in turn_order:
+                                if user_id in players_rolled:
+                                    continue
+                                player_obj = game_state.players.get(user_id)
+                                if not player_obj:
+                                    continue
+                                tile_num = data.get("tile_numbers", {}).get(user_id, 1)
+                                if tile_num >= win_tile:
+                                    continue
+                                pnum = player_numbers.get(user_id, "?")
+                                name = player_obj.character_name or f"Player {pnum}"
+                                mention = f"<@{user_id}>"
+                                pending.append(f"Player {pnum} - {name} ({mention})")
+                            
+                            if pending:
+                                lines = ["➡️ **Next to roll:**", *pending]
+                                await ctx.channel.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
+                except Exception as exc:
+                    logger.debug("Failed to post next-turn info: %s", exc)
+                
                 try:
                     await self._log_action(game_state, f"{ctx.author.display_name} rolled {result}")
                 except Exception as exc:
@@ -3238,6 +3262,14 @@ class GameBoardManager:
                 await ctx.reply("Game is locked and cannot be started.", mention_author=False)
                 return
             
+            # If game is paused, resume it
+            if game_state.is_paused:
+                game_state.is_paused = False
+                await ctx.reply("✅ Game resumed! Players can now roll dice.", mention_author=False)
+                await self._log_action(game_state, f"Game resumed by {ctx.author.display_name}")
+                return
+            
+            # If game already started and not paused, show error
             if game_state.game_started:
                 await ctx.reply("Game has already started! Use `!endgame` to end it first.", mention_author=False)
                 return

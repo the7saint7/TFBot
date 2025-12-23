@@ -6839,10 +6839,16 @@ async def prefix_roll_command(ctx: commands.Context, *, args: str = "") -> None:
     # !roll is only for gacha, not for game board
     # Game board uses !dice only
 
-    await ctx.reply(
-        "Rolls are only supported in the gacha channel or inside active game threads.",
-        mention_author=False,
-    )
+    if GACHA_MANAGER is not None:
+        await ctx.reply(
+            "Rolls are only supported in the gacha channel (if enabled).",
+            mention_author=False,
+        )
+    else:
+        await ctx.reply(
+            "Rolls are not available. Gacha system is not enabled.",
+            mention_author=False,
+        )
 
 
 @bot.command(name="rules")
