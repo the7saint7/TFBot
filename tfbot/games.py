@@ -1533,10 +1533,6 @@ class GameBoardManager:
                     except Exception:
                         pass
         
-        # CRITICAL: Process queued messages after board is shown
-        # This ensures VN messages appear AFTER command output, not interrupting it
-        await self._process_queued_messages(game_state)
-
     async def _process_queued_messages(self, game_state: GameState) -> None:
         """Process all queued messages for a game thread after command completes."""
         thread_id = game_state.game_thread_id
@@ -3113,7 +3109,8 @@ class GameBoardManager:
         
         # CRITICAL: Use command lock to prevent concurrent execution and ensure proper ordering
         # This ensures player commands don't interrupt GM commands and board updates happen in order
-        if isinstance(ctx.channel, discord.Thread):
+        processed_in_thread = isinstance(ctx.channel, discord.Thread)
+        if processed_in_thread:
             thread_id = ctx.channel.id
             command_lock = self._get_command_lock(thread_id)
             
@@ -3129,6 +3126,12 @@ class GameBoardManager:
         else:
             # Not in a thread, execute without lock
             await _impl()
+
+        # Process queued messages once the command has fully completed (lock released if used)
+        if processed_in_thread:
+            game_state = await self._get_game_state_for_context(ctx)
+            if game_state:
+                await self._process_queued_messages(game_state)
 
     async def command_start(self, ctx: commands.Context) -> None:
         """Start the game - render board and allow dice rolls (GM only)."""
