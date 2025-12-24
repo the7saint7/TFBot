@@ -18,7 +18,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import aiohttp
 import discord
@@ -243,7 +243,13 @@ class FaceGitOperation:
     variant_name: str
 
 
-_FACE_GIT_QUEUE: "queue.Queue[FaceGitOperation]" = queue.Queue()
+@dataclass(frozen=True)
+class FaceGitSyncOperation:
+    """Sentinel operation for periodic sync from remote."""
+    git_repo_root: Path
+
+
+_FACE_GIT_QUEUE: "queue.Queue[Union[FaceGitOperation, FaceGitSyncOperation]]" = queue.Queue()
 
 
 def _ensure_face_git_worker() -> None:
@@ -285,11 +291,26 @@ def _face_git_worker_loop() -> None:
     batch: List[FaceGitOperation] = []
     while True:
         operation = _FACE_GIT_QUEUE.get()
+        
+        # Handle sync operations immediately (don't batch)
+        if isinstance(operation, FaceGitSyncOperation):
+            try:
+                _process_face_git_sync(operation)
+            finally:
+                _FACE_GIT_QUEUE.task_done()
+            continue
+        
+        # Batch regular push operations
         batch.append(operation)
         if _FACE_GIT_BATCH_WINDOW > 0:
             while True:
                 try:
                     next_op = _FACE_GIT_QUEUE.get(timeout=_FACE_GIT_BATCH_WINDOW)
+                    # If we get a sync operation, put it back and process our batch first
+                    if isinstance(next_op, FaceGitSyncOperation):
+                        _FACE_GIT_QUEUE.put(next_op)
+                        _FACE_GIT_QUEUE.task_done()
+                        break
                     batch.append(next_op)
                 except queue.Empty:
                     break
@@ -299,6 +320,28 @@ def _face_git_worker_loop() -> None:
             for _ in batch:
                 _FACE_GIT_QUEUE.task_done()
             batch.clear()
+
+
+def _process_face_git_sync(operation: FaceGitSyncOperation) -> None:
+    """Pull latest changes from remote repository."""
+    git_executable = shutil.which("git")
+    if not git_executable:
+        return
+    
+    repo_root = operation.git_repo_root
+    if not repo_root.exists():
+        return
+    
+    try:
+        # Pull with rebase and autostash to handle any local changes
+        pull_cmd = [git_executable, "-C", str(repo_root), "pull", "--rebase", "--autostash", "--quiet"]
+        result = subprocess.run(pull_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            logger.info("Synced faces from remote for %s", repo_root)
+        else:
+            logger.debug("Face sync pull returned non-zero: %s", result.stderr.strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to sync faces from remote for %s: %s", repo_root, exc)
 
 
 def _process_face_git_batch(batch: Sequence[FaceGitOperation]) -> None:
@@ -371,8 +414,36 @@ def _run_face_git_batch_for_repo(
     cmd = [git_executable, "-C", str(repo_root), "commit", "-m", commit_msg]
     subprocess.run(cmd, capture_output=True, text=True, check=True)
 
+    # Pull with rebase before pushing to handle concurrent bot updates
+    try:
+        pull_cmd = [git_executable, "-C", str(repo_root), "pull", "--rebase", "--autostash"]
+        pull_result = subprocess.run(pull_cmd, capture_output=True, text=True, timeout=60)
+        if pull_result.returncode != 0:
+            logger.warning(
+                "Face git pull --rebase failed for %s: %s",
+                repo_root,
+                pull_result.stderr.strip(),
+            )
+            # Try to abort the rebase and continue without pushing
+            subprocess.run(
+                [git_executable, "-C", str(repo_root), "rebase", "--abort"],
+                capture_output=True,
+                text=True,
+            )
+            return
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Face git pull timed out or failed for %s: %s", repo_root, exc)
+        return
+
     cmd = [git_executable, "-C", str(repo_root), "push"]
-    subprocess.run(cmd, capture_output=True, text=True, check=True)
+    push_result = subprocess.run(cmd, capture_output=True, text=True)
+    if push_result.returncode != 0:
+        logger.warning(
+            "Face git push failed for %s: %s",
+            repo_root,
+            push_result.stderr.strip(),
+        )
+        return
 
     logger.info(
         "Pushed %d face cache change(s) to remote for %s",
@@ -383,7 +454,15 @@ def _run_face_git_batch_for_repo(
 
 VN_SELECTION_FILE = Path(os.getenv("TFBOT_VN_SELECTIONS", "tf_outfits.json"))
 _VN_LAYOUT_FILE_SETTING = os.getenv("TFBOT_VN_LAYOUTS", "vn_layouts.json").strip()
-VN_LAYOUT_FILE = Path(_VN_LAYOUT_FILE_SETTING) if _VN_LAYOUT_FILE_SETTING else None
+if _VN_LAYOUT_FILE_SETTING:
+    layout_path = Path(_VN_LAYOUT_FILE_SETTING)
+    # Resolve relative to BASE_DIR if not absolute
+    if not layout_path.is_absolute():
+        VN_LAYOUT_FILE = (BASE_DIR / layout_path).resolve()
+    else:
+        VN_LAYOUT_FILE = layout_path.resolve()
+else:
+    VN_LAYOUT_FILE = None
 
 SPRITE_IMAGE_SUFFIXES: Tuple[str, ...] = (".png", ".webp")
 
@@ -1529,25 +1608,16 @@ def _check_face_exists_in_remote(
 
 def _sync_faces_from_remote(git_repo_root: Path) -> None:
     """
-    Pull latest changes from remote for the faces directory.
+    Queue a sync operation to pull latest changes from remote.
     
     Args:
         git_repo_root: Git repository root directory
     """
-    git_executable = shutil.which("git")
-    if not git_executable:
+    if not git_repo_root.exists():
         return
     
-    try:
-        # Pull latest changes (only fast-forward)
-        pull_cmd = [git_executable, "-C", str(git_repo_root), "pull", "--ff-only", "--quiet"]
-        result = subprocess.run(pull_cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode == 0:
-            logger.debug("Synced faces from remote")
-        else:
-            logger.debug("Face sync pull returned non-zero: %s", result.stderr.strip())
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-        logger.debug("Failed to sync faces from remote: %s", exc)
+    _ensure_face_git_worker()
+    _FACE_GIT_QUEUE.put(FaceGitSyncOperation(git_repo_root=git_repo_root))
 
 
 def _cache_character_face_background(
@@ -1692,29 +1762,46 @@ def _cache_character_face_background(
         logger.warning("Error caching face for %s/%s: %s", character_dir.name, variant_dir.name, exc, exc_info=True)
 
 
-# Periodic sync state
-_last_face_sync_time: float = 0.0
-_face_sync_interval: float = 86400.0  # 24 hours in seconds
-_face_sync_lock = threading.Lock()
+# Periodic sync state (convert hours to seconds)
+_FACE_SYNC_INTERVAL_HOURS = max(0.016, float_from_env("TFBOT_FACE_SYNC_HOURS", 3.0))  # Default 3 hours (min 1 minute)
+_FACE_SYNC_INTERVAL = _FACE_SYNC_INTERVAL_HOURS * 3600.0  # Convert to seconds
+_face_sync_scheduler: Optional[threading.Thread] = None
+_face_sync_scheduler_lock = threading.Lock()
 
 
-def _periodic_face_sync() -> None:
-    """Periodic background task to sync faces from remote git repository."""
-    global _last_face_sync_time
-    
+def _ensure_face_sync_scheduler() -> None:
+    """Start the periodic sync scheduler if not already running."""
+    global _face_sync_scheduler
+    with _face_sync_scheduler_lock:
+        if _face_sync_scheduler and _face_sync_scheduler.is_alive():
+            return
+        _face_sync_scheduler = threading.Thread(
+            target=_face_sync_scheduler_loop,
+            name="face-sync-scheduler",
+            daemon=True,
+        )
+        _face_sync_scheduler.start()
+
+
+def _face_sync_scheduler_loop() -> None:
+    """Background loop that periodically triggers face sync from remote."""
     git_repo_root = _resolve_characters_repo_root()
     if not git_repo_root or not git_repo_root.exists():
+        logger.warning("Cannot start face sync scheduler: no git repo found")
         return
     
-    current_time = time.time()
-    with _face_sync_lock:
-        # Check if enough time has passed since last sync
-        if current_time - _last_face_sync_time < _face_sync_interval:
-            return
-        _last_face_sync_time = current_time
+    logger.info(
+        "Face sync scheduler started (interval: %.1f hours)",
+        _FACE_SYNC_INTERVAL_HOURS,
+    )
     
-    logger.debug("Running periodic face sync from remote")
-    _sync_faces_from_remote(git_repo_root)
+    while True:
+        try:
+            time.sleep(_FACE_SYNC_INTERVAL)
+            logger.debug("Triggering periodic face sync from remote")
+            _sync_faces_from_remote(git_repo_root)
+        except Exception as exc:
+            logger.warning("Error in face sync scheduler: %s", exc, exc_info=True)
 
 
 def _cache_character_face(
@@ -1760,26 +1847,15 @@ def _cache_character_face(
         face_relative_path = cache_file.relative_to(git_repo_root)
         if _check_face_exists_in_remote(git_repo_root, face_relative_path):
             logger.debug("Face exists in remote for %s/%s, syncing...", character_dir.name, variant_dir.name)
-            # Sync from remote in background
-            sync_thread = threading.Thread(
-                target=_sync_faces_from_remote,
-                args=(git_repo_root,),
-                daemon=True,
-                name=f"face-sync-{character_dir.name}-{variant_dir.name}",
-            )
-            sync_thread.start()
+            # Queue sync operation through worker
+            _sync_faces_from_remote(git_repo_root)
             return
     
-    # Trigger periodic sync check (non-blocking)
+    # Ensure periodic sync scheduler is running
     try:
-        sync_check_thread = threading.Thread(
-            target=_periodic_face_sync,
-            daemon=True,
-            name="face-sync-check",
-        )
-        sync_check_thread.start()
+        _ensure_face_sync_scheduler()
     except Exception:
-        pass  # Ignore errors in sync check
+        pass  # Ignore errors in scheduler startup
     
     # Make a copy of the image for thread safety
     try:
