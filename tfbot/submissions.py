@@ -320,6 +320,29 @@ class SubmissionManager:
         else:
             await ctx.reply(f"Mirrored locally but git push failed: {detail}", mention_author=False)
 
+    async def sync_command(self, ctx: commands.Context) -> None:
+        author = ctx.author
+        guild = ctx.guild
+        if not isinstance(author, discord.Member) or guild is None:
+            await ctx.reply("Run this command inside a server.", mention_author=False)
+            return
+        if SUBMISSION_CHANNEL_ID and ctx.channel.id != SUBMISSION_CHANNEL_ID:
+            await ctx.reply("This command can only be used in the designated submission channel.", mention_author=False)
+            return
+        if not self._has_approval_power(author):
+            await ctx.reply("You lack permission to run repository sync.", mention_author=False)
+            return
+        repo_root = self._resolve_repo()
+        if repo_root is None:
+            await ctx.reply("characters_repo is not configured.", mention_author=False)
+            return
+
+        success, detail = await asyncio.to_thread(self._sync_characters_repo, repo_root)
+        if success:
+            await ctx.reply("characters_repo synced successfully.", mention_author=False)
+        else:
+            await ctx.reply(f"Sync failed: {detail}", mention_author=False)
+
     def _select_attachment(self, attachments: Sequence[discord.Attachment]) -> Optional[discord.Attachment]:
         for attachment in attachments:
             if attachment.content_type and attachment.content_type.startswith("image/"):
@@ -413,6 +436,26 @@ class SubmissionManager:
         relative_path = outfit_path.relative_to(repo_root)
         commit_message = f"mirrored by {actor_name}"
         return self._commit_submission(repo_root, relative_path, commit_message)
+
+    def _sync_characters_repo(self, repo_root: Path) -> tuple[bool, str]:
+        git_executable = shutil.which("git")
+        if not git_executable:
+            return False, "git executable not found."
+        pull_cmd = [git_executable, "-C", str(repo_root), "pull"]
+        pull_result = subprocess.run(pull_cmd, capture_output=True, text=True)
+        if pull_result.returncode == 0:
+            return True, pull_result.stdout.strip() or "pull completed."
+        pull_detail = pull_result.stderr.strip() or pull_result.stdout.strip() or "git pull failed."
+        push_cmd = [git_executable, "-C", str(repo_root), "push"]
+        push_result = subprocess.run(push_cmd, capture_output=True, text=True)
+        if push_result.returncode != 0:
+            push_detail = push_result.stderr.strip() or push_result.stdout.strip() or "git push failed."
+            return False, f"{pull_detail} Also unable to push: {push_detail}"
+        retry_result = subprocess.run(pull_cmd, capture_output=True, text=True)
+        if retry_result.returncode == 0:
+            return True, "local changes pushed; pull completed."
+        retry_detail = retry_result.stderr.strip() or retry_result.stdout.strip() or "git pull failed after push."
+        return False, retry_detail
 
     def _render_preview(self, record: SubmissionRecord, preview_text: str) -> Optional[discord.File]:
         try:
@@ -702,6 +745,10 @@ def setup_submission_features(bot: commands.Bot) -> SubmissionManager:
     @bot.command(name="mirror")
     async def mirror_command(ctx: commands.Context, character: str, pose: str, outfit: str):
         await manager.mirror_command(ctx, character, pose, outfit)
+
+    @bot.command(name="synch")
+    async def sync_command(ctx: commands.Context):
+        await manager.sync_command(ctx)
 
     bot.add_listener(manager.on_raw_reaction_add)
     return manager

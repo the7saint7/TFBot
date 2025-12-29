@@ -385,7 +385,7 @@ GACHA_CHANNEL_ID = int_from_env("TFBOT_GACHA_CHANNEL_ID", 0)
 GACHA_ENABLED = GACHA_CHANNEL_ID > 0
 CLASSIC_ENABLED = BOT_MODE != "gacha" and TF_CHANNEL_ID > 0
 SUBMISSION_CHANNEL_ID = int_from_env("TFBOT_SUBMISSION_CHANNEL_ID", 0)
-SUBMISSION_COMMANDS: set[str] = {"submit", "mirror"}
+SUBMISSION_COMMANDS: set[str] = {"submit", "mirror", "synch"}
 
 if BOT_MODE == "gacha" and not GACHA_ENABLED:
     raise RuntimeError("TFBOT_GACHA_CHANNEL_ID is required when running in gacha mode.")
