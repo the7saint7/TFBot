@@ -441,21 +441,68 @@ class SubmissionManager:
         git_executable = shutil.which("git")
         if not git_executable:
             return False, "git executable not found."
-        pull_cmd = [git_executable, "-C", str(repo_root), "pull"]
-        pull_result = subprocess.run(pull_cmd, capture_output=True, text=True)
-        if pull_result.returncode == 0:
-            return True, pull_result.stdout.strip() or "pull completed."
-        pull_detail = pull_result.stderr.strip() or pull_result.stdout.strip() or "git pull failed."
-        push_cmd = [git_executable, "-C", str(repo_root), "push"]
-        push_result = subprocess.run(push_cmd, capture_output=True, text=True)
-        if push_result.returncode != 0:
-            push_detail = push_result.stderr.strip() or push_result.stdout.strip() or "git push failed."
-            return False, f"{pull_detail} Also unable to push: {push_detail}"
-        retry_result = subprocess.run(pull_cmd, capture_output=True, text=True)
-        if retry_result.returncode == 0:
-            return True, "local changes pushed; pull completed."
-        retry_detail = retry_result.stderr.strip() or retry_result.stdout.strip() or "git pull failed after push."
-        return False, retry_detail
+        pull_rc, pull_detail = self._run_git_command(git_executable, repo_root, ["pull"])
+        if pull_rc == 0:
+            return True, "Repository pulled successfully."
+        logger.warning("characters_repo pull failed: %s", pull_detail)
+
+        push_rc, push_detail = self._run_git_command(git_executable, repo_root, ["push"])
+        if push_rc == 0:
+            retry_rc, _ = self._run_git_command(git_executable, repo_root, ["pull"])
+            if retry_rc == 0:
+                return True, "Local changes pushed and repository pulled."
+        else:
+            logger.warning("characters_repo push failed: %s", push_detail)
+
+        reset_success = self._hard_reset_repo(git_executable, repo_root)
+        if reset_success:
+            return True, "Repository hard-reset to remote."
+        return False, "Unable to synchronize characters_repo automatically."
+
+    def _run_git_command(self, git_executable: str, repo_root: Path, args: list[str]) -> tuple[int, str]:
+        cmd = [git_executable, "-C", str(repo_root), *args]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        return result.returncode, detail
+
+    def _detect_upstream_ref(self, git_executable: str, repo_root: Path) -> Optional[str]:
+        rc, detail = self._run_git_command(
+            git_executable,
+            repo_root,
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        if rc == 0 and detail:
+            return detail.splitlines()[0].strip()
+        logger.warning("Failed to detect upstream ref for %s: %s", repo_root, detail)
+        return None
+
+    def _hard_reset_repo(self, git_executable: str, repo_root: Path) -> bool:
+        upstream = self._detect_upstream_ref(git_executable, repo_root) or "origin/main"
+        fetch_rc, fetch_detail = self._run_git_command(
+            git_executable,
+            repo_root,
+            ["fetch", "--all", "--tags", "--prune"],
+        )
+        if fetch_rc != 0:
+            logger.warning("characters_repo fetch failed: %s", fetch_detail)
+            return False
+        reset_rc, reset_detail = self._run_git_command(
+            git_executable,
+            repo_root,
+            ["reset", "--hard", upstream],
+        )
+        if reset_rc != 0:
+            logger.warning("characters_repo reset --hard failed: %s", reset_detail)
+            return False
+        clean_rc, clean_detail = self._run_git_command(
+            git_executable,
+            repo_root,
+            ["clean", "-fd"],
+        )
+        if clean_rc != 0:
+            logger.warning("characters_repo clean failed: %s", clean_detail)
+            return False
+        return True
 
     def _render_preview(self, record: SubmissionRecord, preview_text: str) -> Optional[discord.File]:
         try:
