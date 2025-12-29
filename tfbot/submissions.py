@@ -18,7 +18,7 @@ import discord
 from discord.ext import commands
 
 from tfbot.models import TransformationState
-from tfbot.panels import VN_CACHE_DIR, parse_discord_formatting, render_vn_panel
+from tfbot.panels import VN_CACHE_DIR, compose_game_avatar, parse_discord_formatting, render_vn_panel
 from tfbot.utils import is_admin, utc_now
 
 try:
@@ -409,6 +409,7 @@ class SubmissionManager:
             return False, "failed to process outfit image."
 
         self._clear_vn_cache_entry(character, pose)
+        compose_game_avatar.cache_clear()
         relative_path = outfit_path.relative_to(repo_root)
         commit_message = f"mirrored by {actor_name}"
         return self._commit_submission(repo_root, relative_path, commit_message)
