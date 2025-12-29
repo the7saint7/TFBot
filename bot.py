@@ -372,6 +372,7 @@ from tfbot.utils import (
     path_from_env,
     utc_now,
 )
+from tfbot.submissions import setup_submission_features
 
 if TYPE_CHECKING:
     from tfbot.gacha import GachaProfile
@@ -383,6 +384,7 @@ TF_CHANNEL_ID = int_from_env("TFBOT_CHANNEL_ID", 0)
 GACHA_CHANNEL_ID = int_from_env("TFBOT_GACHA_CHANNEL_ID", 0)
 GACHA_ENABLED = GACHA_CHANNEL_ID > 0
 CLASSIC_ENABLED = BOT_MODE != "gacha" and TF_CHANNEL_ID > 0
+SUBMISSION_CHANNEL_ID = int_from_env("TFBOT_SUBMISSION_CHANNEL_ID", 0)
 
 if BOT_MODE == "gacha" and not GACHA_ENABLED:
     raise RuntimeError("TFBOT_GACHA_CHANNEL_ID is required when running in gacha mode.")
@@ -1382,6 +1384,7 @@ bot = TFBot(command_prefix=os.getenv("TFBOT_PREFIX", "!"), intents=intents, case
 ROLEPLAY_COG: Optional[RoleplayCog] = None
 GAME_BOARD_MANAGER: Optional["GameBoardManager"] = None
 _SYNCED_APP_COMMAND_GUILDS: set[int] = set()
+SUBMISSION_MANAGER = setup_submission_features(bot)
 
 
 async def setup_bot_extensions() -> None:
@@ -4896,8 +4899,16 @@ async def on_message(message: discord.Message):
     )
 
     ctx = await bot.get_context(message)
+    submit_channel_id = SUBMISSION_CHANNEL_ID if SUBMISSION_CHANNEL_ID > 0 else None
+    command_allowed_extra = bool(
+        submit_channel_id
+        and ctx.command
+        and ctx.command.qualified_name == "submit"
+        and getattr(message.channel, "id", None) == submit_channel_id
+    )
+
     if ctx.command:
-        if channel_allowed:
+        if channel_allowed or command_allowed_extra:
             command_invoked = True
             logger.debug(
                 "Invoking command %s by %s in channel %s",

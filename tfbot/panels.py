@@ -3063,6 +3063,7 @@ def render_vn_panel(
     gacha_outfit_override: Optional[str] = None,
     gacha_pose_override: Optional[str] = None,
     gacha_border: Optional[str] = None,
+    override_avatar_image: Optional["Image.Image"] = None,
 ) -> Optional[discord.File]:
     try:
         from PIL import Image, ImageDraw
@@ -3144,7 +3145,11 @@ def render_vn_panel(
     draw = ImageDraw.Draw(base)
 
     avatar_image = None
-    if avatar_box:
+    if override_avatar_image is not None:
+        avatar_image = override_avatar_image.copy()
+        if avatar_image.mode != "RGBA":
+            avatar_image = avatar_image.convert("RGBA")
+    if avatar_box and avatar_image is None:
         avatar_image = compose_state_avatar_image(
             state,
             pose_override=gacha_pose_override,
