@@ -209,9 +209,14 @@ class SubmissionManager:
         if repo_root is None:
             await ctx.reply("characters_repo is not configured; submissions are unavailable.", mention_author=False)
             return
-        target_dir = repo_root / "characters" / character / pose / "outfits"
-        if not target_dir.exists():
-            await ctx.reply("Character or pose folder not found in characters_repo.", mention_author=False)
+        pose_dir = repo_root / "characters" / character / pose
+        target_dir = pose_dir / "outfits"
+        try:
+            pose_dir.mkdir(parents=True, exist_ok=True)
+            target_dir.mkdir(exist_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to create character/pose directory %s: %s", target_dir, exc)
+            await ctx.reply("Unable to create character or pose folders in characters_repo.", mention_author=False)
             return
         dest_file = target_dir / f"{outfit}.png"
         if dest_file.exists():
