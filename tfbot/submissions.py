@@ -18,7 +18,7 @@ import discord
 from discord.ext import commands
 
 from tfbot.models import TransformationState
-from tfbot.panels import parse_discord_formatting, render_vn_panel
+from tfbot.panels import VN_CACHE_DIR, parse_discord_formatting, render_vn_panel
 from tfbot.utils import is_admin, utc_now
 
 try:
@@ -278,6 +278,48 @@ class SubmissionManager:
                 logger.debug("Failed to add reaction %s to submission message %s", emoji, sent_message.id)
         await ctx.reply("Submission posted for approval.", mention_author=False)
 
+    async def mirror_command(self, ctx: commands.Context, character: str, pose: str, outfit: str) -> None:
+        author = ctx.author
+        guild = ctx.guild
+        if not isinstance(author, discord.Member) or guild is None:
+            await ctx.reply("Run this command inside a server.", mention_author=False)
+            return
+        if SUBMISSION_CHANNEL_ID and ctx.channel.id != SUBMISSION_CHANNEL_ID:
+            await ctx.reply("This command can only be used in the designated submission channel.", mention_author=False)
+            return
+        if not self._has_approval_power(author):
+            await ctx.reply("You lack permission to mirror outfits.", mention_author=False)
+            return
+        validation = self._validate_inputs(character, pose, outfit)
+        if validation:
+            await ctx.reply(validation, mention_author=False)
+            return
+        repo_root = self._resolve_repo()
+        if repo_root is None:
+            await ctx.reply("characters_repo is not configured; mirroring is unavailable.", mention_author=False)
+            return
+        target_dir = repo_root / "characters" / character / pose / "outfits"
+        outfit_path = target_dir / f"{outfit}.png"
+        if not outfit_path.exists():
+            await ctx.reply("That outfit image does not exist yet.", mention_author=False)
+            return
+
+        success, detail = await asyncio.to_thread(
+            self._mirror_outfit_image,
+            repo_root,
+            outfit_path,
+            author.display_name,
+            character,
+            pose,
+        )
+        if success:
+            message = (
+                f"Mirrored `{character}` pose `{pose}` outfit `{outfit}` and pushed the update."
+            )
+            await ctx.reply(message, mention_author=False)
+        else:
+            await ctx.reply(f"Mirrored locally but git push failed: {detail}", mention_author=False)
+
     def _select_attachment(self, attachments: Sequence[discord.Attachment]) -> Optional[discord.Attachment]:
         for attachment in attachments:
             if attachment.content_type and attachment.content_type.startswith("image/"):
@@ -343,6 +385,33 @@ class SubmissionManager:
 
     def _store_image(self, record: SubmissionRecord, image: "Image.Image") -> None:
         image.save(record.image_path, format="PNG")
+
+    def _mirror_outfit_image(
+        self,
+        repo_root: Path,
+        outfit_path: Path,
+        actor_name: str,
+        character: str,
+        pose: str,
+    ) -> tuple[bool, str]:
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            return False, "image processing is unavailable."
+        if not outfit_path.exists():
+            return False, "outfit image missing."
+        try:
+            with Image.open(outfit_path) as img:
+                mirrored = ImageOps.mirror(img.convert("RGBA"))
+                mirrored.save(outfit_path)
+        except OSError as exc:
+            logger.warning("Failed to mirror outfit %s: %s", outfit_path, exc)
+            return False, "failed to process outfit image."
+
+        self._clear_vn_cache_entry(character, pose)
+        relative_path = outfit_path.relative_to(repo_root)
+        commit_message = f"mirrored by {actor_name}"
+        return self._commit_submission(repo_root, relative_path, commit_message)
 
     def _render_preview(self, record: SubmissionRecord, preview_text: str) -> Optional[discord.File]:
         try:
@@ -411,6 +480,24 @@ class SubmissionManager:
         if not isinstance(facing, str):
             return False
         return facing.strip().lower() == "left"
+
+    def _clear_vn_cache_entry(self, character: str, pose: str) -> None:
+        if VN_CACHE_DIR is None:
+            return
+        candidates = {character, character.lower()}
+        pose_candidates = {pose, pose.lower()}
+        for char_token in candidates:
+            char_dir = VN_CACHE_DIR / char_token
+            for pose_token in pose_candidates:
+                cache_dir = char_dir / pose_token
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                    logger.debug("Cleared VN cache directory %s", cache_dir)
+            if char_dir.exists():
+                try:
+                    next(char_dir.iterdir())
+                except StopIteration:
+                    shutil.rmtree(char_dir, ignore_errors=True)
 
     def _build_preview_state(self, record: SubmissionRecord) -> TransformationState:
         now = utc_now()
@@ -568,16 +655,17 @@ class SubmissionManager:
         except OSError as exc:
             logger.warning("Failed to copy submission image into repo: %s", exc)
             return False, "failed to copy image into repository."
-        return self._commit_submission(repo_root, relative_path, approver_name)
+        commit_message = f"aprouved by {approver_name}"
+        return self._commit_submission(repo_root, relative_path, commit_message)
 
-    def _commit_submission(self, repo_root: Path, relative_path: Path, approver_name: str) -> tuple[bool, str]:
+    def _commit_submission(self, repo_root: Path, relative_path: Path, commit_message: str) -> tuple[bool, str]:
         git_executable = shutil.which("git")
         if not git_executable:
             return False, "git executable not found."
 
         commands = [
             [git_executable, "-C", str(repo_root), "add", str(relative_path)],
-            [git_executable, "-C", str(repo_root), "commit", "-m", f"aprouved by {approver_name}"],
+            [git_executable, "-C", str(repo_root), "commit", "-m", commit_message],
         ]
         for cmd in commands:
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -609,6 +697,10 @@ def setup_submission_features(bot: commands.Bot) -> SubmissionManager:
     @bot.command(name="submit")
     async def submit_command(ctx: commands.Context, character: str, pose: str, outfit: str):
         await manager.submit_command(ctx, character, pose, outfit)
+
+    @bot.command(name="mirror")
+    async def mirror_command(ctx: commands.Context, character: str, pose: str, outfit: str):
+        await manager.mirror_command(ctx, character, pose, outfit)
 
     bot.add_listener(manager.on_raw_reaction_add)
     return manager
