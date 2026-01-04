@@ -17,6 +17,7 @@ from typing import Dict, Optional, Sequence
 import discord
 from discord.ext import commands
 
+from tfbot.character_lookup import CharacterNameNormalizer, CharacterNormalizationError
 from tfbot.models import TransformationState
 from tfbot.panels import VN_CACHE_DIR, compose_game_avatar, parse_discord_formatting, render_vn_panel
 from tfbot.utils import is_admin, utc_now
@@ -165,6 +166,7 @@ class SubmissionManager:
         self.pending_by_message: Dict[int, SubmissionRecord] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
         self._repo_root: Optional[Path] = None
+        self._character_normalizer: Optional[CharacterNameNormalizer] = None
         _ensure_directories()
         self._load_existing()
 
@@ -209,6 +211,10 @@ class SubmissionManager:
         if repo_root is None:
             await ctx.reply("characters_repo is not configured; submissions are unavailable.", mention_author=False)
             return
+        character, normalization_error = self._normalize_character_name(character, repo_root=repo_root)
+        if normalization_error:
+            await ctx.reply(normalization_error, mention_author=False)
+            return
         pose_dir = repo_root / "characters" / character / pose
         target_dir = pose_dir / "outfits"
         try:
@@ -218,7 +224,8 @@ class SubmissionManager:
             logger.warning("Failed to create character/pose directory %s: %s", target_dir, exc)
             await ctx.reply("Unable to create character or pose folders in characters_repo.", mention_author=False)
             return
-        dest_file = target_dir / f"{outfit}.png"
+        relative_path = self._build_relative_outfit_path(character, pose, outfit)
+        dest_file = repo_root / relative_path
         if dest_file.exists():
             await ctx.reply("An outfit with that name already exists. Choose a different outfit name.", mention_author=False)
             return
@@ -235,7 +242,7 @@ class SubmissionManager:
             pose=pose,
             outfit=outfit,
             attachment_url=attachment.url,
-            relative_path=str(dest_file.relative_to(repo_root)),
+            relative_path=str(relative_path),
         )
         try:
             self._store_image(record, image)
@@ -298,6 +305,10 @@ class SubmissionManager:
         if repo_root is None:
             await ctx.reply("characters_repo is not configured; mirroring is unavailable.", mention_author=False)
             return
+        character, normalization_error = self._normalize_character_name(character, repo_root=repo_root)
+        if normalization_error:
+            await ctx.reply(normalization_error, mention_author=False)
+            return
         target_dir = repo_root / "characters" / character / pose / "outfits"
         outfit_path = target_dir / f"{outfit}.png"
         if not outfit_path.exists():
@@ -358,6 +369,49 @@ class SubmissionManager:
             return "Outfit names must not contain spaces."
         if not all(ch.isalnum() or ch == "_" for ch in outfit):
             return "Outfit names may only contain letters, numbers, or underscores."
+        return None
+
+    def _build_relative_outfit_path(self, character: str, pose: str, outfit: str) -> Path:
+        return Path("characters") / character / pose / "outfits" / f"{outfit}.png"
+
+    def _normalize_character_name(
+        self,
+        character: str,
+        *,
+        repo_root: Optional[Path] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        repo = repo_root or self._resolve_repo()
+        if repo is None:
+            return None, "characters_repo is not configured."
+        normalizer = self._character_normalizer
+        if normalizer is None or normalizer.repo_root != repo:
+            normalizer = CharacterNameNormalizer(repo)
+            self._character_normalizer = normalizer
+        else:
+            normalizer.refresh()
+        try:
+            canonical = normalizer.normalize(character)
+        except CharacterNormalizationError as exc:
+            logger.warning("Character normalization failed for '%s': %s", character, exc)
+            return None, str(exc)
+        return canonical, None
+
+    def _ensure_canonical_record(self, record: SubmissionRecord, repo_root: Path) -> Optional[str]:
+        canonical, error = self._normalize_character_name(record.character_name, repo_root=repo_root)
+        if error:
+            return error
+        if canonical and canonical != record.character_name:
+            logger.info(
+                "Updating submission %s character folder %s -> %s",
+                record.token,
+                record.character_name,
+                canonical,
+            )
+            record.character_name = canonical
+        relative_path = self._build_relative_outfit_path(record.character_name, record.pose_name, record.outfit_name)
+        new_relative = str(relative_path)
+        if record.target_relative_path != new_relative:
+            record.target_relative_path = new_relative
         return None
 
     async def _load_attachment_image(self, attachment: discord.Attachment) -> "Image.Image":
@@ -682,6 +736,10 @@ class SubmissionManager:
         if repo_root is None:
             await self._notify_channel(record, "characters_repo is unavailable. Cannot approve submissions right now.")
             return
+        normalization_error = self._ensure_canonical_record(record, repo_root)
+        if normalization_error:
+            await self._notify_channel(record, f"Cannot approve submission: {normalization_error}")
+            return
         result = await asyncio.to_thread(self._apply_submission_changes, record, repo_root, member.display_name)
         success, detail = result
         if success:
@@ -739,7 +797,8 @@ class SubmissionManager:
         approver_name: str,
     ) -> tuple[bool, str]:
         try:
-            relative_path = Path(record.target_relative_path)
+            relative_path = self._build_relative_outfit_path(record.character_name, record.pose_name, record.outfit_name)
+            record.target_relative_path = str(relative_path)
             destination = (repo_root / relative_path).resolve()
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(record.image_path, destination)
