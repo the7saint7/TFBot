@@ -1,13 +1,13 @@
 {
   "name": "Snakes and Ladders",
-  "board_image": "snakes_ladders_board.webp",
+  "board_image": "upscaled_snakes_and_ladders.png",
   "grid": {
     "rows": 10,
     "cols": 10,
-    "tile_width": 88,
-    "tile_height": 88,
-    "start_x": 25,
-    "start_y": 213,
+    "tile_width": 318,
+    "tile_height": 319,
+    "start_x": 115,
+    "start_y": 787,
     "blocked_cells": []
   },
   "dice": {
