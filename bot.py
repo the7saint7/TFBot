@@ -6,7 +6,9 @@ import logging
 import os
 import random
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import traceback
@@ -50,6 +52,35 @@ logging.basicConfig(
 logger = logging.getLogger("tfbot")
 if PIL is not None:
     logging.getLogger("PIL").setLevel(logging.ERROR)
+
+_DEBUG_REROLL = os.getenv("TFBOT_DEBUG_REROLL", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _truncate_log_value(value: object, *, limit: int = 64) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…"
+
+
+def _reroll_diag_log(event: str, **fields: object) -> None:
+    """Optional reroll diagnostics to session error log. Enabled by TFBOT_DEBUG_REROLL=1."""
+    if not _DEBUG_REROLL:
+        return
+    safe_fields = " ".join(f"{k}={_truncate_log_value(v)}" for k, v in fields.items() if v is not None)
+    logger.error("reroll_diag: %s %s", event, safe_fields)
+
+
+def _ctx_interaction_id(ctx: Any) -> Optional[int]:
+    message = getattr(ctx, "message", None)
+    interaction_id = getattr(message, "id", None)
+    if isinstance(interaction_id, int):
+        return interaction_id
+    interaction = getattr(ctx, "interaction", None)
+    interaction_id = getattr(interaction, "id", None)
+    if isinstance(interaction_id, int):
+        return interaction_id
+    return None
 
 
 def _resolve_vn_cache_dir() -> Optional[Path]:
@@ -194,6 +225,7 @@ def _sync_character_repo() -> Optional[Path]:
             "TFBOT_CHARACTERS_REPO destination %s exists but is not a git repository; skipping sync.",
             repo_dir,
         )
+        return None
     else:
         old_head = None
         if repo_git_dir.exists():
@@ -201,6 +233,31 @@ def _sync_character_repo() -> Optional[Path]:
             old_head = _read_git_head_sha(git_executable, repo_dir, startup_logger)
             synced = _hard_sync_existing_repo(git_executable, repo_dir, startup_logger)
             if not synced:
+                # Remove stale git index files (e.g. index.lock, index) and retry sync once.
+                for name in ("index.lock", "index"):
+                    path = repo_dir / ".git" / name
+                    if path.exists():
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            try:
+                                os.chmod(path, stat.S_IWRITE if os.name == "nt" else 0o644)
+                                path.unlink(missing_ok=True)
+                            except OSError as e:
+                                startup_logger.warning("Could not remove %s: %s", path, e)
+                startup_logger.info(
+                    "Removed stale git index files (if any); retrying sync."
+                )
+                synced = _hard_sync_existing_repo(git_executable, repo_dir, startup_logger)
+            if not synced:
+                # Fallback: use existing directory if character subfolder exists.
+                characters_dir_fb = repo_dir / target_subdir if target_subdir else repo_dir
+                if characters_dir_fb.exists():
+                    startup_logger.warning(
+                        "Characters repo sync failed; using existing directory at %s.",
+                        characters_dir_fb,
+                    )
+                    return characters_dir_fb
                 startup_logger.warning(
                     "Characters repo at %s could not be synced; deleting and recloning.",
                     repo_dir,
@@ -208,7 +265,17 @@ def _sync_character_repo() -> Optional[Path]:
                 try:
                     shutil.rmtree(repo_dir)
                 except OSError as exc:
-                    startup_logger.warning("Failed to remove %s for reclone: %s", repo_dir, exc)
+                    startup_logger.warning(
+                        "Failed to remove %s for reclone: %s", repo_dir, exc
+                    )
+                    # Fallback when rmtree fails: use existing dir if present.
+                    characters_dir_fb = repo_dir / target_subdir if target_subdir else repo_dir
+                    if repo_dir.exists() and characters_dir_fb.exists():
+                        startup_logger.warning(
+                            "Sync/reclone failed; using existing directory at %s.",
+                            characters_dir_fb,
+                        )
+                        return characters_dir_fb
                     return None
                 action = "clone"
         if not repo_git_dir.exists():
@@ -261,8 +328,27 @@ def _sync_character_repo() -> Optional[Path]:
 
 
 _characters_repo_path = _sync_character_repo()
+_startup_logger = logging.getLogger("tfbot.startup")
+_startup_logger.info(
+    "Characters repo: TFBOT_CHARACTERS_REPO=%s; sprite asset root=%s",
+    "set" if os.getenv("TFBOT_CHARACTERS_REPO", "").strip() else "not set",
+    str(_characters_repo_path) if _characters_repo_path else "not set",
+)
 if _characters_repo_path:
     os.environ["TFBOT_VN_ASSET_ROOT"] = str(_characters_repo_path)
+elif os.getenv("TFBOT_CHARACTERS_REPO", "").strip():
+    _startup_logger.error(
+        "Characters repo could not be synced or used. Sprites will not load. Aborting startup."
+    )
+    print(
+        "\n[ERROR] Characters repo could not be synced or used. Sprites will not load. Aborting startup.",
+        file=sys.stderr,
+    )
+    try:
+        input("Press Enter to close...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    sys.exit(1)
 
 
 def _resolve_character_faces_root() -> Optional[Path]:
@@ -372,33 +458,45 @@ from tfbot.utils import (
     get_setting,
     int_from_env,
     is_admin,
+    is_bot_mod,
     member_profile_name,
     normalize_pose_name,
     path_from_env,
     utc_now,
 )
 from tfbot.submissions import setup_submission_features
+from tfbot.session_error_log import (
+    install as install_session_error_log,
+    register_bot_hooks,
+    shutdown as shutdown_session_error_log,
+)
+from tfbot import bot_moderation as bot_mod
 
 if TYPE_CHECKING:
     from tfbot.gacha import GachaProfile
     from tfbot.games import GameBoardManager
 
 
-# Read TFBOT_TEST flag to determine mode
-# If NOT DEFINED (missing/blank) → None → Backward compatible (use current format)
-# If TFBOT_TEST=YES → True → Use _TEST channels
-# If TFBOT_TEST=NO → False → Use _LIVE channels
+# Read TFBOT_TEST flag to determine mode (test mode OR live mode only)
+# If NOT DEFINED (missing/blank) → LIVE (use _LIVE settings)
+# If TFBOT_TEST=YES → True → Use _TEST settings
+# If TFBOT_TEST=NO → False → Use _LIVE settings
 TFBOT_TEST_RAW = os.getenv("TFBOT_TEST", "").strip().upper()
 if not TFBOT_TEST_RAW:
-    TEST_MODE: Optional[bool] = None  # Backward compatible
+    TEST_MODE: Optional[bool] = False  # Not defined → LIVE (use _LIVE settings only)
 elif TFBOT_TEST_RAW in ("YES", "TRUE", "1", "ON"):
     TEST_MODE = True  # TEST mode
 elif TFBOT_TEST_RAW in ("NO", "FALSE", "0", "OFF"):
     TEST_MODE = False  # LIVE mode
 else:
-    # Invalid value, default to backward compatible
-    logger.warning("Invalid TFBOT_TEST value '%s', defaulting to backward compatible mode", TFBOT_TEST_RAW)
-    TEST_MODE = None
+    # Invalid value, default to LIVE
+    logger.warning("Invalid TFBOT_TEST value '%s', defaulting to LIVE mode", TFBOT_TEST_RAW)
+    TEST_MODE = False
+
+# Re-apply log level with mode-specific var (TFBOT_LOG_LEVEL_LIVE / TFBOT_LOG_LEVEL_TEST)
+_log_level_name = get_setting("TFBOT_LOG_LEVEL", "INFO", TEST_MODE).upper() or "INFO"
+logging.getLogger().setLevel(getattr(logging, _log_level_name, logging.INFO))
+install_session_error_log(BASE_DIR)
 
 BOT_MODE = get_setting("TFBOT_MODE", "classic", TEST_MODE).lower()
 TF_CHANNEL_ID = get_channel_id("TFBOT_CHANNEL_ID", 0, TEST_MODE)
@@ -673,8 +771,8 @@ PRIVILEGED_FORM_TOKENS = set(SPECIAL_REROLL_TOKENS)
 
 def _privileged_requirement_message(action: str) -> str:
     if SPECIAL_FORMS_DISPLAY:
-        return f"Only admins or {SPECIAL_FORM_SUBJECT} can {action}."
-    return f"Only admins can {action}."
+        return f"Only admins, moderators, or {SPECIAL_FORM_SUBJECT} can {action}."
+    return f"Only admins or moderators can {action}."
 
 def _parse_featured_weight_map(raw: str) -> Dict[str, float]:
     """Parse comma/semicolon separated token=weight entries."""
@@ -706,6 +804,11 @@ FEATURED_TF_WEIGHTS = _parse_featured_weight_map(get_setting("TFBOT_FEATURED_TF_
 
 
 configure_state(state_file=TF_STATE_FILE, stats_file=TF_STATS_FILE, reroll_file=TF_REROLL_FILE)
+_state_dir = TF_STATE_FILE.parent
+OVERLAY_STATE_FILE = _state_dir / "overlay_state.json"
+BOT_BANS_FILE = _state_dir / "bot_bans.json"
+BOT_TIMEOUTS_FILE = _state_dir / "bot_timeouts.json"
+bot_mod.configure(bans_file=BOT_BANS_FILE, timeouts_file=BOT_TIMEOUTS_FILE)
 tf_stats.update(load_stats_from_disk())
 reroll_cooldowns.update(load_reroll_cooldowns_from_disk())
 
@@ -715,6 +818,363 @@ ADMIN_PROTECTION_ENABLED = get_setting("TFBOT_ADMIN_PROTECTION_ENABLED", "false"
 SPECIAL_CHARACTERS_ADMIN_ONLY = get_setting("TFBOT_SPECIAL_CHARACTERS_ADMIN_ONLY", "true", TEST_MODE).lower() in ("true", "1", "yes", "on")
 INANIMATE_ENABLED = get_setting("TFBOT_INANIMATE_ENABLED", "true", TEST_MODE).lower() in ("true", "1", "yes", "on")
 BLOCK_INANIMATE_EXCEPT_SPECIAL = os.getenv("TFBOT_BLOCK_INANIMATE_EXCEPT_SPECIAL", "false").lower() in ("true", "1", "yes", "on")
+
+ACTIVE_WINDOW_SECONDS = 6 * 60 * 60
+SWAPALL_DEFAULT_MINUTES = 60
+DEVICE_MIN_SECONDS = 5 * 60
+DEVICE_MAX_SECONDS = 4 * 60 * 60
+DEVICE_RECHARGE_SECONDS = 30 * 60
+DEVICE_BATTERY_MAX = 100.0
+
+# Overlay state (swap/clone visual overrides)
+overlay_records: Dict[TransformKey, Dict[str, object]] = {}
+overlay_group_members: Dict[str, set[TransformKey]] = {}
+overlay_group_tasks: Dict[str, asyncio.Task] = {}
+last_active_tf: Dict[TransformKey, datetime] = {}
+
+# Device state
+device_holder_by_guild: Dict[int, int] = {}
+device_rotation_tasks: Dict[int, asyncio.Task] = {}
+device_battery_by_guild: Dict[int, float] = {}
+device_battery_updated_at: Dict[int, datetime] = {}
+
+
+def _serialize_overlay_state() -> Dict[str, object]:
+    records_payload: List[Dict[str, object]] = []
+    for (guild_id, user_id), payload in overlay_records.items():
+        row = dict(payload)
+        row["guild_id"] = guild_id
+        row["user_id"] = user_id
+        records_payload.append(row)
+    active_payload = [
+        {"guild_id": guild_id, "user_id": user_id, "at": at.isoformat()}
+        for (guild_id, user_id), at in last_active_tf.items()
+    ]
+    device_payload = [{"guild_id": guild_id, "holder_user_id": user_id} for guild_id, user_id in device_holder_by_guild.items()]
+    battery_payload = [
+        {
+            "guild_id": guild_id,
+            "battery": float(device_battery_by_guild.get(guild_id, DEVICE_BATTERY_MAX)),
+            "updated_at": device_battery_updated_at.get(guild_id, utc_now()).isoformat(),
+        }
+        for guild_id in set(device_holder_by_guild.keys()) | set(device_battery_by_guild.keys())
+    ]
+    return {
+        "overlay_records": records_payload,
+        "last_active_tf": active_payload,
+        "device_holders": device_payload,
+        "device_battery": battery_payload,
+    }
+
+
+def _persist_overlay_state() -> None:
+    OVERLAY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OVERLAY_STATE_FILE.write_text(json.dumps(_serialize_overlay_state(), separators=(",", ":")), encoding="utf-8")
+
+
+def _rebuild_overlay_groups() -> None:
+    overlay_group_members.clear()
+    for key, rec in overlay_records.items():
+        group_id = str(rec.get("group_id") or "").strip()
+        if group_id:
+            overlay_group_members.setdefault(group_id, set()).add(key)
+
+
+def _load_overlay_state() -> None:
+    overlay_records.clear()
+    overlay_group_members.clear()
+    last_active_tf.clear()
+    device_holder_by_guild.clear()
+    device_battery_by_guild.clear()
+    device_battery_updated_at.clear()
+    if not OVERLAY_STATE_FILE.exists():
+        return
+    try:
+        payload = json.loads(OVERLAY_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to parse overlay state %s: %s", OVERLAY_STATE_FILE, exc)
+        return
+    for row in payload.get("overlay_records", []):
+        try:
+            key = (int(row["guild_id"]), int(row["user_id"]))
+        except Exception:
+            continue
+        rec = dict(row)
+        rec.pop("guild_id", None)
+        rec.pop("user_id", None)
+        overlay_records[key] = rec
+    for row in payload.get("last_active_tf", []):
+        try:
+            key = (int(row["guild_id"]), int(row["user_id"]))
+            at = datetime.fromisoformat(str(row["at"]))
+        except Exception:
+            continue
+        last_active_tf[key] = at
+    for row in payload.get("device_holders", []):
+        try:
+            device_holder_by_guild[int(row["guild_id"])] = int(row["holder_user_id"])
+        except Exception:
+            continue
+    for row in payload.get("device_battery", []):
+        try:
+            gid = int(row["guild_id"])
+            device_battery_by_guild[gid] = max(0.0, min(float(row.get("battery", DEVICE_BATTERY_MAX)), DEVICE_BATTERY_MAX))
+            device_battery_updated_at[gid] = datetime.fromisoformat(str(row.get("updated_at")))
+        except Exception:
+            continue
+    _rebuild_overlay_groups()
+
+
+def _snapshot_base_visual_fields(state: TransformationState) -> Dict[str, object]:
+    return {
+        "character_name": state.character_name,
+        "character_folder": state.character_folder,
+        "character_avatar_path": state.character_avatar_path,
+        "character_message": state.character_message,
+        "is_inanimate": state.is_inanimate,
+        "inanimate_responses": list(state.inanimate_responses),
+        "form_owner_user_id": state.form_owner_user_id,
+        "identity_display_name": state.identity_display_name,
+    }
+
+
+def _restore_base_visual_fields(state: TransformationState, base: Mapping[str, object]) -> None:
+    state.character_name = str(base.get("character_name") or state.character_name)
+    state.character_folder = str(base.get("character_folder") or "") or None
+    state.character_avatar_path = str(base.get("character_avatar_path") or state.character_avatar_path)
+    state.character_message = str(base.get("character_message") or state.character_message)
+    state.is_inanimate = bool(base.get("is_inanimate", state.is_inanimate))
+    responses = base.get("inanimate_responses", ())
+    if isinstance(responses, list):
+        state.inanimate_responses = tuple(str(item) for item in responses)
+    elif isinstance(responses, tuple):
+        state.inanimate_responses = responses
+    state.form_owner_user_id = base.get("form_owner_user_id")
+    state.identity_display_name = base.get("identity_display_name")
+
+
+def _apply_visual_from_state(target: TransformationState, source: TransformationState) -> None:
+    # Visual-only copy: do not mutate attribution identity fields.
+    target.character_name = source.character_name
+    target.character_folder = source.character_folder
+    target.character_avatar_path = source.character_avatar_path
+    target.character_message = source.character_message
+    target.is_inanimate = source.is_inanimate
+    target.inanimate_responses = tuple(source.inanimate_responses)
+    target.avatar_applied = False
+
+
+def _cancel_overlay_group_task(group_id: str) -> None:
+    task = overlay_group_tasks.pop(group_id, None)
+    if task:
+        task.cancel()
+
+
+def _has_overlay(key: TransformKey) -> bool:
+    return key in overlay_records
+
+
+def _is_overlay_visual_source_locked(guild_id: int, source_user_id: int) -> bool:
+    for (g_id, _), rec in overlay_records.items():
+        if g_id != guild_id:
+            continue
+        if rec.get("overlay_type") == "swap" and int(rec.get("source_user_id", -1)) == source_user_id:
+            return True
+    return False
+
+
+def has_device_privilege(member: discord.Member, guild_id: int) -> bool:
+    return device_holder_by_guild.get(guild_id) == member.id
+
+
+def _device_cost_for_command(command_name: str) -> float:
+    name = (command_name or "").strip().lower()
+    if name in {"swapall", "swapallnonadmin", "rerollall", "rerollnonadmin"}:
+        return 90.0
+    if name in {"reroll", "clone", "genderswap", "ageswap"}:
+        return 45.0
+    if name in {"swap", "say"}:
+        return 10.0
+    if name in {"revert"}:
+        return 20.0
+    return 15.0
+
+
+def _sync_device_battery(guild_id: int) -> float:
+    now = utc_now()
+    current = float(device_battery_by_guild.get(guild_id, DEVICE_BATTERY_MAX))
+    last = device_battery_updated_at.get(guild_id, now)
+    elapsed = max((now - last).total_seconds(), 0.0)
+    recharge = (elapsed / DEVICE_RECHARGE_SECONDS) * DEVICE_BATTERY_MAX
+    current = max(0.0, min(current + recharge, DEVICE_BATTERY_MAX))
+    device_battery_by_guild[guild_id] = current
+    device_battery_updated_at[guild_id] = now
+    return current
+
+
+def _is_device_only_actor(member: discord.Member, state: Optional[TransformationState], guild_id: int) -> bool:
+    return has_device_privilege(member, guild_id) and not (is_admin(member) or is_bot_mod(member) or _has_special_reroll_access(state))
+
+
+def _device_precheck_message(
+    member: discord.Member,
+    state: Optional[TransformationState],
+    guild_id: int,
+    command_name: str,
+) -> Optional[str]:
+    if not _is_device_only_actor(member, state, guild_id):
+        return None
+    battery = _sync_device_battery(guild_id)
+    cost = _device_cost_for_command(command_name)
+    if battery + 1e-9 >= cost:
+        return None
+    need = max(cost - battery, 0.0)
+    seconds = int((need / DEVICE_BATTERY_MAX) * DEVICE_RECHARGE_SECONDS)
+    minutes = max((seconds + 59) // 60, 1)
+    return f"The Device is too drained for `{command_name}` ({battery:.0f}% battery). Recharge ETA: ~{minutes} minute(s)."
+
+
+def _log_device_command_use(member: discord.Member, command_name: str, guild_id: int) -> None:
+    if not has_device_privilege(member, guild_id):
+        return
+    logger.error("device_use: guild=%s user=%s command=%s", guild_id, member.id, command_name)
+    try:
+        bot.loop.create_task(
+            send_history_message(
+                "Device Command Use",
+                f"Guild: {guild_id}\nUser: {member.display_name} ({member.id})\nCommand: {command_name}",
+            )
+        )
+    except Exception:
+        pass
+
+
+def _device_record_success(
+    member: discord.Member,
+    state: Optional[TransformationState],
+    guild_id: int,
+    command_name: str,
+) -> None:
+    if not _is_device_only_actor(member, state, guild_id):
+        return
+    current = _sync_device_battery(guild_id)
+    cost = _device_cost_for_command(command_name)
+    device_battery_by_guild[guild_id] = max(0.0, current - cost)
+    device_battery_updated_at[guild_id] = utc_now()
+    _persist_overlay_state()
+    _log_device_command_use(member, command_name, guild_id)
+
+
+def has_fun_privilege(member: discord.Member, state: Optional[TransformationState], guild_id: int) -> bool:
+    return (
+        is_admin(member)
+        or is_bot_mod(member)
+        or _has_special_reroll_access(state)
+        or has_device_privilege(member, guild_id)
+    )
+
+
+def _pick_device_eligible_user(guild: discord.Guild) -> Optional[int]:
+    now = utc_now()
+    candidates: List[int] = []
+    for (g_id, user_id), seen_at in last_active_tf.items():
+        if g_id != guild.id:
+            continue
+        if (now - seen_at).total_seconds() > ACTIVE_WINDOW_SECONDS:
+            continue
+        member = guild.get_member(user_id)
+        if member is None or member.bot:
+            continue
+        if is_admin(member) or is_bot_mod(member):
+            continue
+        if bot_mod.is_banned(guild.id, user_id) or bot_mod.is_timed_out(guild.id, user_id):
+            continue
+        if find_active_transformation(user_id, guild.id) is None:
+            continue
+        candidates.append(user_id)
+    if not candidates:
+        return None
+    return random.choice(candidates)
+
+
+async def _announce_device_transfer(guild: discord.Guild, old_holder: Optional[int], new_holder: int) -> None:
+    channel = bot.get_channel(TF_CHANNEL_ID) if TF_CHANNEL_ID > 0 else None
+    if not isinstance(channel, discord.TextChannel):
+        return
+    old_name = "nobody" if old_holder is None else f"<@{old_holder}>"
+    msg = f"The Device crackles with static... it leaves {old_name} and lands with <@{new_holder}>."
+    try:
+        await channel.send(msg, allowed_mentions=discord.AllowedMentions(users=True))
+    except discord.HTTPException as exc:
+        logger.error("Device transfer announcement failed in guild %s: %s", guild.id, exc)
+
+
+async def _rotate_device_once(guild: discord.Guild, force_announce: bool = False) -> None:
+    old_holder = device_holder_by_guild.get(guild.id)
+    new_holder = _pick_device_eligible_user(guild)
+    if new_holder is None:
+        return
+    if old_holder == new_holder and not force_announce:
+        return
+    device_holder_by_guild[guild.id] = new_holder
+    _sync_device_battery(guild.id)
+    _persist_overlay_state()
+    logger.error("device_transfer: guild=%s old=%s new=%s", guild.id, old_holder, new_holder)
+    await send_history_message("Device Transfer", f"Guild: {guild.id}\nOld: {old_holder}\nNew: {new_holder}")
+    await _announce_device_transfer(guild, old_holder, new_holder)
+
+
+async def _device_rotation_loop(guild_id: int) -> None:
+    try:
+        while True:
+            await asyncio.sleep(random.randint(DEVICE_MIN_SECONDS, DEVICE_MAX_SECONDS))
+            guild = bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            await _rotate_device_once(guild)
+    except asyncio.CancelledError:
+        return
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("Device rotation loop failed for guild %s", guild_id)
+
+
+def _ensure_device_rotation_task(guild_id: int) -> None:
+    existing = device_rotation_tasks.get(guild_id)
+    if existing and not existing.done():
+        return
+    device_rotation_tasks[guild_id] = asyncio.create_task(_device_rotation_loop(guild_id))
+
+
+def _device_status_text(guild: discord.Guild) -> str:
+    holder_id = device_holder_by_guild.get(guild.id)
+    battery = _sync_device_battery(guild.id)
+    if not holder_id:
+        holder_text = "Nobody"
+    else:
+        member = guild.get_member(holder_id)
+        holder_text = member.display_name if member is not None else str(holder_id)
+    if battery >= DEVICE_BATTERY_MAX - 1e-9:
+        eta_text = "fully charged now"
+    else:
+        missing = DEVICE_BATTERY_MAX - battery
+        seconds = int((missing / DEVICE_BATTERY_MAX) * DEVICE_RECHARGE_SECONDS)
+        minutes = max((seconds + 59) // 60, 1)
+        eta_text = f"full in ~{minutes} minute(s)"
+    return (
+        f"Device holder: {holder_text}\n"
+        f"Battery: {battery:.0f}% ({eta_text})\n"
+        "Costs: low 10% (`say`,`swap`) | medium 20% (`revert`) | high 45% (`reroll`,`clone`,`genderswap`,`ageswap`) | all-target 90%"
+    )
+
+
+def _record_tf_activity(message: discord.Message) -> None:
+    guild = message.guild
+    if guild is None:
+        return
+    channel = _extract_command_channel(message.channel)
+    if not _is_allowed_command_channel(channel):
+        return
+    last_active_tf[(guild.id, message.author.id)] = utc_now()
 
 
 def _special_token_variants(value: Optional[str]) -> set[str]:
@@ -1428,12 +1888,36 @@ def _build_character_pool(
             for wrong, correct in encoding_fixes.items():
                 message_text = message_text.replace(wrong, correct)
             
+            pack_name = entry.get("_pack_name")
+            if isinstance(pack_name, str):
+                pack_name = pack_name.strip() or None
+            else:
+                pack_name = None
+            gender = entry.get("gender")
+            gender = gender.strip() if isinstance(gender, str) else None
+            age = entry.get("age")
+            age = age.strip() if isinstance(age, str) else None
+            type_val = entry.get("type")
+            type_val = type_val.strip() if isinstance(type_val, str) else None
+            genderswap = entry.get("genderswap")
+            genderswap = genderswap.strip() if isinstance(genderswap, str) else None
+            ageswap = entry.get("ageswap")
+            ageswap = ageswap.strip() if isinstance(ageswap, str) else None
+            gender_age_swap = entry.get("gender_age_swap")
+            gender_age_swap = gender_age_swap.strip() if isinstance(gender_age_swap, str) else None
             pool.append(
                 TFCharacter(
                     name=entry["name"],
                     avatar_path=avatar_path,
                     message=message_text,
                     folder=folder_name,
+                    gender=gender,
+                    age=age,
+                    type=type_val,
+                    _pack_name=pack_name,
+                    genderswap=genderswap,
+                    ageswap=ageswap,
+                    gender_age_swap=gender_age_swap,
                 )
             )
         except KeyError as exc:
@@ -1450,6 +1934,7 @@ if _CHARACTER_DATASET_STACKS:
 
 _CHARACTER_DATASET = _load_character_dataset()
 CHARACTER_POOL = _build_character_pool(_CHARACTER_DATASET, CHARACTER_AVATAR_ROOT)
+CHARACTER_POOL_SET = frozenset(CHARACTER_POOL)
 CHARACTER_BY_NAME: Dict[str, TFCharacter] = {
     character.name.strip().lower(): character for character in CHARACTER_POOL
 }
@@ -1458,6 +1943,129 @@ for character in CHARACTER_POOL:
     folder_token = _normalize_folder_token(character.folder or character.name)
     if folder_token and folder_token not in CHARACTER_BY_FOLDER:
         CHARACTER_BY_FOLDER[folder_token] = character
+CHARACTER_BY_PACK_FOLDER: Dict[str, TFCharacter] = {}
+for character in CHARACTER_POOL:
+    if getattr(character, "_pack_name", None):
+        pack = character._pack_name
+        folder = character.folder or character.name
+        if pack and folder:
+            key = f"{pack}/{folder}"
+            if key not in CHARACTER_BY_PACK_FOLDER:
+                CHARACTER_BY_PACK_FOLDER[key] = character
+
+
+IDENTITY_GROUP_BY_LOWER_NAME: Dict[str, frozenset[str]] = {}
+_IDENTITY_GROUPS_BUILT = False
+
+
+def _ensure_identity_groups_built() -> None:
+    """Build connected components over pool rows linked by swap edges (lazy; never crash import)."""
+    global _IDENTITY_GROUPS_BUILT  # pylint: disable=global-statement
+    if _IDENTITY_GROUPS_BUILT:
+        return
+    try:
+        parent: Dict[str, str] = {}
+
+        def _find(x: str) -> str:
+            parent.setdefault(x, x)
+            if parent[x] != x:
+                parent[x] = _find(parent[x])
+            return parent[x]
+
+        def _union(a: str, b: str) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for character in CHARACTER_POOL:
+            nk = character.name.strip().lower()
+            _find(nk)
+            pack = getattr(character, "_pack_name", None)
+            for link in (
+                character.genderswap,
+                character.ageswap,
+                character.gender_age_swap,
+            ):
+                other = _resolve_link_to_character(link, pack)
+                if other is not None and other.name:
+                    _union(nk, other.name.strip().lower())
+
+        root_to_names: Dict[str, set[str]] = {}
+        for character in CHARACTER_POOL:
+            nk = character.name.strip().lower()
+            root = _find(nk)
+            root_to_names.setdefault(root, set()).add(character.name)
+
+        by_lower: Dict[str, frozenset[str]] = {}
+        for names in root_to_names.values():
+            frozen = frozenset(names)
+            for n in names:
+                by_lower[n.strip().lower()] = frozen
+
+        IDENTITY_GROUP_BY_LOWER_NAME.clear()
+        IDENTITY_GROUP_BY_LOWER_NAME.update(by_lower)
+        _IDENTITY_GROUPS_BUILT = True
+    except Exception as exc:  # pylint: disable=broad-except
+        # This must never take the bot down; log to session error file and fall back to singletons.
+        logger.exception("Failed to build identity groups; falling back to singleton identities (%s)", exc)
+        IDENTITY_GROUP_BY_LOWER_NAME.clear()
+        _IDENTITY_GROUPS_BUILT = True
+
+
+def identity_names_for_character_name(character_name: str) -> frozenset[str]:
+    """All pool ``name`` strings in the same swap-link group as ``character_name`` (singleton if unknown)."""
+    _ensure_identity_groups_built()
+    key = (character_name or "").strip().lower()
+    if not key:
+        return frozenset()
+    group = IDENTITY_GROUP_BY_LOWER_NAME.get(key)
+    if group is not None:
+        return group
+    return frozenset({character_name.strip()})
+
+
+def identity_occupancy_conflict(
+    guild_id: int,
+    *,
+    exclude_user_id: Optional[int],
+    candidate_name: str,
+) -> bool:
+    """True if ``candidate_name`` shares an identity group with another member's form in this guild."""
+    return identity_assignment_blocked(
+        guild_id,
+        exclude_user_ids={exclude_user_id} if exclude_user_id is not None else None,
+        candidate_name=candidate_name,
+    )
+
+
+def identity_assignment_blocked(
+    guild_id: int,
+    *,
+    exclude_user_ids: Optional[set[int]],
+    candidate_name: str,
+) -> bool:
+    """True if ``candidate_name`` shares an identity group with another member's form in this guild."""
+    cand = set(identity_names_for_character_name(candidate_name))
+    if not cand:
+        return False
+    for (g_id, u_id), st in active_transformations.items():
+        if g_id != guild_id:
+            continue
+        if exclude_user_ids and u_id in exclude_user_ids:
+            continue
+        if cand & set(identity_names_for_character_name(st.character_name)):
+            return True
+    return False
+
+
+# Resolve authoring links like characters_STVariants/<bucket>/AbbyGB (variant ``name``) when keys use variants_* folders.
+STVARIANTS_BY_CANON_NAME: Dict[str, TFCharacter] = {}
+for character in CHARACTER_POOL:
+    if getattr(character, "_pack_name", None) != "characters_STVariants":
+        continue
+    nm = (character.name or "").strip()
+    if nm and nm not in STVARIANTS_BY_CANON_NAME:
+        STVARIANTS_BY_CANON_NAME[nm] = character
 ALLOWED_CHARACTER_FOLDERS: set[str] = set(CHARACTER_BY_FOLDER.keys())
 _CHARACTER_FOLDER_OVERRIDES = {
     character.name.strip().lower(): character.folder.strip()
@@ -1465,6 +2073,148 @@ _CHARACTER_FOLDER_OVERRIDES = {
     if character.folder and character.folder.strip()
 }
 set_character_directory_overrides(_CHARACTER_FOLDER_OVERRIDES)
+
+
+def _diagnose_swap_link_failure(link_value: str, current_pack: Optional[str]) -> str:
+    """Human-readable trace for logs when _resolve_link_to_character returns None."""
+    lv = (link_value or "").strip()
+    bits: list[str] = []
+    if not lv:
+        return "empty link"
+    if "/" not in lv:
+        bits.append(f"folder_only={lv!r}")
+        if current_pack:
+            ck = f"{current_pack}/{lv}"
+            bits.append(
+                f"pack_folder_key={ck!r} hit={ck in CHARACTER_BY_PACK_FOLDER}"
+            )
+        ft = _normalize_folder_token(lv)
+        bits.append(
+            f"CHARACTER_BY_FOLDER[{ft!r}] hit={ft in CHARACTER_BY_FOLDER if ft else False}"
+        )
+        return "; ".join(bits)
+    char = CHARACTER_BY_PACK_FOLDER.get(lv)
+    bits.append(f"direct_KEY={lv!r} hit={char is not None}")
+    if (
+        current_pack
+        and not lv.startswith("characters_")
+        and "/" in lv
+    ):
+        ck = f"{current_pack}/{lv}"
+        bits.append(f"composite_KEY={ck!r} hit={ck in CHARACTER_BY_PACK_FOLDER}")
+    parts = lv.split("/")
+    if (
+        len(parts) >= 3
+        and parts[0] == "characters_STVariants"
+        and not parts[-1].startswith("variants_")
+    ):
+        tail = parts[-1].strip()
+        bits.append(
+            f"STVARIANTS_BY_CANON_NAME[{tail!r}] hit={tail in STVARIANTS_BY_CANON_NAME}"
+        )
+    return "; ".join(bits)
+
+
+def _vn_swap_ok_logs_enabled() -> bool:
+    """When false, successful VN genderswap/ageswap logs at DEBUG only (set TFBOT_VN_SWAP_DEBUG=1 for INFO)."""
+    return os.getenv("TFBOT_VN_SWAP_DEBUG", "").strip().upper() in ("1", "YES", "TRUE", "ON")
+
+
+def _resolve_link_to_character(
+    link_value: Optional[str], current_pack: Optional[str]
+) -> Optional[TFCharacter]:
+    """
+    Resolve a link value (genderswap/ageswap) to a TFCharacter in the loaded pool.
+    Returns None if the link is empty or the target form is not in the pool.
+    """
+    if not link_value or not isinstance(link_value, str):
+        return None
+    link_value = link_value.strip()
+    if not link_value:
+        return None
+    if "/" in link_value:
+        char = CHARACTER_BY_PACK_FOLDER.get(link_value)
+        if char and char in CHARACTER_POOL_SET:
+            return char
+        # Bucket-relative links from loader (e.g. st_variants/variants_abbygb) match pool keys as pack/bucket/rest.
+        if (
+            current_pack
+            and not link_value.startswith("characters_")
+        ):
+            composite_key = f"{current_pack}/{link_value}"
+            char = CHARACTER_BY_PACK_FOLDER.get(composite_key)
+            if char and char in CHARACTER_POOL_SET:
+                return char
+        parts = link_value.split("/")
+        if (
+            len(parts) >= 3
+            and parts[0] == "characters_STVariants"
+            and not parts[-1].startswith("variants_")
+        ):
+            tail = parts[-1].strip()
+            if tail:
+                cand = STVARIANTS_BY_CANON_NAME.get(tail)
+                if cand and cand in CHARACTER_POOL_SET:
+                    return cand
+        return None
+    # folder-only: try current pack + folder, then folder lookup
+    if current_pack:
+        key = f"{current_pack}/{link_value}"
+        char = CHARACTER_BY_PACK_FOLDER.get(key)
+        if char and char in CHARACTER_POOL_SET:
+            return char
+    folder_token = _normalize_folder_token(link_value)
+    char = CHARACTER_BY_FOLDER.get(folder_token)
+    return char if (char and char in CHARACTER_POOL_SET) else None
+
+
+def _get_loaded_pack_file_for_reroll(token: str) -> Optional[str]:
+    """
+    Map user input (e.g. ST, Student Transfer, characters_ST) to a pack file name
+    that is actually loaded (has at least one character in CHARACTER_POOL).
+    Returns None if token does not match any loaded pack.
+    """
+    if not token or not token.strip():
+        return None
+    token_lower = token.strip().lower()
+    loaded_pack_files = {getattr(c, "_pack_name", None) for c in CHARACTER_POOL if getattr(c, "_pack_name", None)}
+    loaded_pack_files.discard(None)
+    if not loaded_pack_files:
+        return None
+    repo_dir_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip() or "characters_repo"
+    repo_path = Path(repo_dir_setting)
+    if not repo_path.is_absolute():
+        repo_path = (BASE_DIR / repo_path).resolve()
+    config_path = repo_path / "tf_characters.json"
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    packs = data.get("packs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    if not isinstance(packs, list):
+        return None
+    for entry in packs:
+        if not isinstance(entry, dict):
+            continue
+        pack_file = entry.get("file") or entry.get("file_name")
+        if not pack_file or pack_file not in loaded_pack_files:
+            continue
+        pack_file_str = str(pack_file).strip()
+        pack_name = (entry.get("name") or "").strip()
+        if token_lower == pack_file_str.lower():
+            return pack_file_str
+        if pack_name and token_lower == pack_name.lower():
+            return pack_file_str
+        if pack_name and token_lower in pack_name.lower():
+            return pack_file_str
+        if token_lower in pack_file_str.lower():
+            return pack_file_str
+    return None
+
+
 GACHA_MANAGER = None
 _CHARACTER_DIRECTORY_CACHE: list[str] = []
 _CHARACTER_DIRECTORY_CACHE_EXPIRY: float = 0.0
@@ -1522,6 +2272,7 @@ class TFBot(commands.Bot):
 
 
 bot = TFBot(command_prefix=get_setting("TFBOT_PREFIX", "!", TEST_MODE), intents=intents, case_insensitive=True)
+register_bot_hooks(bot)
 ROLEPLAY_COG: Optional[RoleplayCog] = None
 GAME_BOARD_MANAGER: Optional["GameBoardManager"] = None
 _SYNCED_APP_COMMAND_GUILDS: set[int] = set()
@@ -1697,6 +2448,42 @@ async def ensure_state_restored() -> None:
                 state.guild_id,
                 remaining,
             )
+
+    # Hardening: if state is already broken (two users share one logical identity), log once per guild.
+    by_guild: Dict[int, Dict[frozenset[str], List[int]]] = {}
+    for (g_id, u_id), st in active_transformations.items():
+        by_guild.setdefault(g_id, {}).setdefault(
+            identity_names_for_character_name(st.character_name),
+            [],
+        ).append(u_id)
+    for g_id, groups in by_guild.items():
+        dup_groups = {tuple(sorted(names)): users for names, users in groups.items() if len(users) > 1}
+        if dup_groups:
+            logger.error(
+                "Identity exclusivity violation detected on restore guild=%s groups=%s",
+                g_id,
+                {names: len(users) for names, users in dup_groups.items()},
+            )
+
+    _load_overlay_state()
+    now = utc_now()
+    for key, record in list(overlay_records.items()):
+        expires_raw = str(record.get("expires_at") or "").strip()
+        if not expires_raw:
+            continue
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+        except ValueError:
+            overlay_records.pop(key, None)
+            continue
+        if expires_at <= now:
+            await _revert_overlay_for_user(key[0], key[1], reason="Expired overlay cleaned during restore.")
+            continue
+        group_id = str(record.get("group_id") or "").strip()
+        if group_id and group_id not in overlay_group_tasks:
+            overlay_group_tasks[group_id] = asyncio.create_task(
+                _overlay_expiry_task(key[0], group_id, (expires_at - now).total_seconds())
+            )
     tf_state.STATE_RESTORED = True
 
 
@@ -1758,6 +2545,90 @@ async def _unswap_and_announce(
     return True
 
 
+async def _revert_overlay_group(
+    guild_id: int,
+    group_id: str,
+    *,
+    reason: str,
+    channel: Optional[discord.abc.Messageable] = None,
+) -> int:
+    keys = set(overlay_group_members.get(group_id, set()))
+    if not keys:
+        return 0
+    reverted = 0
+    for key in keys:
+        if key[0] != guild_id:
+            continue
+        record = overlay_records.get(key)
+        state = active_transformations.get(key)
+        if not record or state is None:
+            overlay_records.pop(key, None)
+            continue
+        base = record.get("base_visual")
+        if isinstance(base, Mapping):
+            _restore_base_visual_fields(state, base)
+            reverted += 1
+        overlay_records.pop(key, None)
+    overlay_group_members.pop(group_id, None)
+    _cancel_overlay_group_task(group_id)
+    if reverted > 0:
+        persist_states()
+        _persist_overlay_state()
+        await send_history_message("Overlay Reverted", f"{reason}\nGroup: {group_id}\nMembers: {reverted}")
+        if channel is not None:
+            try:
+                await channel.send(f"Overlay group reverted ({reverted}): {reason}", allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                pass
+    return reverted
+
+
+async def _revert_overlay_for_user(
+    guild_id: int,
+    user_id: int,
+    *,
+    reason: str,
+    channel: Optional[discord.abc.Messageable] = None,
+) -> bool:
+    key = state_key(guild_id, user_id)
+    record = overlay_records.get(key)
+    if not record:
+        return False
+    group_id = str(record.get("group_id") or "").strip()
+    if group_id:
+        reverted = await _revert_overlay_group(guild_id, group_id, reason=reason, channel=channel)
+        return reverted > 0
+
+    state = active_transformations.get(key)
+    if state is None:
+        overlay_records.pop(key, None)
+        _persist_overlay_state()
+        return False
+    base = record.get("base_visual")
+    if isinstance(base, Mapping):
+        _restore_base_visual_fields(state, base)
+    overlay_records.pop(key, None)
+    persist_states()
+    _persist_overlay_state()
+    await send_history_message("Overlay Reverted", f"{reason}\nUser: {user_id}")
+    if channel is not None:
+        try:
+            await channel.send(f"Overlay reverted for <@{user_id}>: {reason}", allowed_mentions=discord.AllowedMentions(users=False))
+        except discord.HTTPException:
+            pass
+    return True
+
+
+async def _overlay_expiry_task(guild_id: int, group_id: str, delay_seconds: float) -> None:
+    try:
+        await asyncio.sleep(max(delay_seconds, 0.0))
+        await _revert_overlay_group(guild_id, group_id, reason="Overlay duration expired.")
+    except asyncio.CancelledError:
+        return
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("Overlay expiry failed for group=%s guild=%s", group_id, guild_id)
+
+
 async def revert_transformation(state: TransformationState, *, expired: bool) -> None:
     key = state_key(state.guild_id, state.user_id)
     current = active_transformations.get(key)
@@ -1772,6 +2643,12 @@ async def revert_transformation(state: TransformationState, *, expired: bool) ->
     else:
         logger.warning("Could not locate member %s in guild %s to revert TF", state.user_id, state.guild_id)
 
+    await _revert_overlay_for_user(
+        state.guild_id,
+        state.user_id,
+        reason=f"{member.display_name if member else f'User {state.user_id}'}: base TF reverted",
+    )
+
     await _unswap_and_announce(
         state.guild_id,
         state.user_id,
@@ -1784,6 +2661,17 @@ async def revert_transformation(state: TransformationState, *, expired: bool) ->
     active_transformations.pop(key, None)
     persist_states()
 
+    schedule_history_refresh()
+
+
+def _free_character_for_moderation(guild_id: int, user_id: int) -> None:
+    """Remove user's VN transformation and cancel revert task (e.g. when banning)."""
+    key = state_key(guild_id, user_id)
+    task = revert_tasks.pop(key, None)
+    if task:
+        task.cancel()
+    active_transformations.pop(key, None)
+    persist_states()
     schedule_history_refresh()
 
 
@@ -2127,20 +3015,82 @@ async def prefix_help_game_command(ctx: commands.Context, *, command: Optional[s
         await GACHA_MANAGER.command_help(ctx)
         return
     
-    # Fall back to default help command system
-    if bot.help_command:
-        bot.help_command.context = ctx
-        try:
-            if command:
-                cmd = bot.get_command(command)
-                if cmd:
-                    await bot.help_command.send_command_help(cmd)
-                else:
-                    await bot.help_command.send_error_message(f"Command '{command}' not found.")
-            else:
-                await bot.help_command.send_bot_help(bot.cogs)
-        finally:
-            bot.help_command.context = None
+    # VN help (non-gameboard): curated output so players aren't shown admin/gameboard commands.
+    if not ctx.guild or not isinstance(ctx.author, discord.Member):
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+
+    guild = ctx.guild
+    author = ctx.author
+    author_state = find_active_transformation(author.id, guild.id)
+
+    is_device_holder = has_device_privilege(author, guild.id)
+    is_special = _has_special_reroll_access(author_state)
+    is_admin_mod = is_admin(author) or is_bot_mod(author)
+
+    bot_name = getattr(bot.user, "name", None) or TFBOT_NAME or "the bot"
+
+    if command:
+        # Keep command-specific help short; do not fall back to discord.py default (it lists irrelevant commands).
+        cmd = command.strip().lower()
+        if cmd in {"reroll", "genderswap", "ageswap", "swap", "swapall", "swapallnonadmin", "clone", "revert"}:
+            await ctx.reply(
+                f"Use `!help` with no args to see the available VN commands for you.",
+                mention_author=False,
+            )
+            return
+        await ctx.reply("I can't show help for that command from this VN `!help` view.", mention_author=False)
+        return
+
+    lines: list[str] = [
+        f"**VN commands for {bot_name}**",
+        "",
+        "**Player commands:**",
+        "• `!reroll <target>` — Spend your reroll on someone else. (You cannot reroll yourself.)",
+        "• `!genderswap` — Swap your current form’s gender (if available).",
+        "• `!genderswap <target>` — (Device/Special/Admin) Swap someone else’s current form’s gender.",
+        "• `!ageswap` — Swap your current form’s age (if available).",
+        "• `!ageswap <target>` — (Device/Special/Admin) Swap someone else’s current form’s age.",
+        "• `!dstatus` — Show current Device holder and battery (no pings).",
+        "• `!helpdevice` — Explain Device mechanics.",
+    ]
+
+    # Privileged fun commands (Device holder, specials like Mirra/Narrator, or admin/mod)
+    if is_device_holder or is_special or is_admin_mod:
+        lines.extend(
+            [
+                "",
+                "**Privileged fun commands:**",
+                "• `!swap <a> <b>` — (Device/Special/Admin) Swap two transformed users.",
+                "• `!swapall [minutes]` — (Device/Special/Admin) Randomly swap active transformed users.",
+                "• `!swapallnonadmin [minutes]` — (Device/Special/Admin) Swap active non-admin users.",
+                "• `!clone <source> [target] [minutes]` — (Device/Special/Admin) Clone visuals onto a target.",
+                "• `!revert [target]` — (Device/Special/Admin) Revert active swap/clone overlays.",
+            ]
+        )
+
+    # Ability hint section (Device battery rules vs special-form note)
+    if is_device_holder:
+        lines.extend(
+            [
+                "",
+                "**Device holder:** you can use the privileged fun commands above.",
+                "Battery costs: low 10% (`swap`,`say`) | medium 20% (`revert`) | high 45% (`reroll`,`clone`,`genderswap`,`ageswap`) | all-target 90% (`swapall*`). Recharge `0→100` in 30 minutes.",
+            ]
+        )
+    elif is_special:
+        lines.extend(
+            [
+                "",
+                "**Special (Mirra/Narrator):** you can use the privileged fun commands above.",
+                "(Device battery limits apply only to the actual Device holder.)",
+            ]
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 2000:
+        text = text[:1990] + "\n…"
+    await ctx.reply(text, mention_author=False)
 
 # Register help command conditionally (after gacha registers its commands)
 # Our help command handles game threads, gacha channels, and default help
@@ -2411,7 +3361,11 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
             member = await message.guild.fetch_member(message.author.id)
         except discord.HTTPException as exc:
             logger.warning("Failed to fetch member %s: %s", message.author.id, exc)
-            return
+            return None
+
+    if bot_mod.is_banned(message.guild.id, member.id) or bot_mod.is_timed_out(message.guild.id, member.id):
+        logger.debug("User %s is banned or timed out; skipping random TF.", member.id)
+        return None
 
     key = state_key(message.guild.id, member.id)
     if key in active_transformations:
@@ -2422,18 +3376,24 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     # When protection is ON: Only admins can transform admins (via reroll, not normal rolls)
     # When protection is OFF: Anyone can be transformed by normal message triggers
     if ADMIN_PROTECTION_ENABLED:
-        member_is_admin = is_admin(member)
+        member_is_admin = is_admin(member) or is_bot_mod(member)
         if member_is_admin:
             # Admins can only be transformed by other admins (via reroll commands), not by their own messages
             # This blocks normal daily rolls from triggering on admins
             logger.debug("Admin protection enabled: blocking normal TF trigger for admin user %s (only admin rerolls allowed)", member.id)
             return None
 
-    used_characters = {state.character_name for state in active_transformations.values()}
+    used_identities: set[str] = set()
+    for state in active_transformations.values():
+        if state.guild_id != message.guild.id:
+            continue
+        used_identities |= set(identity_names_for_character_name(state.character_name))
     available_characters = [
-        character for character in CHARACTER_POOL if character.name not in used_characters
+        character
+        for character in CHARACTER_POOL
+        if not (set(identity_names_for_character_name(character.name)) & used_identities)
     ]
-    if not is_admin(member):
+    if not (is_admin(member) or is_bot_mod(member)):
         available_characters = [
             character
             for character in available_characters
@@ -2447,7 +3407,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     if INANIMATE_FORMS and random.random() <= INANIMATE_TF_CHANCE:
         available_inanimate = list(INANIMATE_FORMS)
         # Toggleable restriction: Only admins can get Ball/Narrator inanimate forms (if enabled)
-        if SPECIAL_CHARACTERS_ADMIN_ONLY and not is_admin(member):
+        if SPECIAL_CHARACTERS_ADMIN_ONLY and not (is_admin(member) or is_bot_mod(member)):
             available_inanimate = [
                 form for form in available_inanimate
                 if not _is_special_reroll_name(str(form.get("name", "")))
@@ -2779,7 +3739,7 @@ async def _safe_defer_interaction(
         await interaction.response.defer(thinking=thinking)
         return True
     except discord.NotFound as exc:
-        logger.warning(
+        logger.error(
             "Interaction %s expired before defer could be sent: %s",
             getattr(interaction, "id", "unknown"),
             exc,
@@ -3061,16 +4021,18 @@ def current_history_channel_id() -> int:
 @bot.event
 async def on_ready():
     await ensure_state_restored()
+    for guild in bot.guilds:
+        if device_holder_by_guild.get(guild.id) is None:
+            await _rotate_device_once(guild, force_announce=True)
+        _ensure_device_rotation_task(guild.id)
     await _sync_application_commands_for_known_guilds()
     logger.info("Logged in as %s (id=%s)", bot.user, bot.user.id if bot.user else "unknown")
     
-    # Log TFBOT_TEST mode status
-    if TEST_MODE is None:
-        logger.info("TFBOT_TEST mode: NOT DEFINED (backward compatible - using current format)")
-    elif TEST_MODE:
+    # Log TFBOT_TEST mode status (not defined or NO → LIVE; YES → TEST)
+    if TEST_MODE:
         logger.info("TFBOT_TEST mode: YES (TEST mode - using _TEST channels)")
     else:
-        logger.info("TFBOT_TEST mode: NO (LIVE mode - using _LIVE channels)")
+        logger.info("TFBOT_TEST mode: NO or not defined (LIVE mode - using _LIVE channels)")
     
     logger.info("TF chance set to %.0f%%", TF_CHANCE * 100)
     logger.info("Message style: %s", MESSAGE_STYLE.upper())
@@ -3124,13 +4086,29 @@ async def on_ready():
             logger.warning("Failed to send startup message: %s", exc)
 
 
+@bot.event
+async def on_member_remove(member: discord.Member) -> None:
+    """Clear transformation state when a user leaves the server (frees character for reroll)."""
+    key = state_key(member.guild.id, member.id)
+    popped = active_transformations.pop(key, None)
+    if popped:
+        persist_states()
+        schedule_history_refresh()
+        logger.info(
+            "Cleared transformation for user %s (%s) who left guild %s",
+            member.id,
+            member.display_name,
+            member.guild.id,
+        )
+
+
 async def secret_reset_command(ctx: commands.Context):
     author = ctx.author
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
-    if not is_admin(author):
-        await ctx.reply("You lack permission to run this command.", mention_author=False)
+    if not (is_admin(author) or is_bot_mod(author)):
+        await ctx.reply("You must be an admin or moderator to run this command.", mention_author=False)
         return None
 
     await ensure_state_restored()
@@ -3169,14 +4147,365 @@ async def slash_synreset_command(interaction: discord.Interaction) -> None:
         await interaction.followup.send("TF reset completed.", ephemeral=True)
 
 
+async def _resolve_target_to_member(
+    guild: discord.Guild,
+    target: str,
+    message_mentions: list,
+) -> Optional[discord.Member]:
+    """
+    Resolve a target string to a Member: mention, user ID, character name, or Discord display/username.
+    Used by timeout, ban, untimeout, and freecharacter.
+    """
+    target = (target or "").strip()
+    if not target:
+        return None
+    if message_mentions:
+        return message_mentions[0]
+    if target.isdigit():
+        user_id = int(target)
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        _, member = await fetch_member(guild.id, user_id)
+        return member
+    token_lower = target.lower()
+    for (gid, uid), st in list(active_transformations.items()):
+        if gid != guild.id:
+            continue
+        if st.character_name and st.character_name.lower() == token_lower:
+            member = guild.get_member(uid)
+            if member is not None:
+                return member
+            _, member = await fetch_member(guild.id, uid)
+            return member
+        if st.character_name and token_lower in st.character_name.lower():
+            member = guild.get_member(uid)
+            if member is not None:
+                return member
+            _, member = await fetch_member(guild.id, uid)
+            return member
+    # Match by Discord display name or username (exact then partial)
+    for (gid, uid), st in list(active_transformations.items()):
+        if gid != guild.id:
+            continue
+        member = guild.get_member(uid)
+        if member is None:
+            _, member = await fetch_member(guild.id, uid)
+        if member is None:
+            continue
+        display_lower = member.display_name.lower()
+        name_lower = member.name.lower()
+        if token_lower == display_lower or token_lower == name_lower:
+            return member
+    for (gid, uid), st in list(active_transformations.items()):
+        if gid != guild.id:
+            continue
+        member = guild.get_member(uid)
+        if member is None:
+            _, member = await fetch_member(guild.id, uid)
+        if member is None:
+            continue
+        display_lower = member.display_name.lower()
+        name_lower = member.name.lower()
+        if token_lower in display_lower or token_lower in name_lower:
+            return member
+    return None
+
+
+@bot.command(name="freecharacter")
+async def freecharacter_command(ctx: commands.Context, *, character_or_user: str = "") -> None:
+    """Admin or moderator only: Free a character stuck to a user who left. Usage: !freecharacter <character_name> or !freecharacter <user_id>"""
+    if not isinstance(ctx.author, discord.Member):
+        await ctx.reply("Run this command inside a server.", mention_author=False)
+        return
+    if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    if not ctx.guild:
+        await ctx.reply("Run this command inside a server.", mention_author=False)
+        return
+
+    await ensure_state_restored()
+
+    token = (character_or_user or "").strip()
+    if not token:
+        await ctx.reply(
+            "Usage: `!freecharacter <character_name>` or `!freecharacter <user_id>` – frees a character stuck to a user who left.",
+            mention_author=False,
+        )
+        return
+
+    guild_id = ctx.guild.id
+    key_to_remove = None
+    char_name = None
+
+    # Try user ID first
+    if token.isdigit():
+        user_id = int(token)
+        key_to_remove = state_key(guild_id, user_id)
+        if key_to_remove in active_transformations:
+            st = active_transformations[key_to_remove]
+            char_name = st.character_name or "unknown"
+
+    # Else match by character name (case-insensitive)
+    if key_to_remove is None:
+        token_lower = token.lower()
+        for (gid, uid), st in list(active_transformations.items()):
+            if gid != guild_id:
+                continue
+            if st.character_name and st.character_name.lower() == token_lower:
+                key_to_remove = state_key(gid, uid)
+                char_name = st.character_name
+                break
+            if st.character_name and token_lower in st.character_name.lower():
+                key_to_remove = state_key(gid, uid)
+                char_name = st.character_name
+                break
+
+    if key_to_remove is None:
+        await ctx.reply(
+            f"No active transformation found for `{token}` in this server.",
+            mention_author=False,
+        )
+        return
+
+    active_transformations.pop(key_to_remove, None)
+    persist_states()
+    schedule_history_refresh()
+    label = char_name or token
+    await ctx.reply(
+        f"Freed **{label}** – they're available for others to roll or reroll into now.",
+        mention_author=False,
+    )
+
+
+def _parse_timeout_duration(s: str) -> Optional[int]:
+    """Parse duration string to minutes. e.g. '2m', '10m', '30m', '1h', '2h', '24h'. Returns None for incremental."""
+    s = (s or "").strip().lower()
+    if not s or s in ("default", "incremental", "auto"):
+        return None
+    if s.endswith("m"):
+        try:
+            return int(s[:-1])
+        except ValueError:
+            pass
+    if s.endswith("h"):
+        try:
+            return int(s[:-1]) * 60
+        except ValueError:
+            pass
+    return None
+
+
+@bot.command(name="timeout")
+@commands.guild_only()
+async def prefix_timeout_command(ctx: commands.Context, *, args: str = "") -> None:
+    """Admin/mod only: Time out a user from VN bot usage. Usage: !timeout @user or character name [duration]. Omit duration for incremental (2m, then 10m, 30m, 1h…; resets after 60min without a timeout)."""
+    if not ctx.guild:
+        await ctx.reply("This command can only be used in a server.", mention_author=False)
+        return
+    if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    parts = (args or "").strip().split()
+    if not parts:
+        await ctx.reply("Usage: `!timeout @user or character name [duration]`. Omit duration for incremental tiers (first 2m, then 10m, 30m, 1h…; resets after 60 min without a timeout).", mention_author=False)
+        return
+    target_str = parts[0]
+    duration_str = " ".join(parts[1:])
+    await ensure_state_restored()
+    member = await _resolve_target_to_member(ctx.guild, target_str, list(ctx.message.mentions))
+    if member is None:
+        await ctx.reply("No user or character found for that name in this server.", mention_author=False)
+        return
+    if is_admin(member) or is_bot_mod(member):
+        await ctx.reply("You cannot timeout an admin or moderator.", mention_author=False)
+        return
+    gid, uid = ctx.guild.id, member.id
+    channel_id = getattr(ctx.channel, "id", None)
+    duration_minutes = _parse_timeout_duration(duration_str)
+    minutes = bot_mod.add_timeout(gid, uid, duration_minutes=duration_minutes, channel_id=channel_id)
+    duration_label = bot_mod.get_timeout_duration_label(minutes)
+    discord_name = member.display_name
+    await ctx.channel.send(f"**{discord_name}** is in a timeout for {duration_label}.")
+    await ctx.reply(f"{discord_name} is timed out for {duration_label}.", mention_author=False)
+
+
+@bot.command(name="untimeout")
+@commands.guild_only()
+async def prefix_untimeout_command(ctx: commands.Context, *, target: str = "") -> None:
+    """Admin/mod only: Remove a user's timeout. Usage: !untimeout @user or character name or user name"""
+    if not ctx.guild:
+        await ctx.reply("This command can only be used in a server.", mention_author=False)
+        return
+    if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    target = (target or "").strip()
+    if not target:
+        await ctx.reply("Usage: `!untimeout @user or character name or user name`", mention_author=False)
+        return
+    await ensure_state_restored()
+    member = await _resolve_target_to_member(ctx.guild, target, list(ctx.message.mentions))
+    if member is None:
+        await ctx.reply("No user or character found for that name in this server.", mention_author=False)
+        return
+    gid, uid = ctx.guild.id, member.id
+    bot_mod.clear_timeout(gid, uid)
+    discord_name = member.display_name
+    await ctx.channel.send(f"**{discord_name}** is no longer timed out.")
+    await ctx.reply(f"{discord_name} is no longer timed out.", mention_author=False)
+
+
+@bot.command(name="ban")
+@commands.guild_only()
+async def prefix_ban_command(ctx: commands.Context, *, target: str = "") -> None:
+    """Admin/mod only: Ban a user from VN bot usage. Usage: !ban @user or character name"""
+    if not ctx.guild:
+        await ctx.reply("This command can only be used in a server.", mention_author=False)
+        return
+    if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    target = (target or "").strip()
+    if not target:
+        await ctx.reply("Usage: `!ban @user or character name`", mention_author=False)
+        return
+    await ensure_state_restored()
+    member = await _resolve_target_to_member(ctx.guild, target, list(ctx.message.mentions))
+    if member is None:
+        await ctx.reply("No user or character found for that name in this server.", mention_author=False)
+        return
+    if is_admin(member) or is_bot_mod(member):
+        await ctx.reply("You cannot ban an admin or moderator.", mention_author=False)
+        return
+    gid, uid = ctx.guild.id, member.id
+    channel_id = getattr(ctx.channel, "id", None)
+    _free_character_for_moderation(gid, uid)
+    bot_mod.add_ban(gid, uid, channel_id=channel_id)
+    discord_name = member.display_name
+    await ctx.channel.send(f"**{discord_name}** has been banned permanently.")
+    bot_name = getattr(bot.user, "name", None) or TFBOT_NAME or "the bot"
+    await ctx.reply(f"{discord_name} is banned from using {bot_name}.", mention_author=False)
+
+
+@bot.command(name="unban")
+@commands.guild_only()
+async def prefix_unban_command(ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
+    """Admin/mod only: Unban a user from VN bot usage. Usage: !unban @user"""
+    if not ctx.guild:
+        await ctx.reply("This command can only be used in a server.", mention_author=False)
+        return
+    if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    if member is None:
+        await ctx.reply("Usage: `!unban @user`", mention_author=False)
+        return
+    gid, uid = ctx.guild.id, member.id
+    bot_mod.remove_ban(gid, uid)
+    discord_name = member.display_name
+    await ctx.channel.send(f"**{discord_name}** has been unbanned.")
+    await ctx.reply(f"{discord_name} is no longer banned.", mention_author=False)
+
+
+@bot.command(name="helpadmin", aliases=["adminhelp"])
+@commands.guild_only()
+async def prefix_helpadmin_command(ctx: commands.Context) -> None:
+    """List admin and moderator commands only."""
+    if not ctx.guild:
+        await ctx.reply("This command can only be used in a server.", mention_author=False)
+        return
+    if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    bot_name = getattr(bot.user, "name", None) or TFBOT_NAME or "the bot"
+    lines = [
+        f"**Admin / moderator commands for {bot_name}**",
+        "",
+        "**Moderation (timeout/ban apply only in the channel where used; user can still use the bot elsewhere, e.g. gameboard):**",
+        "• `!timeout @user or character name or user name [duration]` — Time out from VN in this channel. Omit duration for incremental (2m, 10m, 30m, 1h…). Slash: `/timeout` (optional character, duration).",
+        "• `!untimeout @user or character name or user name` — Remove timeout. Slash: `/untimeout` (optional character).",
+        "• `!ban @user or character name or user name` — Ban from VN in this channel. Slash: `/ban` (optional character).",
+        "• `!unban @user` — Unban from VN. Slash: `/unban`.",
+        "",
+        "**Other admin/mod:**",
+        "• `!freecharacter <character_name> or <user_id>` — Free a character stuck to a user who left.",
+        "• `!synreset` — Reset all active transformations in this server. Slash: `/synreset`.",
+        "• `!rerollall` — Reroll everyone at once. Slash: `/rerollall`.",
+        "• `!rerollnonadmin` — Reroll everyone that's not admin. Slash: `/rerollnonadmin`.",
+        "• `!resetinfo confirm` — Delete and recreate every character info forum post.",
+        "• `!refreshinfo` — Refresh character info forum posts.",
+        "",
+        "**Device admin tool (VN only):**",
+        "• `!dspawn` / `/dspawn` — Force immediate Device reassignment.",
+    ]
+    text = "\n".join(lines)
+    try:
+        await ctx.reply(text[:2000], mention_author=False)
+    except discord.HTTPException:
+        await ctx.reply(text[:1990] + "\n…", mention_author=False)
+
+
+@bot.command(name="dspawn")
+@commands.guild_only()
+async def prefix_dspawn_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False)
+        return
+    if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    old_holder = device_holder_by_guild.get(ctx.guild.id)
+    await _rotate_device_once(ctx.guild, force_announce=True)
+    new_holder = device_holder_by_guild.get(ctx.guild.id)
+    if new_holder is None:
+        await ctx.reply("No eligible transformed non-admin users are active right now.", mention_author=False)
+        return
+    await ctx.reply(f"Device reassigned: <@{old_holder}> -> <@{new_holder}>", mention_author=False)
+
+
+@bot.command(name="dstatus")
+@commands.guild_only()
+async def prefix_dstatus_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False)
+        return
+    await ctx.reply(_device_status_text(ctx.guild)[:2000], mention_author=False)
+
+
+@bot.command(name="helpdevice")
+@commands.guild_only()
+async def prefix_helpdevice_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False)
+        return
+    text = (
+        "**The Device**\n"
+        "It randomly jumps between active transformed non-admin users (about 5 minutes to 4 hours).\n"
+        "Holder gains fun-command privilege (reroll/swap/clone family), but no moderation/system powers.\n\n"
+        f"{_device_status_text(ctx.guild)}"
+    )
+    await ctx.reply(text[:2000], mention_author=False)
+
+
 @bot.command(name="resetinfo")
 async def reset_character_info_forum_command(ctx: commands.Context, confirmation: str = ""):
     author = ctx.author
     if not isinstance(author, discord.Member):
         await ctx.reply("Run this command inside a server.", mention_author=False)
         return
-    if not is_admin(author):
-        await ctx.reply("You lack permission to run this command.", mention_author=False)
+    if not (is_admin(author) or is_bot_mod(author)):
+        await ctx.reply("You must be an admin or moderator to run this command.", mention_author=False)
         return
     if confirmation.strip().lower() != "confirm":
         await ctx.reply(
@@ -3218,8 +4547,8 @@ async def refresh_character_info_forum_posts_command(ctx: commands.Context):
     if not isinstance(author, discord.Member):
         await ctx.reply("Run this command inside a server.", mention_author=False)
         return
-    if not is_admin(author):
-        await ctx.reply("You lack permission to run this command.", mention_author=False)
+    if not (is_admin(author) or is_bot_mod(author)):
+        await ctx.reply("You must be an admin or moderator to run this command.", mention_author=False)
         return
     if not CHARACTER_INFO_FORUM_ENABLED:
         await ctx.reply(
@@ -3249,13 +4578,180 @@ async def refresh_character_info_forum_posts_command(ctx: commands.Context):
     )
 
 
+async def _delete_vn_message_with_retry(
+    message: Optional[discord.Message],
+    *,
+    context: str = "",
+) -> None:
+    """Delete a channel message with one retry on failure. NotFound counts as success."""
+    if message is None:
+        return
+    label = context or "vn"
+    for attempt in range(2):
+        try:
+            await message.delete()
+            return
+        except discord.NotFound:
+            return
+        except discord.HTTPException as exc:
+            if attempt == 0:
+                await asyncio.sleep(0.2)
+                continue
+            logger.warning("Message delete failed (%s): %s", label, exc)
+
+
+def _format_bulk_reroll_summary(
+    *,
+    filter_non_admin_mod: bool,
+    eligible_count: int,
+    success_count: int,
+    failed_count: int,
+) -> str:
+    if eligible_count == 0:
+        if filter_non_admin_mod:
+            return (
+                "Reroll failed: no eligible non-admin/non-mod transformed members "
+                "were found in this channel."
+            )
+        return "Reroll failed: no eligible transformed members were found in this channel."
+    if success_count == eligible_count:
+        return "Rerolled Everyone"
+    if success_count > 0:
+        return f"Rerolled {success_count} characters. {failed_count} failed."
+    return f"Reroll failed: 0 of {eligible_count} rerolls succeeded."
+
+
+def _normalize_tf_stats_user_record(
+    raw: Any,
+    *,
+    guild_id: int,
+    user_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Return ``{total: int, characters: dict[str, int]}`` or None if raw is not a usable dict."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning(
+            "tf_stats invalid shape guild=%s user=%s type=%s",
+            guild_id,
+            user_id,
+            type(raw).__name__,
+        )
+        return None
+    total_raw = raw.get("total", 0)
+    try:
+        total = int(total_raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "tf_stats invalid total guild=%s user=%s raw=%r",
+            guild_id,
+            user_id,
+            total_raw,
+        )
+        total = 0
+    chars_raw = raw.get("characters", {})
+    characters: Dict[str, int] = {}
+    if isinstance(chars_raw, dict):
+        for key, val in chars_raw.items():
+            try:
+                characters[str(key)] = int(val)
+            except (TypeError, ValueError):
+                continue
+    elif chars_raw is not None:
+        logger.warning(
+            "tf_stats invalid characters type guild=%s user=%s",
+            guild_id,
+            user_id,
+        )
+    return {"total": total, "characters": characters}
+
+
+async def _execute_bulk_reroll_for_channel(
+    *,
+    guild: discord.Guild,
+    channel: discord.abc.GuildChannel,
+    prefix_ctx: Optional[commands.Context],
+    interaction: Optional[discord.Interaction],
+    filter_non_admin_mod: bool,
+) -> Tuple[int, int, int]:
+    """Snapshot eligible transformed members and reroll sequentially. Returns (eligible, success, failed)."""
+    channel_member_ids: set[int] = set()
+    if isinstance(channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+        for member in guild.members:
+            if channel.permissions_for(member).view_channel:
+                channel_member_ids.add(member.id)
+
+    eligible_members: List[discord.Member] = []
+    for (g_id, u_id), _state in list(active_transformations.items()):
+        if g_id != guild.id or u_id not in channel_member_ids:
+            continue
+        member = guild.get_member(u_id)
+        if member is None:
+            continue
+        if filter_non_admin_mod and (is_admin(member) or is_bot_mod(member)):
+            continue
+        eligible_members.append(member)
+
+    eligible_count = len(eligible_members)
+    success_count = 0
+    failed_count = 0
+    t0 = time.monotonic()
+    try:
+        for member in eligible_members:
+            if interaction is not None:
+                ctx_loop = InteractionContextAdapter(interaction, bot=bot)
+            else:
+                ctx_loop = prefix_ctx  # type: ignore[assignment]
+            ctx_loop._slash_target_member = member
+            ctx_loop._slash_target_folder = None
+            ctx_loop._slash_force_folder = None
+            ctx_loop._suppress_reroll_messages = True
+            try:
+                await reroll_command(ctx_loop, args="")
+            except Exception:
+                logger.exception(
+                    "Bulk reroll failed for member %s (%s) in guild %s",
+                    getattr(member, "display_name", "?"),
+                    member.id,
+                    guild.id,
+                )
+                failed_count += 1
+            else:
+                success_count += 1
+    finally:
+        if prefix_ctx is not None:
+            for attr in (
+                "_suppress_reroll_messages",
+                "_slash_target_member",
+                "_slash_target_folder",
+                "_slash_force_folder",
+            ):
+                if hasattr(prefix_ctx, attr):
+                    try:
+                        delattr(prefix_ctx, attr)
+                    except AttributeError:
+                        pass
+    elapsed = time.monotonic() - t0
+    logger.debug(
+        "Bulk reroll finished filter_non_admin_mod=%s eligible=%s success=%s failed=%s duration=%.2fs",
+        filter_non_admin_mod,
+        eligible_count,
+        success_count,
+        failed_count,
+        elapsed,
+    )
+    return eligible_count, success_count, failed_count
+
+
 async def reroll_command(ctx: commands.Context, *, args: str = ""):
     await ensure_state_restored()
     author = ctx.author
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
-    
+
+    game_state = None
+
     # Check if this is a game thread - if so, route to gameboard manager
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
         game_state = await GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
@@ -3285,7 +4781,6 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         and ROLEPLAY_COG.is_roleplay_post(ctx.channel)
         and ROLEPLAY_COG.has_control(author)
     )
-    author_is_admin = is_admin(author) or roleplay_dm_override
 
     guild = ctx.guild
     if guild is None:
@@ -3293,7 +4788,13 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         return None
     now = utc_now()
     author_state = find_active_transformation(author.id, guild.id)
+    author_has_fun_power = has_fun_privilege(author, author_state, guild.id)
+    author_is_admin = author_has_fun_power or roleplay_dm_override
     author_has_special_power = _has_special_reroll_access(author_state)
+    battery_block = _device_precheck_message(author, author_state, guild.id, "reroll")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return None
     author_special_label = author_state.character_name if author_state else ""
     can_force_reroll = author_is_admin or author_has_special_power
     
@@ -3330,6 +4831,13 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     forced_inanimate: Optional[Dict[str, object]] = None
 
     tokens = [token for token in args.split() if token.strip()]
+    # VN reroll filter: tokens starting with '-' are variable or pack filters, not target/forced
+    filter_value: Optional[str] = None
+    for t in tokens:
+        if t.strip().startswith("-"):
+            filter_value = t.strip()[1:].strip()
+            break
+    non_filter_tokens = [t for t in tokens if not t.strip().startswith("-")]
     forced_token: Optional[str] = None
     forced_token_blocked = False
     target_member: Optional[discord.Member] = None
@@ -3358,11 +4866,23 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             tokens = [slash_folder]
         forced_override = getattr(ctx, "_slash_force_folder", None)
         if forced_override:
-            forced_token = forced_override
+            if forced_override.strip().startswith("-"):
+                filter_value = forced_override.strip()[1:].strip()
+            else:
+                forced_token = forced_override
+        non_filter_tokens = list(tokens)
+    else:
+        # Recompute filter_value and non_filter_tokens from current tokens
+        filter_value = None
+        for t in tokens:
+            if t.strip().startswith("-"):
+                filter_value = t.strip()[1:].strip()
+                break
+        non_filter_tokens = [t for t in tokens if not t.strip().startswith("-")]
 
     try:
-        if tokens:
-            first = tokens.pop(0)
+        if non_filter_tokens:
+            first = non_filter_tokens.pop(0)
             target_selected = True
             mention_id = _extract_user_id_from_token(first)
             if mention_id is not None:
@@ -3371,7 +4891,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     await ctx.reply("I couldn't find that member.", mention_author=False)
                     return None
                 target_member = member_lookup
-                target_is_admin = is_admin(member_lookup)
+                target_is_admin = is_admin(member_lookup) or is_bot_mod(member_lookup)
                 state = find_active_transformation(member_lookup.id, guild.id)
                 if state is None:
                     placeholder = _build_placeholder_state(member_lookup, guild)
@@ -3392,26 +4912,39 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 )
                 if potential_member:
                     target_member = potential_member
-                    target_is_admin = is_admin(potential_member)
+                    target_is_admin = is_admin(potential_member) or is_bot_mod(potential_member)
                     placeholder = _build_placeholder_state(potential_member, guild)
                     placeholder_key = state_key(guild.id, potential_member.id)
                     placeholder_state = placeholder
                     active_transformations[placeholder_key] = placeholder
                     state = placeholder
                 else:
+                    _reroll_diag_log(
+                        "target_resolve_failed",
+                        guild_id=getattr(guild, "id", None),
+                        author_id=getattr(author, "id", None),
+                        target_token=first,
+                        interaction_id=_ctx_interaction_id(ctx),
+                    )
                     await ctx.reply(
-                        f"No active transformation uses folder `{first}`.",
+                        f"I couldn't find an active transformation matching `{first}`.",
                         mention_author=False,
                     )
                     return None
             if state is not None and target_member is None:
                 _, member_lookup = await fetch_member(state.guild_id, state.user_id)
                 target_member = member_lookup
-                target_is_admin = bool(member_lookup and is_admin(member_lookup))
+                target_is_admin = bool(member_lookup and (is_admin(member_lookup) or is_bot_mod(member_lookup)))
 
-        if tokens:
-            forced_token = tokens.pop(0)
-        if tokens:
+        if non_filter_tokens:
+            forced_token = non_filter_tokens.pop(0)
+        if non_filter_tokens:
+            _reroll_diag_log(
+                "too_many_arguments",
+                guild_id=getattr(guild, "id", None),
+                author_id=getattr(author, "id", None),
+                args=args,
+            )
             await ctx.reply(
                 "Too many arguments. Provide at most a target and optional forced folder.",
                 mention_author=False,
@@ -3419,18 +4952,33 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             return None
 
         if not target_selected:
-            if not author_is_admin:
+            if filter_value:
+                # VN: !reroll -female etc. = reroll self with filter
+                target_member = author
+                target_is_admin = is_admin(author) or is_bot_mod(author)
+                state = author_state
+                if state is None:
+                    await ctx.reply("You are not currently transformed.", mention_author=False)
+                    return None
+            elif not author_is_admin:
+                _reroll_diag_log(
+                    "missing_target_nonadmin",
+                    guild_id=getattr(guild, "id", None),
+                    author_id=getattr(author, "id", None),
+                    filter_value=filter_value,
+                )
                 await ctx.reply(
                     "Specify someone to reroll, e.g. `/reroll who_member:<member>` or mention the user.",
                     mention_author=False,
                 )
                 return None
-            target_member = author
-            target_is_admin = is_admin(author)
-            state = author_state
-            if state is None:
-                await ctx.reply("You are not currently transformed.", mention_author=False)
-                return None
+            else:
+                target_member = author
+                target_is_admin = is_admin(author) or is_bot_mod(author)
+                state = author_state
+                if state is None:
+                    await ctx.reply("You are not currently transformed.", mention_author=False)
+                    return None
 
         if forced_token is None:
             forced_override = getattr(ctx, "_slash_force_folder", None)
@@ -3448,6 +4996,13 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             state = placeholder
 
         if state is None:
+            _reroll_diag_log(
+                "state_not_found",
+                guild_id=getattr(guild, "id", None),
+                author_id=getattr(author, "id", None),
+                target_member_id=getattr(target_member, "id", None),
+                target_selected=target_selected,
+            )
             await ctx.reply(
                 "Unable to locate a transformation to reroll. Make sure the target is currently transformed.",
                 mention_author=False,
@@ -3456,18 +5011,31 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         if target_member is None:
             _, target_member = await fetch_member(state.guild_id, state.user_id)
             if target_member is None:
+                # Lazy cleanup: user left server - free the character so others can roll into them
+                key = state_key(state.guild_id, state.user_id)
+                active_transformations.pop(key, None)
+                persist_states()
+                schedule_history_refresh()
+                char_name = state.character_name or "that character"
                 await ctx.reply(
-                    "Unable to locate the member transformed into this character.",
+                    f"The person who had **{char_name}** left the server. I've freed **{char_name}** – they're available for others to roll or reroll into now. **{char_name}** is not assigned to anyone right now.",
                     mention_author=False,
                 )
                 return None
-            target_is_admin = is_admin(target_member)
+            target_is_admin = is_admin(target_member) or is_bot_mod(target_member)
+
+        if target_member is not None and (bot_mod.is_banned(guild.id, target_member.id) or bot_mod.is_timed_out(guild.id, target_member.id)):
+            await ctx.reply(
+                "That user is banned or timed out from the bot; I can't assign a transformation to them.",
+                mention_author=False,
+            )
+            return None
 
         # Admin protection: Non-admins can't reroll admins (if enabled)
         if ADMIN_PROTECTION_ENABLED:
             if target_is_admin and not author_is_admin:
                 await ctx.reply(
-                    "Only admins can reroll other admins.",
+                    "Only admins or moderators can reroll other admins.",
                     mention_author=False,
                 )
                 return None
@@ -3480,14 +5048,14 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 and target_is_admin
             ):
                 await ctx.reply(
-                    f"{SPECIAL_FORM_CAPITALIZED} perks can't be used on admins.",
+                    f"{SPECIAL_FORM_CAPITALIZED} perks can't be used on admins. Only admins or moderators can do that.",
                     mention_author=False,
                 )
                 return None
 
-        if target_member.id == author.id and not (author_is_admin or author_has_special_power):
+        if target_member.id == author.id and not (author_is_admin or author_has_special_power) and not filter_value:
             await ctx.reply(
-                "You can't use your own reroll. Ask another player or admin.",
+                "You can't use your own reroll. Ask another player, admin, or moderator.",
                 mention_author=False,
             )
             return None
@@ -3499,16 +5067,19 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
 
         if forced_token:
-            forced_character = _find_character_by_folder(forced_token)
-            forced_inanimate = None
-            if forced_character is None:
-                forced_inanimate = next(
-                    (entry for entry in INANIMATE_FORMS if str(entry.get("name", "")).strip().lower() == forced_token.lower()),
-                    None,
-                )
+            forced_character, forced_inanimate = _resolve_forced_reroll_token(forced_token)
             if forced_character is None and forced_inanimate is None:
+                _reroll_diag_log(
+                    "forced_resolve_failed",
+                    guild_id=getattr(guild, "id", None),
+                    author_id=getattr(author, "id", None),
+                    target_member_id=getattr(target_member, "id", None),
+                    interaction_id=_ctx_interaction_id(ctx),
+                    forced_token=forced_token,
+                    can_force_reroll=can_force_reroll,
+                )
                 await ctx.reply(
-                    f"Unknown folder `{forced_token}`. Use a valid character folder.",
+                    f"Unknown target `{forced_token}`. Provide a valid first name.",
                     mention_author=False,
                 )
                 return None
@@ -3517,14 +5088,14 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
                     if not author_is_admin and not author_has_special_power:
                         await ctx.reply(
-                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                            f"Only admins, moderators, or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
                             mention_author=False,
                         )
                         return None
                 if forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
                     if not author_is_admin and not author_has_special_power:
                         await ctx.reply(
-                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
+                            f"Only admins, moderators, or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
                             mention_author=False,
                         )
                         return None
@@ -3535,7 +5106,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 and not target_is_admin
             ):
                 await ctx.reply(
-                    f"You can only force {TFBOT_NAME} or Circe onto admins unless you're an admin yourself.",
+                    f"You can only force {TFBOT_NAME} or Circe onto admins unless you're an admin or moderator.",
                     mention_author=False,
                 )
                 return None
@@ -3573,6 +5144,20 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
             return None
 
+        await _revert_overlay_for_user(
+            guild.id,
+            target_member.id,
+            reason=f"{target_member.display_name}'s visual overlay reset before reroll.",
+            channel=ctx.channel,
+        )
+        state = active_transformations.get(key)
+        if state is None:
+            await ctx.reply(
+                "Their transformation reset during overlay cleanup. Try again if they are still transformed.",
+                mention_author=False,
+            )
+            return None
+
         await _unswap_and_announce(
             guild.id,
             target_member.id,
@@ -3587,11 +5172,25 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
             return None
 
-        used_names = {
-            current_state.character_name
-            for current_key, current_state in active_transformations.items()
-            if current_key != key
-        }
+        others_expanded: set[str] = set()
+        identity_cache: Dict[str, frozenset[str]] = {}
+
+        def _ident(name: Optional[str]) -> frozenset[str]:
+            key_name = (name or "").strip()
+            if not key_name:
+                return frozenset()
+            cached = identity_cache.get(key_name)
+            if cached is not None:
+                return cached
+            resolved = identity_names_for_character_name(key_name)
+            identity_cache[key_name] = resolved
+            return resolved
+
+        for current_key, current_state in active_transformations.items():
+            if current_key == key:
+                continue
+            others_expanded |= set(_ident(current_state.character_name))
+        self_identity = set(_ident(state.character_name))
 
         # Cooldown already checked earlier - skip duplicate check
 
@@ -3625,10 +5224,40 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             new_responses = tuple()
             new_is_inanimate = False
         else:
+            # VN: optional filter by variable (gender/age/type) or pack (-prefix)
+            pool_for_reroll: Sequence[TFCharacter] = CHARACTER_POOL
+            if filter_value:
+                filter_lower = filter_value.strip().lower()
+                # Try variable filter: any character in pool with matching gender/age/type
+                variable_matches = [
+                    c for c in CHARACTER_POOL
+                    if (getattr(c, "gender", None) or "").strip().lower() == filter_lower
+                    or (getattr(c, "age", None) or "").strip().lower() == filter_lower
+                    or (getattr(c, "type", None) or "").strip().lower() == filter_lower
+                ]
+                if variable_matches:
+                    pool_for_reroll = variable_matches
+                else:
+                    pack_file = _get_loaded_pack_file_for_reroll(filter_value)
+                    if pack_file:
+                        pool_for_reroll = [c for c in CHARACTER_POOL if getattr(c, "_pack_name", None) == pack_file]
+                    else:
+                        await ctx.reply(
+                            "No characters match that filter (variable or pack).",
+                            mention_author=False,
+                        )
+                        return None
+                if not pool_for_reroll:
+                    await ctx.reply(
+                        "No characters from that pack are available." if _get_loaded_pack_file_for_reroll(filter_value) else "No characters match that filter.",
+                        mention_author=False,
+                    )
+                    return None
             available_characters = [
                 character
-                for character in CHARACTER_POOL
-                if character.name not in used_names and character.name != state.character_name
+                for character in pool_for_reroll
+                if not (set(_ident(character.name)) & others_expanded)
+                and character.name not in self_identity
             ]
             if not target_is_admin:
                 available_characters = [
@@ -3652,7 +5281,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     mention_author=False,
                 )
                 return None
+            # Guard against RNG reselecting the current form (4.5 parity: avoid misleading no-ops)
             chosen = random.choice(available_characters)
+            retry_budget = 3
+            while retry_budget > 0 and chosen.name == state.character_name and len(available_characters) > 1:
+                chosen = random.choice(available_characters)
+                retry_budget -= 1
             new_name = chosen.name
             new_folder = chosen.folder
             new_avatar_path = chosen.avatar_path
@@ -3661,17 +5295,60 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             new_is_inanimate = False
 
         if new_name == state.character_name:
+            _reroll_diag_log(
+                "already_transformed_emitted",
+                guild_id=getattr(guild, "id", None),
+                author_id=getattr(author, "id", None),
+                target_member_id=getattr(target_member, "id", None),
+                interaction_id=_ctx_interaction_id(ctx),
+                forced_mode=forced_mode,
+                current_name=state.character_name,
+                new_name=new_name,
+                forced_token=forced_token,
+                forced_character_name=getattr(forced_character, "name", None),
+                forced_inanimate_name=getattr(forced_inanimate, "name", None) if forced_inanimate else None,
+            )
             await ctx.reply(
                 f"They are already transformed into {new_name}.",
                 mention_author=False,
             )
             return None
-        if new_name in used_names:
-            await ctx.reply(
-                f"{new_name} is already in use by another transformation.",
-                mention_author=False,
+        if identity_occupancy_conflict(guild.id, exclude_user_id=target_member.id, candidate_name=new_name):
+            _reroll_diag_log(
+                "identity_conflict_blocked",
+                guild_id=getattr(guild, "id", None),
+                author_id=getattr(author, "id", None),
+                target_member_id=getattr(target_member, "id", None),
+                interaction_id=_ctx_interaction_id(ctx),
+                candidate_name=new_name,
             )
-            return None
+            new_group = set(identity_names_for_character_name(new_name))
+            holder_state = None
+            for s in active_transformations.values():
+                if s.guild_id != guild.id or s.user_id == target_member.id:
+                    continue
+                if new_group & set(identity_names_for_character_name(s.character_name)):
+                    holder_state = s
+                    break
+            if holder_state is not None:
+                _, holder_member = await fetch_member(guild.id, holder_state.user_id)
+                if holder_member is None:
+                    holder_key = state_key(holder_state.guild_id, holder_state.user_id)
+                    active_transformations.pop(holder_key, None)
+                    persist_states()
+                    schedule_history_refresh()
+                else:
+                    await ctx.reply(
+                        f"{new_name} is already in use by another transformation.",
+                        mention_author=False,
+                    )
+                    return None
+            else:
+                await ctx.reply(
+                    f"{new_name} is already in use by another transformation.",
+                    mention_author=False,
+                )
+                return None
 
         previous_character = state.character_name
         state.character_name = new_name
@@ -3703,6 +5380,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             increment_tf_stats(guild.id, target_member.id, new_name)
         if not (author_is_admin or author_has_special_power):
             record_reroll_timestamp(guild.id, author.id, now)
+        _device_record_success(author, author_state, guild.id, "reroll")
 
         history_details = (
             f"Triggered by: **{author.display_name}**\n"
@@ -3764,10 +5442,10 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             except discord.HTTPException as exc:
                 logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
 
-            try:
-                await ctx.message.delete()
-            except discord.HTTPException:
-                pass
+            await _delete_vn_message_with_retry(
+                getattr(ctx, "message", None),
+                context="reroll announce",
+            )
 
             summary_message = f"{target_member.display_name} has been rerolled into **{new_name}**."
             if forced_mode:
@@ -3776,6 +5454,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 summary_message,
                 delete_after=10,
             )
+            _mark_interaction_adapter_satisfied(ctx)
         
         # Sync game state after reroll completes (if in game thread)
         if game_state and target_member and ctx.guild and GAME_BOARD_MANAGER:
@@ -3801,82 +5480,247 @@ async def slash_reroll_command(
     who_character: Optional[str] = None,
     to_character: Optional[str] = None,
 ) -> None:
-    await interaction.response.defer(thinking=True)
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
     ctx = InteractionContextAdapter(interaction, bot=bot)
     ctx._slash_target_member = who_member
     ctx._slash_target_folder = who_character
     ctx._slash_force_folder = to_character
-    await reroll_command(ctx, args="")
+    try:
+        await reroll_command(ctx, args="")
+    except discord.NotFound as exc:
+        logger.error(
+            "Slash reroll failed due to expired interaction %s: %s",
+            getattr(interaction, "id", "unknown"),
+            exc,
+        )
+        return
+    except discord.HTTPException as exc:
+        logger.error(
+            "Slash reroll failed for interaction %s: %s",
+            getattr(interaction, "id", "unknown"),
+            exc,
+        )
+        return
+
     if not ctx.responded:
-        await interaction.followup.send("No reroll was performed.", ephemeral=True)
+        try:
+            await interaction.followup.send("No reroll was performed.", ephemeral=True)
+        except discord.NotFound as exc:
+            logger.error(
+                "Slash reroll followup failed due to expired interaction %s: %s",
+                getattr(interaction, "id", "unknown"),
+                exc,
+            )
+        except discord.HTTPException as exc:
+            logger.error(
+                "Slash reroll followup failed for interaction %s: %s",
+                getattr(interaction, "id", "unknown"),
+                exc,
+            )
 
 
-@bot.tree.command(name="rerollall", description="Reroll everyone at once (admin only).")
+@bot.tree.command(name="rerollall", description="Reroll everyone at once (admin or moderator only).")
 @app_commands.guild_only()
 @guard_slash_command_channel
 async def slash_rerollall_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user) or not interaction.guild:
-        await interaction.followup.send("Only admins can use this command.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (is_admin(interaction.user) or is_bot_mod(interaction.user)) or not interaction.guild:
+        await interaction.followup.send(
+            "Reroll is an Admin/Mod only command, cannot be used by players.",
+            ephemeral=True,
+        )
         return
     await ensure_state_restored()
-    
-    # Get members who can view this channel (those "in" the channel)
-    channel_member_ids = set()
-    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
-        for member in interaction.guild.members:
-            if interaction.channel.permissions_for(member).view_channel:
-                channel_member_ids.add(member.id)
-    
-    rerolled_count = 0
-    # Set flag to suppress individual reroll messages
-    for (guild_id, user_id), state in active_transformations.items():
-        if guild_id == interaction.guild.id and user_id in channel_member_ids:
-            member = interaction.guild.get_member(user_id)
-            if member:
-                ctx = InteractionContextAdapter(interaction, bot=bot)
-                ctx._slash_target_member = member
-                ctx._slash_target_folder = None
-                ctx._slash_force_folder = None
-                ctx._suppress_reroll_messages = True
-                await reroll_command(ctx, args="")
-                rerolled_count += 1
-    
-    await interaction.followup.send("Rerolled Everyone", ephemeral=False)
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.followup.send("Use this command in a server channel.", ephemeral=True)
+        return
+    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        prefix_ctx=None,
+        interaction=interaction,
+        filter_non_admin_mod=False,
+    )
+    summary = _format_bulk_reroll_summary(
+        filter_non_admin_mod=False,
+        eligible_count=eligible_count,
+        success_count=success_count,
+        failed_count=failed_count,
+    )
+    await interaction.followup.send(summary, ephemeral=False)
 
 
-@bot.tree.command(name="rerollnonadmin", description="Reroll everyone that's not admin (admin only).")
+@bot.tree.command(name="rerollnonadmin", description="Reroll everyone that's not admin (admin or moderator only).")
 @app_commands.guild_only()
 @guard_slash_command_channel
 async def slash_rerollnonadmin_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user) or not interaction.guild:
-        await interaction.followup.send("Only admins can use this command.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (is_admin(interaction.user) or is_bot_mod(interaction.user)) or not interaction.guild:
+        await interaction.followup.send(
+            "Reroll is an Admin/Mod only command, cannot be used by players.",
+            ephemeral=True,
+        )
         return
     await ensure_state_restored()
-    
-    # Get members who can view this channel (those "in" the channel)
-    channel_member_ids = set()
-    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
-        for member in interaction.guild.members:
-            if interaction.channel.permissions_for(member).view_channel:
-                channel_member_ids.add(member.id)
-    
-    rerolled_count = 0
-    # Set flag to suppress individual reroll messages
-    for (guild_id, user_id), state in active_transformations.items():
-        if guild_id == interaction.guild.id and user_id in channel_member_ids:
-            member = interaction.guild.get_member(user_id)
-            if member and not is_admin(member):
-                ctx = InteractionContextAdapter(interaction, bot=bot)
-                ctx._slash_target_member = member
-                ctx._slash_target_folder = None
-                ctx._slash_force_folder = None
-                ctx._suppress_reroll_messages = True
-                await reroll_command(ctx, args="")
-                rerolled_count += 1
-    
-    await interaction.followup.send(f"Rerolled {rerolled_count} non-admin member(s) in this channel.", ephemeral=False)
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.followup.send("Use this command in a server channel.", ephemeral=True)
+        return
+    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        prefix_ctx=None,
+        interaction=interaction,
+        filter_non_admin_mod=True,
+    )
+    summary = _format_bulk_reroll_summary(
+        filter_non_admin_mod=True,
+        eligible_count=eligible_count,
+        success_count=success_count,
+        failed_count=failed_count,
+    )
+    await interaction.followup.send(summary, ephemeral=False)
+
+
+@bot.tree.command(name="timeout", description="Time out a user from VN bot usage (admin/mod only).")
+@app_commands.describe(
+    user="User to time out.",
+    character="Optional: character name (whoever has this character in this server will be timed out).",
+    duration="Optional: 2m, 10m, 30m, 1h, 2h, 4h, 24h. Omit for incremental tiers (2m, 10m, 30m, 1h…; resets after 60 min).",
+)
+@app_commands.guild_only()
+async def slash_timeout_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character: Optional[str] = None,
+    duration: Optional[str] = None,
+) -> None:
+    if not (is_admin(interaction.user) or is_bot_mod(interaction.user)):
+        await interaction.response.send_message("Only admins or moderators can use this command.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    member = user
+    if character and (character := character.strip()):
+        await ensure_state_restored()
+        member = await _resolve_target_to_member(guild, character, [])
+        if member is None:
+            await interaction.response.send_message(
+                "No one is currently that character in this server.",
+                ephemeral=True,
+            )
+            return
+    if is_admin(member) or is_bot_mod(member):
+        await interaction.response.send_message("You cannot timeout an admin or moderator.", ephemeral=True)
+        return
+    gid, uid = guild.id, member.id
+    channel_id = getattr(interaction.channel, "id", None) if interaction.channel else None
+    duration_minutes = _parse_timeout_duration(duration or "")
+    minutes = bot_mod.add_timeout(gid, uid, duration_minutes=duration_minutes, channel_id=channel_id)
+    duration_label = bot_mod.get_timeout_duration_label(minutes)
+    discord_name = member.display_name
+    await interaction.response.send_message(f"{discord_name} is timed out for {duration_label}.", ephemeral=True)
+    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.channel.send(f"**{discord_name}** is in a timeout for {duration_label}.")
+
+
+@bot.tree.command(name="untimeout", description="Remove a user's timeout (admin/mod only).")
+@app_commands.describe(
+    user="User to remove timeout from.",
+    character="Optional: character name or user name (whoever has this character / matches this name in this server will be untimed out).",
+)
+@app_commands.guild_only()
+async def slash_untimeout_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character: Optional[str] = None,
+) -> None:
+    if not (is_admin(interaction.user) or is_bot_mod(interaction.user)):
+        await interaction.response.send_message("Only admins or moderators can use this command.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    member = user
+    if character and (character := character.strip()):
+        await ensure_state_restored()
+        member = await _resolve_target_to_member(guild, character, [])
+        if member is None:
+            await interaction.response.send_message(
+                "No user or character found for that name in this server.",
+                ephemeral=True,
+            )
+            return
+    gid, uid = guild.id, member.id
+    bot_mod.clear_timeout(gid, uid)
+    discord_name = member.display_name
+    await interaction.response.send_message(f"{discord_name} is no longer timed out.", ephemeral=True)
+    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.channel.send(f"**{discord_name}** is no longer timed out.")
+
+
+@bot.tree.command(name="ban", description="Ban a user from VN bot usage (admin/mod only).")
+@app_commands.describe(
+    user="User to ban.",
+    character="Optional: character name (whoever has this character in this server will be banned).",
+)
+@app_commands.guild_only()
+async def slash_ban_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character: Optional[str] = None,
+) -> None:
+    if not (is_admin(interaction.user) or is_bot_mod(interaction.user)):
+        await interaction.response.send_message("Only admins or moderators can use this command.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    member = user
+    if character and (character := character.strip()):
+        await ensure_state_restored()
+        member = await _resolve_target_to_member(guild, character, [])
+        if member is None:
+            await interaction.response.send_message(
+                "No one is currently that character in this server.",
+                ephemeral=True,
+            )
+            return
+    if is_admin(member) or is_bot_mod(member):
+        await interaction.response.send_message("You cannot ban an admin or moderator.", ephemeral=True)
+        return
+    gid, uid = guild.id, member.id
+    channel_id = getattr(interaction.channel, "id", None) if interaction.channel else None
+    _free_character_for_moderation(gid, uid)
+    bot_mod.add_ban(gid, uid, channel_id=channel_id)
+    discord_name = member.display_name
+    bot_name = getattr(bot.user, "name", None) or TFBOT_NAME or "the bot"
+    await interaction.response.send_message(f"{discord_name} is banned from using {bot_name}.", ephemeral=True)
+    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.channel.send(f"**{discord_name}** has been banned permanently.")
+
+
+@bot.tree.command(name="unban", description="Unban a user from VN bot usage (admin/mod only).")
+@app_commands.describe(user="User to unban.")
+@app_commands.guild_only()
+async def slash_unban_command(interaction: discord.Interaction, user: discord.Member) -> None:
+    if not (is_admin(interaction.user) or is_bot_mod(interaction.user)):
+        await interaction.response.send_message("Only admins or moderators can use this command.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    gid, uid = guild.id, user.id
+    bot_mod.remove_ban(gid, uid)
+    discord_name = user.display_name
+    await interaction.response.send_message(f"{discord_name} is no longer banned.", ephemeral=True)
+    if isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.channel.send(f"**{discord_name}** has been unbanned.")
 
 
 @bot.tree.command(name="dm", description="Show or assign the RP DM (use inside the RP forum thread).")
@@ -3990,10 +5834,26 @@ async def tf_stats_command(ctx: commands.Context):
         return False
 
     guild_data = tf_stats.get(str(guild_id), {})
-    user_data = guild_data.get(str(ctx.author.id))
-    has_stats = bool(user_data)
-    if not user_data:
-        user_data = {"total": 0, "characters": {}}
+    raw_user = guild_data.get(str(ctx.author.id))
+    normalized_user = (
+        _normalize_tf_stats_user_record(
+            raw_user, guild_id=guild_id, user_id=ctx.author.id
+        )
+        if raw_user is not None
+        else None
+    )
+    if raw_user is not None and normalized_user is None:
+        await ctx.reply(
+            "Your transformation stats record looks corrupted. If this keeps happening, ask a server admin.",
+            mention_author=False,
+        )
+        if hasattr(ctx, "_responded"):
+            ctx._responded = True
+            if hasattr(ctx, "_responded_flag"):
+                ctx._responded_flag = True
+        return False
+    user_data = normalized_user if normalized_user is not None else {"total": 0, "characters": {}}
+    has_stats = bool(user_data.get("total") or user_data.get("characters"))
     logger.debug("TF stats: has_stats=%s data_keys=%s", has_stats, list(user_data.keys()))
 
     key = state_key(guild_id, ctx.author.id)
@@ -4117,12 +5977,10 @@ async def tf_stats_command(ctx: commands.Context):
         )
         return False
     finally:
-        message = getattr(ctx, "message", None)
-        if message is not None:
-            try:
-                await message.delete()
-            except Exception:
-                pass
+        await _delete_vn_message_with_retry(
+            getattr(ctx, "message", None),
+            context="tf_stats",
+        )
 
 
 @bot.tree.command(name="tf", description="DM your transformation statistics.")
@@ -4148,10 +6006,7 @@ async def slash_tf_command(interaction: discord.Interaction) -> None:
 
 
 async def background_command(ctx: commands.Context, *, selection: str = ""):
-    try:
-        await ctx.message.delete()
-    except discord.HTTPException:
-        pass
+    await _delete_vn_message_with_retry(ctx.message, context="background")
 
     async def send_channel_feedback(content: str, **kwargs) -> None:
         kwargs.setdefault("mention_author", False)
@@ -4233,7 +6088,7 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     can_target_others = (
         ctx.guild is not None
         and actor_member is not None
-        and (is_admin(actor_member) or _actor_has_narrator_power(actor_member))
+        and ((is_admin(actor_member) or is_bot_mod(actor_member)) or _actor_has_narrator_power(actor_member))
     )
     selection = selection.strip()
     target_spec: Optional[str] = None
@@ -4383,7 +6238,7 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
     can_target_others = (
         ctx.guild is not None
         and actor_member is not None
-        and (is_admin(actor_member) or _actor_has_narrator_power(actor_member))
+        and ((is_admin(actor_member) or is_bot_mod(actor_member)) or _actor_has_narrator_power(actor_member))
     )
     target_state: Optional[TransformationState] = None
     if can_target_others and ctx.guild and " " in outfit_name:
@@ -4552,7 +6407,7 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
     can_target_others = (
         ctx.guild is not None
         and actor_member is not None
-        and (is_admin(actor_member) or _actor_has_narrator_power(actor_member))
+        and ((is_admin(actor_member) or is_bot_mod(actor_member)) or _actor_has_narrator_power(actor_member))
     )
     target_state: Optional[TransformationState] = None
     if accessory_name and can_target_others and ctx.guild and " " in accessory_name:
@@ -4815,7 +6670,7 @@ async def _handle_slash_say(
     selection_scope = _selection_scope_for_channel(guild_channel)
 
     if enforce_permissions:
-        can_use_command = is_admin(actor) or _actor_has_narrator_power(actor)
+        can_use_command = (is_admin(actor) or is_bot_mod(actor)) or _actor_has_narrator_power(actor)
         if not can_use_command and ROLEPLAY_COG is not None and guild_channel and ROLEPLAY_COG.is_roleplay_post(guild_channel):
             can_use_command = ROLEPLAY_COG.has_control(actor)
         if not can_use_command:
@@ -5051,6 +6906,8 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return None
 
+    _record_tf_activity(message)
+
     logger.info(
         "Message %s from %s in channel %s",
         message.id,
@@ -5066,7 +6923,51 @@ async def on_message(message: discord.Message):
         and isinstance(message.channel, discord.Thread)
         and GAME_BOARD_MANAGER.is_game_thread(message.channel)
     )
-    
+
+    # VN-only: block banned/timed-out users (game board exempt; admins/mods immune)
+    if (
+        message.guild
+        and not is_game_thread
+        and not (is_admin(message.author) or is_bot_mod(message.author))
+    ):
+        gid = message.guild.id
+        uid = message.author.id
+        msg_channel_id = getattr(message.channel, "id", None)
+        if bot_mod.is_banned(gid, uid):
+            ban_channel_id = bot_mod.get_ban_channel_id(gid, uid)
+            if ban_channel_id is not None and msg_channel_id == ban_channel_id:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+                bot_name = getattr(bot.user, "name", None) or TFBOT_NAME or "the bot"
+                dm_text = (
+                    f"You have been banned from using {bot_name}. You cannot use {bot_name} commands or send messages that use {bot_name} until an admin or mod unbans you. "
+                    f"Only an admin or mod can unban you — do not DM or harass staff demanding an unban; doing so may result in you being blocked or removed from the server for harassment."
+                )
+                try:
+                    await message.author.send(dm_text)
+                except discord.HTTPException:
+                    pass
+                return None
+            # Banned but in another channel: do not block (e.g. gameboard allowed)
+        elif bot_mod.is_timed_out(gid, uid):
+            timeout_channel_id = bot_mod.get_timeout_channel_id(gid, uid)
+            if timeout_channel_id is not None and msg_channel_id == timeout_channel_id:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+                remaining = bot_mod.get_timeout_remaining_str(gid, uid) or "some time"
+                bot_name = getattr(bot.user, "name", None) or TFBOT_NAME or "the bot"
+                dm_text = f"You are in a timeout for {remaining}. You cannot use {bot_name} until the timeout expires."
+                try:
+                    await message.author.send(dm_text)
+                except discord.HTTPException:
+                    pass
+                return None
+            # Timed out but in another channel: do not block (e.g. gameboard allowed)
+
     allowed_ids = _allowed_instance_channel_ids()
     channel_allowed = (
         not message.guild
@@ -5122,6 +7023,7 @@ async def on_message(message: discord.Message):
                 message.author.id,
                 getattr(message.channel, "id", None),
             )
+            command_invoked = True
     elif message.content.startswith(str(bot.command_prefix)):
         logger.debug(
             "Command-like message ignored (ctx.command missing) content=%s author=%s channel=%s",
@@ -5158,7 +7060,7 @@ async def on_message(message: discord.Message):
                 
                 if game_state:
                     is_gm = GAME_BOARD_MANAGER._is_gm(message.author, game_state)
-                    is_admin_user = is_admin(message.author)
+                    is_admin_user = is_admin(message.author) or is_bot_mod(message.author)
                     if not is_gm:
                         player = game_state.players.get(message.author.id)
                         has_character = bool(player and player.character_name)
@@ -5184,7 +7086,7 @@ async def on_message(message: discord.Message):
                     # Check if this is !say command and user is GM
                     if command_name == 'say':
                         is_gm = GAME_BOARD_MANAGER._is_gm(message.author, game_state)
-                        is_admin_user = is_admin(message.author)
+                        is_admin_user = is_admin(message.author) or is_bot_mod(message.author)
                         if is_gm or is_admin_user:
                             # Allow !say to proceed for GM/admin - continue processing
                             # Don't return None - let the command handler process it
@@ -5256,7 +7158,7 @@ async def on_message(message: discord.Message):
 
     channel_id = getattr(message.channel, "id", None)
     is_roleplay_forum_post = ROLEPLAY_COG is not None and ROLEPLAY_COG.is_roleplay_post(message.channel)
-    is_admin_user = is_admin(message.author)
+    is_admin_user = is_admin(message.author) or is_bot_mod(message.author)
     
     # Don't skip game thread messages
     is_game_thread_msg = (
@@ -5469,6 +7371,33 @@ def _find_character_by_token(token: str) -> Optional[TFCharacter]:
     return None
 
 
+def _resolve_forced_reroll_token(
+    token: str,
+) -> Tuple[Optional[TFCharacter], Optional[Dict[str, object]]]:
+    """Resolve a forced reroll token to a character (folder or name token) or an inanimate form (name token)."""
+    normalized = (token or "").strip()
+    if not normalized:
+        return None, None
+
+    forced_character = _find_character_by_folder(normalized)
+    if forced_character is None:
+        forced_character = _find_character_by_token(normalized)
+    if forced_character is not None:
+        return forced_character, None
+
+    token_variants = _token_variants(normalized)
+    # Inanimate tokens: 4.5-style first word or full name match
+    for entry in INANIMATE_FORMS:
+        raw = str(entry.get("name", "")).strip()
+        if not raw:
+            continue
+        name_lower = raw.lower()
+        first_lower = name_lower.split(" ", 1)[0]
+        if name_lower in token_variants or first_lower in token_variants:
+            return None, entry
+    return None, None
+
+
 def _has_special_reroll_access(state: Optional[TransformationState]) -> bool:
     """Check if a state has special reroll access (configured special forms)."""
     if state is None:
@@ -5499,8 +7428,8 @@ async def prefix_synreset_35(ctx: commands.Context):
     if not isinstance(author, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return None
-    if not is_admin(author):
-        await ctx.reply("You lack permission to run this command.", mention_author=False)
+    if not (is_admin(author) or is_bot_mod(author)):
+        await ctx.reply("You must be an admin or moderator to run this command.", mention_author=False)
         return None
 
     await ensure_state_restored()
@@ -5600,460 +7529,8 @@ async def prefix_reroll_35(ctx: commands.Context, *, args: str = ""):
             await GAME_BOARD_MANAGER.command_reroll(ctx, member=target_member, token=token, forced_character=forced_character_token)
             return None
     
-    author_is_admin = is_admin(author)
+    await reroll_command(ctx, args=args or "")
 
-    guild = ctx.guild
-    if guild is None:
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
-        return None
-    now = utc_now()
-    author_state = find_active_transformation(author.id, guild.id)
-    author_has_special_reroll = _has_special_reroll_access(author_state)
-    can_force_reroll = author_is_admin or author_has_special_reroll
-    
-    # Check cooldown EARLY - before any other processing
-    # If on cooldown, return immediately without processing query
-    if not author_is_admin and not author_has_special_reroll:
-        last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
-        if last_reroll_at is not None:
-            cooldown_end = last_reroll_at + timedelta(hours=24)
-            if cooldown_end > now:
-                remaining = cooldown_end - now
-                remaining_seconds = max(int(remaining.total_seconds()), 0)
-                hours, remainder = divmod(remaining_seconds, 3600)
-                minutes = remainder // 60
-                if hours and minutes:
-                    when_text = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
-                elif hours:
-                    when_text = f"{hours} hour{'s' if hours != 1 else ''}"
-                elif minutes:
-                    when_text = f"{minutes} minute{'s' if minutes != 1 else ''}"
-                else:
-                    when_text = "less than a minute"
-                await ctx.reply(
-                    f"You've already used your reroll. You can reroll again in {when_text}.",
-                    mention_author=False,
-                )
-                return  # Exit immediately - don't process query at all
-    
-    # Only process query if not on cooldown
-    target_member: Optional[discord.Member] = None
-    target_is_admin = False
-    state: Optional[TransformationState] = None
-
-    forced_character: Optional[TFCharacter] = None
-    forced_inanimate: Optional[Dict[str, object]] = None
-
-    query = args.strip()
-    forced_token: Optional[str] = None
-    if query:
-        parts = query.split()
-        first_token_input = parts[0]
-        first_token = first_token_input.lower()
-        first_token_variants = _token_variants(first_token_input)
-        # DON'T check can_force_reroll here - wait until after state is resolved
-        if len(parts) > 1:
-            forced_token = parts[1].lower()
-
-        def _state_matches(state: TransformationState) -> bool:
-            if state.guild_id != guild.id:
-                return False
-            if _name_matches_token(state.character_name, first_token_input):
-                return True
-            character_entry = CHARACTER_BY_NAME.get(state.character_name.strip().lower())
-            if character_entry and _character_matches_token(character_entry, first_token_input):
-                return True
-            member_obj = guild.get_member(state.user_id)
-            if member_obj:
-                profile = member_profile_name(member_obj).lower()
-                profile_first = profile.split(" ", 1)[0]
-                if profile in first_token_variants or profile_first in first_token_variants:
-                    return True
-            return False
-
-        matching_states = [s for s in active_transformations.values() if _state_matches(s)]
-        target_member = None
-        if matching_states:
-            state = matching_states[0]
-            _, target_member = await fetch_member(state.guild_id, state.user_id)
-        else:
-            caller_state = author_state
-            if caller_state:
-                if _name_matches_token(caller_state.character_name, first_token_input):
-                    state = caller_state
-                    target_member = author
-                else:
-                    entry = CHARACTER_BY_NAME.get(caller_state.character_name.strip().lower())
-                    if entry and _character_matches_token(entry, first_token_input):
-                        state = caller_state
-                        target_member = author
-            if state is None:
-                member_candidate = discord.utils.find(
-                    lambda m: (
-                        m.display_name.lower() in first_token_variants
-                        or m.display_name.split(" ", 1)[0].lower() in first_token_variants
-                        or m.name.lower() in first_token_variants
-                        or m.name.split(" ", 1)[0].lower() in first_token_variants
-                    ),
-                    guild.members if guild else [],
-                )
-                if member_candidate:
-                    state = find_active_transformation(member_candidate.id, guild.id)
-                    target_member = member_candidate
-                else:
-                    state = None
-            if state is None:
-                await ctx.reply(
-                    f"No active transformation found for `{first_token_input}`.",
-                    mention_author=False,
-                )
-                return None
-            if target_member is None:
-                _, target_member = await fetch_member(state.guild_id, state.user_id)
-        
-        # NOW that state is fully resolved, re-check author_state and permissions
-        # This ensures we have the most up-to-date state with folder populated
-        author_state = find_active_transformation(author.id, guild.id)
-        author_has_special_reroll = _has_special_reroll_access(author_state)
-        can_force_reroll = author_is_admin or author_has_special_reroll
-        
-        # NOW check if they can force reroll (after state is resolved)
-        if forced_token and not can_force_reroll:
-            await ctx.reply(
-                _privileged_requirement_message("force a reroll into a specific form"),
-                mention_author=False,
-            )
-            return None
-        
-        if target_member is None:
-            await ctx.reply(
-                f"Unable to locate the member transformed into {state.character_name}.",
-                mention_author=False,
-            )
-            return None
-
-        target_is_admin = isinstance(target_member, discord.Member) and is_admin(target_member)
-
-        # Admin protection: Non-admins can't reroll admins (if enabled)
-        if ADMIN_PROTECTION_ENABLED:
-            if target_is_admin and not author_is_admin:
-                await ctx.reply(
-                    "Only admins can reroll other admins.",
-                    mention_author=False,
-                )
-                return None
-
-        if (
-            not author_is_admin
-            and target_member.id == author.id
-            and not author_has_special_reroll
-        ):
-            await ctx.reply(
-                "You can't use your reroll on yourself. Ask another player to reroll you instead.",
-                mention_author=False,
-            )
-            return None
-
-        if forced_token:
-            forced_character = _find_character_by_folder(forced_token)
-            if forced_character is None:
-                forced_character = next(
-                    (character for character in CHARACTER_POOL if _character_matches_token(character, forced_token)),
-                    None,
-                )
-            if forced_character is None:
-                forced_inanimate = next(
-                    (
-                        entry
-                        for entry in INANIMATE_FORMS
-                        if str(entry.get("name", "")).split(" ", 1)[0].lower() == forced_token
-                        or str(entry.get("name", "")).lower() == forced_token
-                    ),
-                    None,
-                )
-            if forced_character is None and forced_inanimate is None:
-                await ctx.reply(
-                    f"Unknown target `{forced_token}`. Provide a valid first name.",
-                    mention_author=False,
-                )
-                return None
-            # Toggleable restriction: Only admins or Ball/Narrator characters can force Ball/Narrator (if enabled)
-            if SPECIAL_CHARACTERS_ADMIN_ONLY:
-                if forced_character is not None and _is_special_reroll_name(forced_character.name):
-                    if not author_is_admin and not author_has_special_reroll:
-                        await ctx.reply(
-                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
-                            mention_author=False,
-                        )
-                        return None
-                if forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
-                    if not author_is_admin and not author_has_special_reroll:
-                        await ctx.reply(
-                            f"Only admins or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
-                            mention_author=False,
-                        )
-                        return None
-            forced_special_name = None
-            if forced_character is not None and _is_special_reroll_name(forced_character.name):
-                forced_special_name = forced_character.name
-            elif forced_inanimate is not None and _is_special_reroll_name(
-                str(forced_inanimate.get("name", ""))
-            ):
-                forced_special_name = str(forced_inanimate.get("name", ""))
-            if (
-                forced_character is not None
-                and _is_admin_only_random_name(forced_character.name)
-                and not author_is_admin
-                and not target_is_admin
-            ):
-                await ctx.reply(
-                    f"You can only force {TFBOT_NAME} or Circe onto admins unless you're an admin yourself.",
-                    mention_author=False,
-                )
-                return None
-            # Admin protection: Ball/Narrator perks can't force into Ball/Narrator (if enabled)
-            if ADMIN_PROTECTION_ENABLED:
-                if forced_special_name and author_has_special_reroll and not author_is_admin:
-                    await ctx.reply(
-                        f"{SPECIAL_FORM_CAPITALIZED} TFs can't force others into {SPECIAL_FORM_TARGET}. Ask an admin or owner.",
-                        mention_author=False,
-                    )
-                    return None
-    else:
-        if not author_is_admin:
-            await ctx.reply(
-                "You need to specify someone to reroll, e.g. `!reroll charname`.",
-                mention_author=False,
-            )
-            return None
-        target_member = author
-        key = state_key(guild.id, target_member.id)
-        state = author_state
-        if state is None:
-            await ctx.reply(
-                "You are not currently transformed; nothing to reroll.",
-                mention_author=False,
-            )
-            return None
-        target_is_admin = isinstance(target_member, discord.Member) and is_admin(target_member)
-
-    # Admin protection: Non-admins can't reroll admins (if enabled)
-    if ADMIN_PROTECTION_ENABLED:
-        if target_is_admin and not author_is_admin:
-            await ctx.reply(
-                "Only admins can reroll other admins.",
-                mention_author=False,
-            )
-            return None
-
-    key = state_key(guild.id, target_member.id)
-    current_state = active_transformations.get(key)
-    if current_state is None or current_state != state:
-        await ctx.reply(
-            "Unable to locate the transformation for this member.",
-            mention_author=False,
-        )
-        return None
-
-    await _unswap_and_announce(
-        guild.id,
-        target_member.id,
-        reason=f"{target_member.display_name}'s swap chain reset before reroll.",
-        channel=ctx.channel,
-    )
-    state = active_transformations.get(key)
-    if state is None:
-        await ctx.reply(
-            "Their transformation reset during the swap cleanup. Try again if they are still transformed.",
-            mention_author=False,
-        )
-        return None
-
-    used_names = {
-        current_state.character_name
-        for current_key, current_state in active_transformations.items()
-        if current_key != key
-    }
-
-    # Cooldown already checked earlier - skip duplicate check
-
-    forced_mode = forced_character is not None or forced_inanimate is not None
-
-    new_name: str
-    new_folder: Optional[str]
-    new_avatar_path: str
-    new_message: str
-    new_is_inanimate: bool
-    new_responses: Tuple[str, ...]
-
-    if forced_inanimate is not None:
-        new_name = str(forced_inanimate.get("name") or "Mystery Relic")
-        new_folder = None
-        new_avatar_path = str(forced_inanimate.get("avatar_path") or "")
-        new_message = str(forced_inanimate.get("message") or "You feel unsettlingly still.")
-        responses_raw = forced_inanimate.get("responses") or []
-        if isinstance(responses_raw, (list, tuple)):
-            new_responses = tuple(str(item).strip() for item in responses_raw if str(item).strip())
-        else:
-            new_responses = tuple()
-        if not new_responses:
-            new_responses = (new_message,)
-        new_is_inanimate = True
-    elif forced_character is not None:
-        new_name = forced_character.name
-        new_folder = forced_character.folder
-        new_avatar_path = forced_character.avatar_path
-        new_message = forced_character.message
-        new_responses = tuple()
-        new_is_inanimate = False
-    else:
-        available_characters = [
-            character
-            for character in CHARACTER_POOL
-            if character.name not in used_names and character.name != state.character_name
-        ]
-        if not target_is_admin:
-            available_characters = [
-                character
-                for character in available_characters
-                if not _is_admin_only_random_name(character.name)
-                # Toggleable restriction: Only admins can reroll into Ball/Narrator (if enabled)
-                and (not SPECIAL_CHARACTERS_ADMIN_ONLY or not _is_special_reroll_name(character.name))
-            ]
-        # Admin protection: Ball/Narrator perks can't reroll into Ball/Narrator (if enabled)
-        if ADMIN_PROTECTION_ENABLED:
-            if author_has_special_reroll and not author_is_admin:
-                available_characters = [
-                    character
-                    for character in available_characters
-                    if not _is_special_reroll_name(character.name)
-                ]
-        if not available_characters:
-            await ctx.reply(
-                "No alternative characters are available to reroll right now.",
-                mention_author=False,
-            )
-            return None
-        chosen = random.choice(available_characters)
-        new_name = chosen.name
-        new_folder = chosen.folder
-        new_avatar_path = chosen.avatar_path
-        new_message = chosen.message
-        new_responses = tuple()
-        new_is_inanimate = False
-
-    if new_name == state.character_name:
-        await ctx.reply(
-            f"They are already transformed into {new_name}.",
-            mention_author=False,
-        )
-        return None
-    if new_name in used_names:
-        await ctx.reply(
-            f"{new_name} is already in use by another transformation.",
-            mention_author=False,
-        )
-        return None
-
-    previous_character = state.character_name
-    state.character_name = new_name
-    state.character_folder = new_folder
-    state.character_avatar_path = new_avatar_path
-    state.character_message = new_message
-    state.avatar_applied = False
-    state.is_inanimate = new_is_inanimate
-    state.inanimate_responses = new_responses
-
-    character_token = new_folder or new_name
-    duration_label, guaranteed_duration = _choose_reroll_duration(new_is_inanimate, character_token)
-    state.duration_label = duration_label
-    
-    state.started_at = now
-    state.expires_at = now + guaranteed_duration
-    existing_task = revert_tasks.get(key)
-    if existing_task:
-        existing_task.cancel()
-    revert_tasks[key] = asyncio.create_task(
-        _schedule_revert(state, guaranteed_duration.total_seconds())
-    )
-
-    persist_states()
-
-    if not new_is_inanimate:
-        increment_tf_stats(guild.id, target_member.id, new_name)
-    if not author_is_admin and not author_has_special_reroll:
-        record_reroll_timestamp(guild.id, author.id, now)
-
-    history_details = (
-        f"Triggered by: **{author.display_name}**\n"
-        f"Member: **{target_member.display_name}**\n"
-        f"Previous Character: **{previous_character}**\n"
-        f"New Character: **{new_name}**"
-    )
-    if forced_mode:
-        history_details += "\nReason: Forced reroll override."
-    await send_history_message(
-        "TF Rerolled",
-        history_details,
-    )
-
-    original_name = member_profile_name(target_member)
-    if forced_mode:
-        custom_template = (
-            "barely has time to react before The BunniBot swoops in and swaps them straight into {character}. BunniBot just had to spice things up."
-        )
-        response_text = _format_character_message(
-            custom_template,
-            original_name,
-            target_member.mention,
-            state.duration_label,
-            new_name,
-        )
-    else:
-        base_message = _format_character_message(
-            new_message,
-            original_name,
-            target_member.mention,
-            state.duration_label,
-            new_name,
-        )
-        if author_is_admin:
-            response_text = base_message
-        else:
-            response_text = (
-                f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
-            )
-    special_hint = _format_special_reroll_hint_35(new_name)
-    if special_hint:
-        response_text = f"{response_text}\n{special_hint}"
-    emoji_prefix = _get_magic_emoji(guild)
-    try:
-        await ctx.channel.send(
-            f"{emoji_prefix} {response_text}",
-            allowed_mentions=discord.AllowedMentions(users=[target_member]),
-        )
-    except discord.HTTPException as exc:
-        logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
-
-    try:
-        await ctx.message.delete()
-    except discord.HTTPException:
-        pass
-
-    summary_message = f"{target_member.display_name} has been rerolled into **{new_name}**."
-    if forced_mode:
-        summary_message += " (BunniBot insisted on this one.)"
-    await ctx.send(
-        summary_message,
-        delete_after=10,
-    )
-    
-    # Sync game state after reroll completes (if in game thread)
-    if game_state and target_member and ctx.guild and GAME_BOARD_MANAGER:
-        if target_member.id in game_state.players:
-            game_state.players[target_member.id].character_name = new_name
-            await GAME_BOARD_MANAGER._save_game_state(game_state)
-            await GAME_BOARD_MANAGER._log_action(game_state, f"{target_member.display_name} character rerolled to {new_name}")
 
 
 async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
@@ -6080,7 +7557,7 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
     selection_scope = _selection_scope_for_channel(guild_channel)
 
     author_state = find_active_transformation(author.id, guild.id)
-    author_is_admin = is_admin(author)
+    author_is_admin = is_admin(author) or is_bot_mod(author)
     author_has_special = _has_special_reroll_access(author_state) or _state_has_privileged_access(author_state)
     if not (author_is_admin or author_has_special):
         logger.info(
@@ -6090,7 +7567,7 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
             author_has_special,
         )
         await ctx.reply(
-            "Only admins or privileged forms can use this command.",
+            "Only admins, moderators, or privileged forms can use this command.",
             mention_author=False,
         )
         return
@@ -6188,11 +7665,11 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
     await ensure_state_restored()
 
     author_state = find_active_transformation(author.id, guild.id)
-    author_is_admin = is_admin(author)
+    author_is_admin = is_admin(author) or is_bot_mod(author)
     author_has_special = _has_special_reroll_access(author_state) or _state_has_privileged_access(author_state)
     if not (author_is_admin or author_has_special):
         await ctx.reply(
-            "Only admins or privileged forms can use this command.",
+            "Only admins, moderators, or privileged forms can use this command.",
             mention_author=False,
         )
         return
@@ -6346,6 +7823,7 @@ async def slash_undopillow_command(
 @guard_prefix_command_channel
 async def prefix_tf_35(ctx: commands.Context):
     """3.5 version of tf stats command."""
+    await ensure_state_restored()
     guild_id = ctx.guild.id if ctx.guild else None
     if guild_id is None:
         await ctx.reply(
@@ -6355,13 +7833,28 @@ async def prefix_tf_35(ctx: commands.Context):
         return None
 
     guild_data = tf_stats.get(str(guild_id), {})
-    user_data = guild_data.get(str(ctx.author.id))
+    raw_user = guild_data.get(str(ctx.author.id))
+    normalized_user = (
+        _normalize_tf_stats_user_record(
+            raw_user, guild_id=guild_id, user_id=ctx.author.id
+        )
+        if raw_user is not None
+        else None
+    )
+    if raw_user is not None and normalized_user is None:
+        await ctx.reply(
+            "Your transformation stats record looks corrupted. If this keeps happening, ask a server admin.",
+            mention_author=False,
+        )
+        return None
+    user_data = normalized_user if normalized_user is not None else {"total": 0, "characters": {}}
+    has_stats = bool(user_data.get("total") or user_data.get("characters"))
 
-    if not user_data:
-        try:
-            await ctx.message.delete()
-        except discord.HTTPException:
-            pass
+    key = state_key(guild_id, ctx.author.id)
+    current_state = active_transformations.get(key)
+
+    if not has_stats and current_state is None:
+        await _delete_vn_message_with_retry(ctx.message, context="prefix_tf empty")
         try:
             await ctx.author.send(
                 "You haven't experienced any transformations yet."
@@ -6413,8 +7906,6 @@ async def prefix_tf_35(ctx: commands.Context):
             name = "By Character" if idx == 0 else "\u200b"
             embed.add_field(name=name, value=chunk or "\u200b", inline=False)
 
-    key = state_key(guild_id, ctx.author.id)
-    current_state = active_transformations.get(key)
     if current_state:
         remaining = max(
             (current_state.expires_at - utc_now()).total_seconds(),
@@ -6478,78 +7969,67 @@ async def prefix_tf_35(ctx: commands.Context):
             delete_after=10,
         )
     finally:
-        try:
-            await ctx.message.delete()
-        except discord.HTTPException:
-            pass
+        await _delete_vn_message_with_retry(ctx.message, context="prefix_tf")
 
 
 @bot.command(name="rerollall")
 @commands.guild_only()
 @guard_prefix_command_channel
 async def prefix_rerollall_command(ctx: commands.Context) -> None:
-    if not isinstance(ctx.author, discord.Member) or not is_admin(ctx.author) or not ctx.guild:
-        await ctx.reply("Only admins can use this command.", mention_author=False)
+    if not isinstance(ctx.author, discord.Member) or not (is_admin(ctx.author) or is_bot_mod(ctx.author)) or not ctx.guild:
+        await ctx.reply(
+            "Reroll is an Admin/Mod only command, cannot be used by players.",
+            mention_author=False,
+        )
         return
     await ensure_state_restored()
-    
-    # Get members who can view this channel (those "in" the channel)
-    channel_member_ids = set()
-    if isinstance(ctx.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
-        for member in ctx.guild.members:
-            if ctx.channel.permissions_for(member).view_channel:
-                channel_member_ids.add(member.id)
-    
-    rerolled_count = 0
-    # Set flag to suppress individual reroll messages
-    ctx._suppress_reroll_messages = True
-    try:
-        for (guild_id, user_id), state in active_transformations.items():
-            if guild_id == ctx.guild.id and user_id in channel_member_ids:
-                member = ctx.guild.get_member(user_id)
-                if member:
-                    await reroll_command(ctx, args=member.mention)
-                    rerolled_count += 1
-    finally:
-        # Clean up the flag
-        if hasattr(ctx, "_suppress_reroll_messages"):
-            del ctx._suppress_reroll_messages
-    
-    await ctx.reply("Rerolled Everyone", mention_author=False)
+    if ctx.channel is None:
+        await ctx.reply("Use this command in a server channel.", mention_author=False)
+        return
+    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+        guild=ctx.guild,
+        channel=ctx.channel,
+        prefix_ctx=ctx,
+        interaction=None,
+        filter_non_admin_mod=False,
+    )
+    summary = _format_bulk_reroll_summary(
+        filter_non_admin_mod=False,
+        eligible_count=eligible_count,
+        success_count=success_count,
+        failed_count=failed_count,
+    )
+    await ctx.reply(summary, mention_author=False)
 
 
 @bot.command(name="rerollnonadmin")
 @commands.guild_only()
 @guard_prefix_command_channel
 async def prefix_rerollnonadmin_command(ctx: commands.Context) -> None:
-    if not isinstance(ctx.author, discord.Member) or not is_admin(ctx.author) or not ctx.guild:
-        await ctx.reply("Only admins can use this command.", mention_author=False)
+    if not isinstance(ctx.author, discord.Member) or not (is_admin(ctx.author) or is_bot_mod(ctx.author)) or not ctx.guild:
+        await ctx.reply(
+            "Reroll is an Admin/Mod only command, cannot be used by players.",
+            mention_author=False,
+        )
         return
     await ensure_state_restored()
-    
-    # Get members who can view this channel (those "in" the channel)
-    channel_member_ids = set()
-    if isinstance(ctx.channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
-        for member in ctx.guild.members:
-            if ctx.channel.permissions_for(member).view_channel:
-                channel_member_ids.add(member.id)
-    
-    rerolled_count = 0
-    # Set flag to suppress individual reroll messages
-    ctx._suppress_reroll_messages = True
-    try:
-        for (guild_id, user_id), state in active_transformations.items():
-            if guild_id == ctx.guild.id and user_id in channel_member_ids:
-                member = ctx.guild.get_member(user_id)
-                if member and not is_admin(member):
-                    await reroll_command(ctx, args=member.mention)
-                    rerolled_count += 1
-    finally:
-        # Clean up the flag
-        if hasattr(ctx, "_suppress_reroll_messages"):
-            del ctx._suppress_reroll_messages
-    
-    await ctx.reply(f"Rerolled {rerolled_count} non-admin member(s) in this channel.", mention_author=False)
+    if ctx.channel is None:
+        await ctx.reply("Use this command in a server channel.", mention_author=False)
+        return
+    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+        guild=ctx.guild,
+        channel=ctx.channel,
+        prefix_ctx=ctx,
+        interaction=None,
+        filter_non_admin_mod=True,
+    )
+    summary = _format_bulk_reroll_summary(
+        filter_non_admin_mod=True,
+        eligible_count=eligible_count,
+        success_count=success_count,
+        failed_count=failed_count,
+    )
+    await ctx.reply(summary, mention_author=False)
 
 
 # Game Board Commands
@@ -6703,11 +8183,837 @@ async def prefix_transfergm_command(ctx: commands.Context, member: Optional[disc
 @commands.guild_only()
 @guard_prefix_command_channel
 async def prefix_debug_command(ctx: commands.Context) -> None:
-    """Toggle debug mode on/off (Admin & GM only). Shows coordinate labels on board."""
+    """Toggle debug mode on/off (Admin, moderator & GM only). Shows coordinate labels on board."""
     if GAME_BOARD_MANAGER:
         await GAME_BOARD_MANAGER.command_debug(ctx)
 
 
+
+
+def _split_prefix_args_preserve_quotes(args: str) -> List[str]:
+    s = (args or "").strip()
+    if not s:
+        return []
+    try:
+        parts = shlex.split(s, posix=True)
+    except ValueError:
+        return [p for p in s.split() if p.strip()]
+    return [p for p in parts if p.strip()]
+
+
+async def _resolve_genderswap_ageswap_target_member(
+    guild: discord.Guild,
+    author: discord.Member,
+    args: str,
+) -> Tuple[Optional[discord.Member], Optional[str]]:
+    """No tokens -> (None, None) = self. Invalid token -> (None, error message)."""
+    tokens = _split_prefix_args_preserve_quotes(args)
+    if not tokens:
+        return None, None
+    first = tokens[0]
+    mention_id = _extract_user_id_from_token(first)
+    if mention_id is not None:
+        _, member = await fetch_member(guild.id, mention_id)
+        if member is None:
+            return None, "I couldn't find that member."
+        return member, None
+    state_by_name = _find_state_by_token(guild, first)
+    if state_by_name is None:
+        return None, f"I couldn't find an active transformation matching `{first}`."
+    _, member = await fetch_member(state_by_name.guild_id, state_by_name.user_id)
+    if member is None:
+        return None, "That player doesn't appear to be in the server anymore."
+    return member, None
+
+
+def _mark_interaction_adapter_satisfied(ctx: Any) -> None:
+    if isinstance(ctx, InteractionContextAdapter):
+        ctx._responded_flag = True
+
+
+async def _do_genderswap_vn(ctx: Union[commands.Context, Any], guild: discord.Guild, target_member: discord.Member, author: discord.Member) -> bool:
+    """VN only: swap target's current character to their genderswap form. Returns True if swapped and replied."""
+    state = find_active_transformation(target_member.id, guild.id)
+    if state is None or not state.character_name:
+        logger.info(
+            "VN genderswap: no_active_tf user_id=%s guild_id=%s state=%s",
+            target_member.id,
+            guild.id,
+            "missing" if state is None else "empty character_name",
+        )
+        await ctx.reply(
+            "You aren't transformed." if target_member.id == author.id else "They aren't transformed.",
+            mention_author=False,
+        )
+        return False
+    current_character = CHARACTER_BY_NAME.get((state.character_name or "").strip().lower())
+    if current_character is None:
+        logger.info(
+            "VN genderswap: char_not_in_pool user_id=%s guild_id=%s state.character_name=%r",
+            target_member.id,
+            guild.id,
+            (state.character_name or "").strip(),
+        )
+        await ctx.reply(
+            "Could not find the current character in the pool.",
+            mention_author=False,
+        )
+        return False
+    link_value = getattr(current_character, "genderswap", None)
+    if not link_value or not str(link_value).strip():
+        logger.info(
+            "VN genderswap: skip (no link) user_id=%s guild_id=%s char=%r pack=%r folder=%r",
+            target_member.id,
+            guild.id,
+            current_character.name,
+            getattr(current_character, "_pack_name", None),
+            getattr(current_character, "folder", None),
+        )
+        await ctx.reply(
+            f"There is no genderswap for **{current_character.name}**.",
+            mention_author=False,
+        )
+        return False
+    current_pack = getattr(current_character, "_pack_name", None)
+    target_char = _resolve_link_to_character(link_value, current_pack)
+    if target_char is None:
+        logger.warning(
+            "VN genderswap: RESOLVE_FAIL user_id=%s guild_id=%s char=%r pack=%r folder=%r link=%r | %s",
+            target_member.id,
+            guild.id,
+            current_character.name,
+            current_pack,
+            getattr(current_character, "folder", None),
+            str(link_value).strip(),
+            _diagnose_swap_link_failure(str(link_value), current_pack),
+        )
+        await ctx.reply(
+            "That form isn't available (pack may not be loaded).",
+            mention_author=False,
+        )
+        return False
+    if identity_assignment_blocked(
+        guild.id,
+        exclude_user_ids={target_member.id},
+        candidate_name=target_char.name,
+    ):
+        await ctx.reply(
+            "That form is already in use by another transformation.",
+            mention_author=False,
+        )
+        return False
+    _log = logger.info if _vn_swap_ok_logs_enabled() else logger.debug
+    _log(
+        "VN genderswap: OK user_id=%s guild_id=%s from=%r pack=%r folder=%r link=%r -> to=%r target_pack=%r target_folder=%r",
+        target_member.id,
+        guild.id,
+        current_character.name,
+        current_pack,
+        getattr(current_character, "folder", None),
+        str(link_value).strip(),
+        target_char.name,
+        getattr(target_char, "_pack_name", None),
+        getattr(target_char, "folder", None),
+    )
+    old_name = state.character_name
+    state.character_name = target_char.name
+    state.character_folder = target_char.folder
+    state.character_avatar_path = target_char.avatar_path
+    state.character_message = target_char.message
+    state.avatar_applied = False
+    state.is_inanimate = False
+    state.inanimate_responses = tuple()
+    persist_states()
+    schedule_history_refresh()
+    await ctx.reply(
+        f"**{old_name}** has swapped gender; they have become **{target_char.name}**.",
+        mention_author=False,
+    )
+    return True
+
+
+async def _do_ageswap_vn(ctx: Union[commands.Context, Any], guild: discord.Guild, target_member: discord.Member, author: discord.Member) -> bool:
+    """VN only: swap target's current character to their ageswap form. Returns True if swapped and replied."""
+    state = find_active_transformation(target_member.id, guild.id)
+    if state is None or not state.character_name:
+        logger.info(
+            "VN ageswap: no_active_tf user_id=%s guild_id=%s state=%s",
+            target_member.id,
+            guild.id,
+            "missing" if state is None else "empty character_name",
+        )
+        await ctx.reply(
+            "You aren't transformed." if target_member.id == author.id else "They aren't transformed.",
+            mention_author=False,
+        )
+        return False
+    current_character = CHARACTER_BY_NAME.get((state.character_name or "").strip().lower())
+    if current_character is None:
+        logger.info(
+            "VN ageswap: char_not_in_pool user_id=%s guild_id=%s state.character_name=%r",
+            target_member.id,
+            guild.id,
+            (state.character_name or "").strip(),
+        )
+        await ctx.reply(
+            "Could not find the current character in the pool.",
+            mention_author=False,
+        )
+        return False
+    link_value = getattr(current_character, "ageswap", None)
+    if not link_value or not str(link_value).strip():
+        logger.info(
+            "VN ageswap: skip (no link) user_id=%s guild_id=%s char=%r pack=%r folder=%r",
+            target_member.id,
+            guild.id,
+            current_character.name,
+            getattr(current_character, "_pack_name", None),
+            getattr(current_character, "folder", None),
+        )
+        await ctx.reply(
+            f"There is no ageswap for **{current_character.name}**.",
+            mention_author=False,
+        )
+        return False
+    current_pack = getattr(current_character, "_pack_name", None)
+    target_char = _resolve_link_to_character(link_value, current_pack)
+    if target_char is None:
+        logger.warning(
+            "VN ageswap: RESOLVE_FAIL user_id=%s guild_id=%s char=%r pack=%r folder=%r link=%r | %s",
+            target_member.id,
+            guild.id,
+            current_character.name,
+            current_pack,
+            getattr(current_character, "folder", None),
+            str(link_value).strip(),
+            _diagnose_swap_link_failure(str(link_value), current_pack),
+        )
+        await ctx.reply(
+            "That form isn't available (pack may not be loaded).",
+            mention_author=False,
+        )
+        return False
+    if identity_assignment_blocked(
+        guild.id,
+        exclude_user_ids={target_member.id},
+        candidate_name=target_char.name,
+    ):
+        await ctx.reply(
+            "That form is already in use by another transformation.",
+            mention_author=False,
+        )
+        return False
+    _log = logger.info if _vn_swap_ok_logs_enabled() else logger.debug
+    _log(
+        "VN ageswap: OK user_id=%s guild_id=%s from=%r pack=%r folder=%r link=%r -> to=%r target_pack=%r target_folder=%r",
+        target_member.id,
+        guild.id,
+        current_character.name,
+        current_pack,
+        getattr(current_character, "folder", None),
+        str(link_value).strip(),
+        target_char.name,
+        getattr(target_char, "_pack_name", None),
+        getattr(target_char, "folder", None),
+    )
+    old_name = state.character_name
+    state.character_name = target_char.name
+    state.character_folder = target_char.folder
+    state.character_avatar_path = target_char.avatar_path
+    state.character_message = target_char.message
+    state.avatar_applied = False
+    state.is_inanimate = False
+    state.inanimate_responses = tuple()
+    persist_states()
+    schedule_history_refresh()
+    await ctx.reply(
+        f"**{old_name}** has swapped age; they have become **{target_char.name}**.",
+        mention_author=False,
+    )
+    return True
+
+
+@bot.command(name="genderswap")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_genderswap_command(ctx: commands.Context, *, args: str = "") -> None:
+    """VN only: swap your or target's current character to their genderswap form (e.g. Abby → AbbyGB)."""
+    await ensure_state_restored()
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await ctx.reply("This command isn't available in gameboard threads.", mention_author=False)
+        return
+    author = ctx.author
+    guild = ctx.guild
+    target_resolved, resolve_err = await _resolve_genderswap_ageswap_target_member(guild, author, args)
+    if resolve_err:
+        await ctx.reply(resolve_err, mention_author=False)
+        return
+    target_member = target_resolved if target_resolved is not None else author
+    author_state = find_active_transformation(author.id, guild.id)
+    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
+        await ctx.reply("Only admins or moderators can genderswap someone else.", mention_author=False)
+        return
+    battery_block = _device_precheck_message(author, author_state, guild.id, "genderswap")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    if await _do_genderswap_vn(ctx, guild, target_member, author):
+        _device_record_success(author, author_state, guild.id, "genderswap")
+
+
+@bot.command(name="ageswap")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_ageswap_command(ctx: commands.Context, *, args: str = "") -> None:
+    """VN only: swap your or target's current character to their ageswap form."""
+    await ensure_state_restored()
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
+        await ctx.reply("This command isn't available in gameboard threads.", mention_author=False)
+        return
+    author = ctx.author
+    guild = ctx.guild
+    target_resolved, resolve_err = await _resolve_genderswap_ageswap_target_member(guild, author, args)
+    if resolve_err:
+        await ctx.reply(resolve_err, mention_author=False)
+        return
+    target_member = target_resolved if target_resolved is not None else author
+    author_state = find_active_transformation(author.id, guild.id)
+    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
+        await ctx.reply("Only admins or moderators can ageswap someone else.", mention_author=False)
+        return
+    battery_block = _device_precheck_message(author, author_state, guild.id, "ageswap")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    if await _do_ageswap_vn(ctx, guild, target_member, author):
+        _device_record_success(author, author_state, guild.id, "ageswap")
+
+
+def _parse_optional_minutes(raw: str) -> Optional[int]:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        minutes = int(value)
+    except ValueError:
+        return None
+    if minutes <= 0:
+        return None
+    return minutes
+
+
+def _new_overlay_group_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time())}-{random.randint(1000, 9999)}"
+
+
+def _eligible_mass_swap_keys(guild: discord.Guild, *, include_admin_mod: bool) -> List[TransformKey]:
+    now = utc_now()
+    recent_keys: List[TransformKey] = []
+    all_keys: List[TransformKey] = []
+    for key, st in active_transformations.items():
+        if st.guild_id != guild.id:
+            continue
+        member = guild.get_member(st.user_id)
+        if member is None:
+            continue
+        if not include_admin_mod and (is_admin(member) or is_bot_mod(member)):
+            continue
+        if _has_overlay(key):
+            continue
+        all_keys.append(key)
+        last_seen = last_active_tf.get(key)
+        if last_seen is None:
+            continue
+        if (now - last_seen).total_seconds() > ACTIVE_WINDOW_SECONDS:
+            continue
+        recent_keys.append(key)
+    if len(recent_keys) >= 2:
+        return recent_keys
+    return all_keys
+
+
+def _schedule_overlay_group_expiry(guild_id: int, group_id: str, expires_at: Optional[datetime]) -> None:
+    _cancel_overlay_group_task(group_id)
+    if expires_at is None:
+        return
+    delay = max((expires_at - utc_now()).total_seconds(), 0.0)
+    overlay_group_tasks[group_id] = asyncio.create_task(_overlay_expiry_task(guild_id, group_id, delay))
+
+
+def _register_overlay_record(
+    key: TransformKey,
+    *,
+    overlay_type: str,
+    group_id: str,
+    source_user_id: Optional[int],
+    base_visual: Mapping[str, object],
+    expires_at: Optional[datetime],
+) -> None:
+    overlay_records[key] = {
+        "overlay_type": overlay_type,
+        "group_id": group_id,
+        "source_user_id": source_user_id,
+        "base_visual": dict(base_visual),
+        "expires_at": expires_at.isoformat() if expires_at else None,
+    }
+    overlay_group_members.setdefault(group_id, set()).add(key)
+
+
+async def _apply_swapall_group(
+    guild: discord.Guild,
+    keys: Sequence[TransformKey],
+    *,
+    minutes: Optional[int],
+) -> Tuple[int, int]:
+    shuffled = list(keys)
+    random.shuffle(shuffled)
+    group_id = _new_overlay_group_id("swapall")
+    expires_at = utc_now() + timedelta(minutes=minutes) if minutes else None
+    pairs_applied = 0
+    skipped = 0
+    for idx in range(0, len(shuffled) - 1, 2):
+        key_a = shuffled[idx]
+        key_b = shuffled[idx + 1]
+        state_a = active_transformations.get(key_a)
+        state_b = active_transformations.get(key_b)
+        if state_a is None or state_b is None:
+            skipped += 1
+            continue
+        if _is_overlay_visual_source_locked(guild.id, key_a[1]) or _is_overlay_visual_source_locked(guild.id, key_b[1]):
+            skipped += 1
+            continue
+        base_a = _snapshot_base_visual_fields(state_a)
+        base_b = _snapshot_base_visual_fields(state_b)
+        owner_a = state_a.form_owner_user_id or key_a[1]
+        owner_b = state_b.form_owner_user_id or key_b[1]
+        ident_a = state_a.identity_display_name or state_a.character_name
+        ident_b = state_b.identity_display_name or state_b.character_name
+        _register_overlay_record(
+            key_a,
+            overlay_type="swap",
+            group_id=group_id,
+            source_user_id=key_b[1],
+            base_visual=base_a,
+            expires_at=expires_at,
+        )
+        _register_overlay_record(
+            key_b,
+            overlay_type="swap",
+            group_id=group_id,
+            source_user_id=key_a[1],
+            base_visual=base_b,
+            expires_at=expires_at,
+        )
+        _apply_visual_from_state(state_a, state_b)
+        _apply_visual_from_state(state_b, state_a)
+        # Match `swap` attribution semantics: keep own visible identity labels.
+        state_a.form_owner_user_id = owner_b
+        state_a.identity_display_name = ident_a
+        state_b.form_owner_user_id = owner_a
+        state_b.identity_display_name = ident_b
+        pairs_applied += 1
+    if len(shuffled) % 2 == 1:
+        skipped += 1
+    if pairs_applied > 0:
+        persist_states()
+        _persist_overlay_state()
+        _schedule_overlay_group_expiry(guild.id, group_id, expires_at)
+    return pairs_applied, skipped
+
+
+@bot.command(name="swapall")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_swapall_command(ctx: commands.Context, minutes: Optional[str] = None) -> None:
+    await ensure_state_restored()
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    author_state = find_active_transformation(ctx.author.id, ctx.guild.id)
+    if not has_fun_privilege(ctx.author, author_state, ctx.guild.id):
+        await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
+        return
+    battery_block = _device_precheck_message(ctx.author, author_state, ctx.guild.id, "swap")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    battery_block = _device_precheck_message(ctx.author, author_state, ctx.guild.id, "swapall")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    parsed_minutes = _parse_optional_minutes(minutes or "")
+    keys = _eligible_mass_swap_keys(ctx.guild, include_admin_mod=True)
+    if len(keys) < 2:
+        await ctx.reply("Need at least two active transformed users to run swapall.", mention_author=False)
+        return
+    pairs, skipped = await _apply_swapall_group(ctx.guild, keys, minutes=parsed_minutes or SWAPALL_DEFAULT_MINUTES)
+    left_out = max(len(keys) - (pairs * 2), 0)
+    await ctx.reply(
+        f"{ctx.author.display_name} scrambles the room with a mass body-swap! Swapped {pairs} pair(s), left out {left_out}, conflicts {skipped}.",
+        mention_author=False,
+    )
+    _device_record_success(ctx.author, author_state, ctx.guild.id, "swapall")
+
+
+@bot.command(name="swapallnonadmin")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_swapallnonadmin_command(ctx: commands.Context, minutes: Optional[str] = None) -> None:
+    await ensure_state_restored()
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    author_state = find_active_transformation(ctx.author.id, ctx.guild.id)
+    if not has_fun_privilege(ctx.author, author_state, ctx.guild.id):
+        await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
+        return
+    battery_block = _device_precheck_message(ctx.author, author_state, ctx.guild.id, "swapallnonadmin")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    parsed_minutes = _parse_optional_minutes(minutes or "")
+    keys = _eligible_mass_swap_keys(ctx.guild, include_admin_mod=False)
+    if len(keys) < 2:
+        await ctx.reply("Need at least two active non-admin transformed users to run swapall.", mention_author=False)
+        return
+    pairs, skipped = await _apply_swapall_group(ctx.guild, keys, minutes=parsed_minutes or SWAPALL_DEFAULT_MINUTES)
+    left_out = max(len(keys) - (pairs * 2), 0)
+    await ctx.reply(
+        f"{ctx.author.display_name} triggers a non-admin mass swap! Swapped {pairs} pair(s), left out {left_out}, conflicts {skipped}.",
+        mention_author=False,
+    )
+    _device_record_success(ctx.author, author_state, ctx.guild.id, "swapallnonadmin")
+
+
+@bot.command(name="clone")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_clone_command(ctx: commands.Context, *, args: str = "") -> None:
+    await ensure_state_restored()
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    author_state = find_active_transformation(ctx.author.id, ctx.guild.id)
+    if not has_fun_privilege(ctx.author, author_state, ctx.guild.id):
+        await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
+        return
+    battery_block = _device_precheck_message(ctx.author, author_state, ctx.guild.id, "clone")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    tokens = [t for t in args.split() if t.strip()]
+    if not tokens:
+        await ctx.reply("Usage: `!clone <source> [target] [minutes]`", mention_author=False)
+        return
+    source_token = tokens[0]
+    target_token = tokens[1] if len(tokens) >= 2 else ""
+    minutes = _parse_optional_minutes(tokens[2]) if len(tokens) >= 3 else None
+    source_state = _find_state_by_token(ctx.guild, source_token)
+    if source_state is None:
+        await ctx.reply(f"I couldn't find an active transformation matching `{source_token}`.", mention_author=False)
+        return
+    target_state = _find_state_by_token(ctx.guild, target_token) if target_token else find_active_transformation(ctx.author.id, ctx.guild.id)
+    if target_state is None:
+        await ctx.reply(f"I couldn't find an active transformation matching `{target_token or ctx.author.display_name}`.", mention_author=False)
+        return
+    target_key = state_key(target_state.guild_id, target_state.user_id)
+    if _has_overlay(target_key):
+        await ctx.reply("Target already has an active overlay. Revert first.", mention_author=False)
+        return
+    source_key = state_key(source_state.guild_id, source_state.user_id)
+    if _has_overlay(source_key):
+        await ctx.reply("Cannot clone from a swapped/cloned overlay source. Revert source first.", mention_author=False)
+        return
+    expires_at = utc_now() + timedelta(minutes=minutes) if minutes else None
+    group_id = _new_overlay_group_id("clone")
+    _register_overlay_record(
+        target_key,
+        overlay_type="clone",
+        group_id=group_id,
+        source_user_id=source_state.user_id,
+        base_visual=_snapshot_base_visual_fields(target_state),
+        expires_at=expires_at,
+    )
+    _apply_visual_from_state(target_state, source_state)
+    persist_states()
+    _persist_overlay_state()
+    _schedule_overlay_group_expiry(ctx.guild.id, group_id, expires_at)
+    await ctx.reply(
+        f"{ctx.guild.get_member(target_state.user_id).display_name if ctx.guild.get_member(target_state.user_id) else target_state.user_id} now clones {ctx.guild.get_member(source_state.user_id).display_name if ctx.guild.get_member(source_state.user_id) else source_state.user_id}.",
+        mention_author=False,
+    )
+    _device_record_success(ctx.author, author_state, ctx.guild.id, "clone")
+
+
+@bot.command(name="revert")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_revert_overlay_command(ctx: commands.Context, *, target: str = "") -> None:
+    await ensure_state_restored()
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    author_state = find_active_transformation(ctx.author.id, ctx.guild.id)
+    if not has_fun_privilege(ctx.author, author_state, ctx.guild.id):
+        await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
+        return
+    battery_block = _device_precheck_message(ctx.author, author_state, ctx.guild.id, "revert")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    token = target.strip()
+    if not token:
+        group_ids = {str(rec.get("group_id")) for (g, _), rec in overlay_records.items() if g == ctx.guild.id and rec.get("group_id")}
+        total = 0
+        for group_id in sorted(group_ids):
+            total += await _revert_overlay_group(ctx.guild.id, group_id, reason=f"Manual revert by {ctx.author.display_name}", channel=ctx.channel)
+        await ctx.reply(f"Reverted overlays for {total} participant(s).", mention_author=False)
+        _device_record_success(ctx.author, author_state, ctx.guild.id, "revert")
+        return
+    st = _find_state_by_token(ctx.guild, token)
+    if st is None:
+        await ctx.reply(f"I couldn't find an active transformation matching `{token}`.", mention_author=False)
+        return
+    changed = await _revert_overlay_for_user(
+        ctx.guild.id,
+        st.user_id,
+        reason=f"Manual revert by {ctx.author.display_name}",
+        channel=ctx.channel,
+    )
+    if not changed:
+        await ctx.reply("No overlay found for that target.", mention_author=False)
+        return
+    await ctx.reply("Overlay reverted.", mention_author=False)
+    _device_record_success(ctx.author, author_state, ctx.guild.id, "revert")
+
+
+@bot.tree.command(name="swapall", description="Swap all active transformed users randomly.")
+@app_commands.describe(minutes="Optional duration in minutes.")
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_swapall_command(interaction: discord.Interaction, minutes: Optional[int] = None) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    actor_state = find_active_transformation(interaction.user.id, interaction.guild.id)
+    if not has_fun_privilege(interaction.user, actor_state, interaction.guild.id):
+        await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
+        return
+    battery_block = _device_precheck_message(interaction.user, actor_state, interaction.guild.id, "swapall")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
+        return
+    keys = _eligible_mass_swap_keys(interaction.guild, include_admin_mod=True)
+    if len(keys) < 2:
+        await interaction.followup.send("Need at least two active transformed users to run swapall.", ephemeral=True)
+        return
+    use_minutes = minutes if minutes and minutes > 0 else SWAPALL_DEFAULT_MINUTES
+    pairs, skipped = await _apply_swapall_group(interaction.guild, keys, minutes=use_minutes)
+    left_out = max(len(keys) - (pairs * 2), 0)
+    await interaction.followup.send(
+        f"{interaction.user.display_name} scrambles the room with a mass body-swap! Swapped {pairs} pair(s), left out {left_out}, conflicts {skipped}.",
+        ephemeral=False,
+    )
+    _device_record_success(interaction.user, actor_state, interaction.guild.id, "swapall")
+
+
+@bot.tree.command(name="swapallnonadmin", description="Swap all active non-admin transformed users randomly.")
+@app_commands.describe(minutes="Optional duration in minutes.")
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_swapallnonadmin_command(interaction: discord.Interaction, minutes: Optional[int] = None) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    actor_state = find_active_transformation(interaction.user.id, interaction.guild.id)
+    if not has_fun_privilege(interaction.user, actor_state, interaction.guild.id):
+        await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
+        return
+    battery_block = _device_precheck_message(interaction.user, actor_state, interaction.guild.id, "swapallnonadmin")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
+        return
+    keys = _eligible_mass_swap_keys(interaction.guild, include_admin_mod=False)
+    if len(keys) < 2:
+        await interaction.followup.send("Need at least two active non-admin transformed users to run swapall.", ephemeral=True)
+        return
+    use_minutes = minutes if minutes and minutes > 0 else SWAPALL_DEFAULT_MINUTES
+    pairs, skipped = await _apply_swapall_group(interaction.guild, keys, minutes=use_minutes)
+    left_out = max(len(keys) - (pairs * 2), 0)
+    await interaction.followup.send(
+        f"{interaction.user.display_name} triggers a non-admin mass swap! Swapped {pairs} pair(s), left out {left_out}, conflicts {skipped}.",
+        ephemeral=False,
+    )
+    _device_record_success(interaction.user, actor_state, interaction.guild.id, "swapallnonadmin")
+
+
+@bot.tree.command(name="clone", description="Clone one active user's visuals onto another.")
+@app_commands.describe(source="Source token", target="Optional target token", minutes="Optional duration in minutes")
+@app_commands.autocomplete(source=_character_name_autocomplete, target=_character_name_autocomplete)
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_clone_command(
+    interaction: discord.Interaction,
+    source: str,
+    target: Optional[str] = None,
+    minutes: Optional[int] = None,
+) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    actor_state = find_active_transformation(interaction.user.id, interaction.guild.id)
+    if not has_fun_privilege(interaction.user, actor_state, interaction.guild.id):
+        await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
+        return
+    battery_block = _device_precheck_message(interaction.user, actor_state, interaction.guild.id, "clone")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
+        return
+    source_state = _find_state_by_token(interaction.guild, source)
+    if source_state is None:
+        await interaction.followup.send(f"I couldn't find an active transformation matching `{source}`.", ephemeral=True)
+        return
+    target_state = _find_state_by_token(interaction.guild, target) if target else actor_state
+    if target_state is None:
+        await interaction.followup.send(f"I couldn't find an active transformation matching `{target or interaction.user.display_name}`.", ephemeral=True)
+        return
+    target_key = state_key(target_state.guild_id, target_state.user_id)
+    source_key = state_key(source_state.guild_id, source_state.user_id)
+    if _has_overlay(target_key):
+        await interaction.followup.send("Target already has an active overlay. Revert first.", ephemeral=True)
+        return
+    if _has_overlay(source_key):
+        await interaction.followup.send("Cannot clone from an overlay source. Revert source first.", ephemeral=True)
+        return
+    expires_at = utc_now() + timedelta(minutes=minutes) if minutes and minutes > 0 else None
+    group_id = _new_overlay_group_id("clone")
+    _register_overlay_record(
+        target_key,
+        overlay_type="clone",
+        group_id=group_id,
+        source_user_id=source_state.user_id,
+        base_visual=_snapshot_base_visual_fields(target_state),
+        expires_at=expires_at,
+    )
+    _apply_visual_from_state(target_state, source_state)
+    persist_states()
+    _persist_overlay_state()
+    _schedule_overlay_group_expiry(interaction.guild.id, group_id, expires_at)
+    await interaction.followup.send("Clone applied.", ephemeral=False)
+    _device_record_success(interaction.user, actor_state, interaction.guild.id, "clone")
+
+
+@bot.tree.command(name="revert", description="Revert swap/clone overlays.")
+@app_commands.describe(target="Optional target token.")
+@app_commands.autocomplete(target=_character_name_autocomplete)
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_revert_overlay_command(interaction: discord.Interaction, target: Optional[str] = None) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    actor_state = find_active_transformation(interaction.user.id, interaction.guild.id)
+    if not has_fun_privilege(interaction.user, actor_state, interaction.guild.id):
+        await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
+        return
+    battery_block = _device_precheck_message(interaction.user, actor_state, interaction.guild.id, "revert")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
+        return
+    if not target:
+        group_ids = {str(rec.get("group_id")) for (g, _), rec in overlay_records.items() if g == interaction.guild.id and rec.get("group_id")}
+        total = 0
+        for group_id in sorted(group_ids):
+            total += await _revert_overlay_group(interaction.guild.id, group_id, reason=f"Manual revert by {interaction.user.display_name}")
+        await interaction.followup.send(f"Reverted overlays for {total} participant(s).", ephemeral=False)
+        _device_record_success(interaction.user, actor_state, interaction.guild.id, "revert")
+        return
+    st = _find_state_by_token(interaction.guild, target)
+    if st is None:
+        await interaction.followup.send(f"I couldn't find an active transformation matching `{target}`.", ephemeral=True)
+        return
+    changed = await _revert_overlay_for_user(interaction.guild.id, st.user_id, reason=f"Manual revert by {interaction.user.display_name}")
+    await interaction.followup.send("Overlay reverted." if changed else "No overlay found for that target.", ephemeral=False)
+    if changed:
+        _device_record_success(interaction.user, actor_state, interaction.guild.id, "revert")
+
+
+@bot.tree.command(name="dspawn", description="Force the Device to reassign now.")
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_dspawn_command(interaction: discord.Interaction) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
+        await interaction.followup.send("The Device isn't available in gameboard mode.", ephemeral=True)
+        return
+    if not (is_admin(interaction.user) or is_bot_mod(interaction.user)):
+        await interaction.followup.send("Only admins or moderators can use this command.", ephemeral=True)
+        return
+    old_holder = device_holder_by_guild.get(interaction.guild.id)
+    await _rotate_device_once(interaction.guild, force_announce=True)
+    new_holder = device_holder_by_guild.get(interaction.guild.id)
+    if new_holder is None:
+        await interaction.followup.send("No eligible transformed non-admin users are active right now.", ephemeral=True)
+        return
+    await interaction.followup.send(f"Device reassigned: <@{old_holder}> -> <@{new_holder}>", ephemeral=False)
+
+
+@bot.tree.command(name="dstatus", description="Show current Device holder and battery.")
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_dstatus_command(interaction: discord.Interaction) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=False):
+        return
+    if not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
+        await interaction.followup.send("The Device isn't available in gameboard mode.", ephemeral=True)
+        return
+    await interaction.followup.send(_device_status_text(interaction.guild)[:2000], ephemeral=False)
+
+
+@bot.tree.command(name="helpdevice", description="Explain Device powers, battery, and recharge.")
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_helpdevice_command(interaction: discord.Interaction) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=False):
+        return
+    if not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
+        await interaction.followup.send("The Device isn't available in gameboard mode.", ephemeral=True)
+        return
+    text = (
+        "**The Device**\n"
+        "It randomly jumps between active transformed non-admin users (about 5 minutes to 4 hours).\n"
+        "Holder gains fun-command privilege (reroll/swap/clone family), but no moderation/system powers.\n\n"
+        f"{_device_status_text(interaction.guild)}"
+    )
+    await interaction.followup.send(text[:2000], ephemeral=False)
 
 
 @bot.command(name="pswap")
@@ -6792,15 +9098,20 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         return
     
     # Check permission: admin, ball, or narrator only
-    author_is_admin = is_admin(ctx.author)
     author_state = find_active_transformation(ctx.author.id, ctx.guild.id)
-    author_has_special_access = _has_special_reroll_access(author_state)
-    
-    if not author_is_admin and not author_has_special_access:
+    if not has_fun_privilege(ctx.author, author_state, ctx.guild.id):
         await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
         return
     
     tokens = [token for token in args.split() if token.strip()]
+    if len(tokens) == 1:
+        single = tokens[0].lower()
+        if single == "all":
+            await prefix_swapall_command(ctx)
+            return
+        if single in {"allnonadmin", "nonadmin"}:
+            await prefix_swapallnonadmin_command(ctx)
+            return
     if len(tokens) < 2:
         await ctx.reply("Usage: `!swap character1 character2` or `!swap @user1 @user2`", mention_author=False)
         return
@@ -6868,6 +9179,30 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     owner2 = state2.form_owner_user_id or user2_id
     identity1 = state1.identity_display_name or state1.character_name
     identity2 = state2.identity_display_name or state2.character_name
+
+    group1 = set(identity_names_for_character_name(char1_name))
+    group2 = set(identity_names_for_character_name(char2_name))
+    if group1 and group2 and (group1 & group2):
+        await ctx.reply(
+            "Those two forms are linked variants of the same character identity. Swapping them is not allowed.",
+            mention_author=False,
+        )
+        return
+    ignore_users = {user1_id, user2_id}
+    if identity_assignment_blocked(
+        ctx.guild.id,
+        exclude_user_ids=ignore_users,
+        candidate_name=char2_name,
+    ) or identity_assignment_blocked(
+        ctx.guild.id,
+        exclude_user_ids=ignore_users,
+        candidate_name=char1_name,
+    ):
+        await ctx.reply(
+            "That swap would result in a character identity conflict with another active transformation.",
+            mention_author=False,
+        )
+        return
 
     # Create new states with swapped character data
     new_state1 = TransformationState(
@@ -6943,9 +9278,10 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         f"Thanks to {author_name}, {character1_name} swapped bodies with {character2_name}.",
         mention_author=False,
     )
+    _device_record_success(ctx.author, author_state, ctx.guild.id, "swap")
 
 
-@bot.tree.command(name="swap", description="Swap characters between two players or characters (admins or special-form characters only).")
+@bot.tree.command(name="swap", description="Swap characters between two players (admin/mod/special-form only).")
 @app_commands.describe(
     character1="First character/user to swap (character name or @mention).",
     character2="Second character/user to swap (character name or @mention).",
@@ -6991,12 +9327,13 @@ async def slash_swap_command(
         return
     
     # Check permission: admin, ball, or narrator only
-    author_is_admin = is_admin(interaction.user)
     author_state = find_active_transformation(interaction.user.id, interaction.guild.id)
-    author_has_special_access = _has_special_reroll_access(author_state)
-    
-    if not author_is_admin and not author_has_special_access:
+    if not has_fun_privilege(interaction.user, author_state, interaction.guild.id):
         await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
+        return
+    battery_block = _device_precheck_message(interaction.user, author_state, interaction.guild.id, "swap")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
         return
     
     # Use the same logic as prefix command but adapted for slash
@@ -7056,6 +9393,30 @@ async def slash_swap_command(
     owner2 = state2.form_owner_user_id or user2_id
     identity1 = state1.identity_display_name or state1.character_name
     identity2 = state2.identity_display_name or state2.character_name
+
+    group1 = set(identity_names_for_character_name(char1_name))
+    group2 = set(identity_names_for_character_name(char2_name))
+    if group1 and group2 and (group1 & group2):
+        await interaction.followup.send(
+            "Those two forms are linked variants of the same character identity. Swapping them is not allowed.",
+            ephemeral=True,
+        )
+        return
+    ignore_users = {user1_id, user2_id}
+    if identity_assignment_blocked(
+        interaction.guild.id,
+        exclude_user_ids=ignore_users,
+        candidate_name=char2_name,
+    ) or identity_assignment_blocked(
+        interaction.guild.id,
+        exclude_user_ids=ignore_users,
+        candidate_name=char1_name,
+    ):
+        await interaction.followup.send(
+            "That swap would result in a character identity conflict with another active transformation.",
+            ephemeral=True,
+        )
+        return
     
     # Create new states with swapped character data
     new_state1 = TransformationState(
@@ -7127,6 +9488,127 @@ async def slash_swap_command(
         f"Thanks to {author_name}, {character1_name} swapped bodies with {character2_name}.",
         ephemeral=False,
     )
+    _device_record_success(interaction.user, author_state, interaction.guild.id, "swap")
+
+
+@bot.tree.command(name="genderswap", description="VN only: swap your or target's character to their genderswap form.")
+@app_commands.describe(
+    who_member="Member to genderswap (omit for yourself).",
+    who_character="Folder or character token of the active form to genderswap (targets that character's holder).",
+)
+@app_commands.autocomplete(who_character=_character_name_autocomplete)
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_genderswap_command(
+    interaction: discord.Interaction,
+    who_member: Optional[discord.Member] = None,
+    who_character: Optional[str] = None,
+) -> None:
+    """VN only: swap to genderswap form."""
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
+        await interaction.followup.send("This command isn't available in gameboard threads.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    author = interaction.user
+    guild = interaction.guild
+    target_member: discord.Member
+    if who_member is not None:
+        target_member = who_member
+    elif who_character and str(who_character).strip():
+        token = str(who_character).strip()
+        st = _find_state_by_token(guild, token)
+        if st is None:
+            await interaction.followup.send(
+                f"I couldn't find an active transformation matching `{token}`.",
+                ephemeral=True,
+            )
+            return
+        _, resolved = await fetch_member(st.guild_id, st.user_id)
+        if resolved is None:
+            await interaction.followup.send(
+                "That player doesn't appear to be in the server anymore.",
+                ephemeral=True,
+            )
+            return
+        target_member = resolved
+    else:
+        target_member = author
+    author_state = find_active_transformation(author.id, guild.id)
+    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
+        await interaction.followup.send("Only admins or moderators can genderswap someone else.", ephemeral=True)
+        return
+    battery_block = _device_precheck_message(author, author_state, guild.id, "genderswap")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    if await _do_genderswap_vn(ctx, interaction.guild, target_member, author):
+        _device_record_success(author, author_state, guild.id, "genderswap")
+
+
+@bot.tree.command(name="ageswap", description="VN only: swap your or target's character to their ageswap form.")
+@app_commands.describe(
+    who_member="Member to ageswap (omit for yourself).",
+    who_character="Folder or character token of the active form to ageswap (targets that character's holder).",
+)
+@app_commands.autocomplete(who_character=_character_name_autocomplete)
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_ageswap_command(
+    interaction: discord.Interaction,
+    who_member: Optional[discord.Member] = None,
+    who_character: Optional[str] = None,
+) -> None:
+    """VN only: swap to ageswap form."""
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
+        await interaction.followup.send("This command isn't available in gameboard threads.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    author = interaction.user
+    guild = interaction.guild
+    target_member: discord.Member
+    if who_member is not None:
+        target_member = who_member
+    elif who_character and str(who_character).strip():
+        token = str(who_character).strip()
+        st = _find_state_by_token(guild, token)
+        if st is None:
+            await interaction.followup.send(
+                f"I couldn't find an active transformation matching `{token}`.",
+                ephemeral=True,
+            )
+            return
+        _, resolved = await fetch_member(st.guild_id, st.user_id)
+        if resolved is None:
+            await interaction.followup.send(
+                "That player doesn't appear to be in the server anymore.",
+                ephemeral=True,
+            )
+            return
+        target_member = resolved
+    else:
+        target_member = author
+    author_state = find_active_transformation(author.id, guild.id)
+    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
+        await interaction.followup.send("Only admins or moderators can ageswap someone else.", ephemeral=True)
+        return
+    battery_block = _device_precheck_message(author, author_state, guild.id, "ageswap")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
+        return
+    ctx = InteractionContextAdapter(interaction, bot=bot)
+    if await _do_ageswap_vn(ctx, interaction.guild, target_member, author):
+        _device_record_success(author, author_state, guild.id, "ageswap")
 
 
 @bot.command(name="movetoken")
@@ -7277,18 +9759,6 @@ async def prefix_players_command(ctx: commands.Context) -> None:
     return
 
 
-@bot.command(name="bg_list")
-async def prefix_bg_list(ctx: commands.Context):
-    """List available backgrounds (DMs the GM)."""
-    # Check if this is a game thread first
-    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        # Game thread - use game-specific bg list command
-        await GAME_BOARD_MANAGER.command_bg_list(ctx)
-        return
-    
-    # Not in game thread - ignore (VN mode handles this differently)
-    return
-
 @bot.command(name="bg")
 async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
     """3.5 version of bg command."""
@@ -7379,7 +9849,7 @@ async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
     can_target_others = (
         ctx.guild is not None
         and actor_member is not None
-        and (is_admin(actor_member) or _actor_has_narrator_power_35(actor_member))
+        and ((is_admin(actor_member) or is_bot_mod(actor_member)) or _actor_has_narrator_power_35(actor_member))
     )
     selection = selection.strip()
     target_spec: Optional[str] = None
@@ -7474,19 +9944,6 @@ async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
             await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
 
 
-@bot.command(name="outfit_list")
-@guard_prefix_command_channel
-async def prefix_outfit_list(ctx: commands.Context, *, target: str = ""):
-    """List available outfits for a character or user."""
-    # Check if this is a game thread first
-    if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        # Game thread - use game-specific outfit list command
-        await GAME_BOARD_MANAGER.command_outfit_list(ctx, target=target.strip() if target else None)
-        return
-    
-    # Not in game thread - ignore (VN mode handles this differently)
-    return
-
 @bot.command(name="outfit")
 @guard_prefix_command_channel
 async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
@@ -7532,7 +9989,7 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
     can_target_others = (
         ctx.guild is not None
         and actor_member is not None
-        and (is_admin(actor_member) or _actor_has_narrator_power_35(actor_member))
+        and ((is_admin(actor_member) or is_bot_mod(actor_member)) or _actor_has_narrator_power_35(actor_member))
     )
     target_state: Optional[TransformationState] = None
     if can_target_others and ctx.guild and " " in outfit_name:
@@ -7673,13 +10130,13 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
         game_state = await GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
         if game_state:
             # In gameboard mode - only GM can use !say
-            can_use_command = GAME_BOARD_MANAGER._is_gm(actor, game_state) or is_admin(actor)
+            can_use_command = GAME_BOARD_MANAGER._is_gm(actor, game_state) or (is_admin(actor) or is_bot_mod(actor))
         else:
             # Not in gameboard mode - use normal VN mode checks
-            can_use_command = is_admin(actor) or _actor_has_narrator_power_35(actor)
+            can_use_command = (is_admin(actor) or is_bot_mod(actor)) or _actor_has_narrator_power_35(actor)
     else:
         # Not in game thread - use normal VN mode checks
-        can_use_command = is_admin(actor) or _actor_has_narrator_power_35(actor)
+        can_use_command = (is_admin(actor) or is_bot_mod(actor)) or _actor_has_narrator_power_35(actor)
     
     if not can_use_command:
         await ctx.reply(_privileged_requirement_message("use `!say`"), mention_author=False)
@@ -7881,10 +10338,7 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
     if sent_message and cleaned_content:
         _register_relay_message(sent_message.id, target_state.character_name, cleaned_content)
 
-    try:
-        await ctx.message.delete()
-    except discord.HTTPException:
-        pass
+    await _delete_vn_message_with_retry(ctx.message, context="say panel")
 
 
 def main():
@@ -7908,6 +10362,8 @@ def main():
     except Exception as e:
         logger.exception("Unexpected error during bot startup: %s", e)
         raise
+    finally:
+        shutdown_session_error_log()
 
 
 if __name__ == "__main__":

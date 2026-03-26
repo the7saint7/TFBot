@@ -20,7 +20,12 @@ from discord.ext import commands
 from tfbot.character_lookup import CharacterNameNormalizer, CharacterNormalizationError
 from tfbot.models import TransformationState
 from tfbot.panels import VN_CACHE_DIR, compose_game_avatar, parse_discord_formatting, render_vn_panel
-from tfbot.utils import is_admin, utc_now
+from tfbot.utils import _parse_quoted_comma_list, get_setting, is_admin, utc_now
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None  # type: ignore[misc, assignment]
 
 try:
     import yaml  # type: ignore
@@ -38,7 +43,6 @@ ARCHIVE_DIR = SUBMISSIONS_DIR / "archive"
 
 ACCEPT_EMOJI = "✅"
 DECLINE_EMOJI = "❌"
-APROUVER_ROLE = "aprouver"
 SUBMISSION_CHANNEL_ID = int(os.getenv("TFBOT_SUBMISSION_CHANNEL_ID", "0") or 0)
 
 
@@ -709,8 +713,15 @@ class SubmissionManager:
             return True
         if member.guild.owner_id == member.id:
             return True
-        normalized = APROUVER_ROLE.lower()
-        return any(role.name.lower() == normalized for role in getattr(member, "roles", []))
+        if load_dotenv:
+            load_dotenv()
+        raw = os.getenv("TFBOT_TEST", "").strip().upper()
+        test_mode = raw in ("YES", "TRUE", "1", "ON")
+        names_str = get_setting("TFBOT_SUBMISSION_APPROVER_ROLE_NAMES", "", test_mode).strip()
+        if not names_str:
+            return False
+        allowed_names = {s.lower() for s in _parse_quoted_comma_list(names_str)}
+        return any(role.name.lower() in allowed_names for role in getattr(member, "roles", []))
 
     async def _remove_reaction(self, payload: discord.RawReactionActionEvent) -> None:
         channel = self.bot.get_channel(payload.channel_id)

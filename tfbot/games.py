@@ -24,7 +24,7 @@ from discord.ext import commands
 from .game_models import GameConfig, GamePlayer, GameState
 from .game_board import render_game_board, validate_coordinate, _resolve_face_cache_path
 from .game_pack_loader import get_game_pack
-from .utils import get_channel_id, is_admin, int_from_env, path_from_env
+from .utils import get_channel_id, is_admin, is_bot_mod, int_from_env, path_from_env
 from .models import TransformationState, TFCharacter
 from .swaps import ensure_form_owner
 from .state import serialize_state, deserialize_state
@@ -92,17 +92,16 @@ class GameBoardManager:
         # Load main config
         self._config = self._load_main_config()
         
-        # Read TFBOT_TEST flag (same logic as bot.py)
+        # Read TFBOT_TEST flag (same logic as bot.py: not defined or invalid → LIVE)
         TFBOT_TEST_RAW = os.getenv("TFBOT_TEST", "").strip().upper()
         if not TFBOT_TEST_RAW:
-            test_mode: Optional[bool] = None  # Backward compatible
+            test_mode: Optional[bool] = False  # Not defined → LIVE
         elif TFBOT_TEST_RAW in ("YES", "TRUE", "1", "ON"):
             test_mode = True  # TEST mode
         elif TFBOT_TEST_RAW in ("NO", "FALSE", "0", "OFF"):
             test_mode = False  # LIVE mode
         else:
-            # Invalid value, default to backward compatible
-            test_mode = None
+            test_mode = False  # Invalid value → LIVE
         
         # Use environment variable if available, otherwise use config file
         env_forum_id = get_channel_id("TFBOT_GAME_FORUM_CHANNEL_ID", 0, test_mode)
@@ -271,6 +270,7 @@ class GameBoardManager:
                     is_paused=bool(data.get("is_paused", False)),  # Default to False for old saves
                     bot_user_id=data.get("bot_user_id"),  # Load bot ownership (None for old saves)
                     enabled_packs=enabled_packs,  # Restore saved enabled packs (or from config for old saves)
+                    map_thread_id=data.get("map_thread_id"),  # Restore so map thread receives board updates after reload
                 )
                 
                 # ADD pack_data restoration if it exists
@@ -1241,7 +1241,7 @@ class GameBoardManager:
         
         # Handle map thread: auto-delete all messages except admin commands
         if game_state.map_thread_id and thread_id == game_state.map_thread_id:
-            is_admin_user = is_admin(message.author)
+            is_admin_user = is_admin(message.author) or is_bot_mod(message.author)
             # Allow admin commands, cache and delete everything else
             if not is_admin_user or not (message.content and message.content.strip().startswith('!')):
                 await self._cache_and_delete_message(
@@ -1279,7 +1279,7 @@ class GameBoardManager:
                     # Extract message data BEFORE deleting
                     # DIAGNOSTIC: Track admin/player status for queuing
                     is_gm_queuing = self._is_actual_gm(message.author, game_state) if game_state else False
-                    is_admin_queuing = is_admin(message.author)
+                    is_admin_queuing = is_admin(message.author) or is_bot_mod(message.author)
                     player_queuing = game_state.players.get(message.author.id) if game_state else None
                     has_character_queuing = player_queuing and player_queuing.character_name
                     logger.info("[QUEUE-STEP-1] Command lock detected - queuing message (author_id=%s, message_id=%s, thread_id=%s, is_gm=%s, is_admin=%s, has_character=%s, character_name=%s)", 
@@ -1492,7 +1492,7 @@ class GameBoardManager:
         
         # Check if author is GM or admin
         is_gm = self._is_actual_gm(message.author, game_state)
-        is_admin_user = is_admin(message.author)
+        is_admin_user = is_admin(message.author) or is_bot_mod(message.author)
         is_narrator = game_state.narrator_user_id == message.author.id
         
         # Get player info first
@@ -1802,7 +1802,7 @@ class GameBoardManager:
                 message_id = message.id if hasattr(message, 'id') else 'unknown'
                 # DIAGNOSTIC: Track admin/player status during processing
                 is_gm_process = self._is_actual_gm(message.author, game_state) if message.author and game_state else False
-                is_admin_process = is_admin(message.author) if message.author else False
+                is_admin_process = (is_admin(message.author) or is_bot_mod(message.author)) if message.author else False
                 player_process = game_state.players.get(author_id) if game_state else None
                 has_character_process = player_process and player_process.character_name
                 logger.info("[PROCESS-STEP-1] Processing start: Direct send (no text) (author_id=%s, message_id=%s, has_attachments=%s, has_stickers=%s, is_gm=%s, is_admin=%s, has_character=%s, character_name=%s)", 
@@ -2144,7 +2144,7 @@ class GameBoardManager:
                 message_id = message.id if hasattr(message, 'id') else 'unknown'
                 # DIAGNOSTIC: Track admin/player status during VN panel processing
                 is_gm_vn = self._is_actual_gm(message.author, game_state) if message.author and game_state else False
-                is_admin_vn = is_admin(message.author) if message.author else False
+                is_admin_vn = (is_admin(message.author) or is_bot_mod(message.author)) if message.author else False
                 player_vn = game_state.players.get(author_id) if game_state else None
                 has_character_vn = player_vn and player_vn.character_name
                 logger.info("[VN-PANEL-STEP-1] Processing start: VN panel send (author_id=%s, message_id=%s, character=%s, has_attachments=%s, has_stickers=%s, is_gm=%s, is_admin=%s, has_character=%s)", 
@@ -2834,7 +2834,7 @@ class GameBoardManager:
         """Check if member is GM for a game or is admin."""
         if not isinstance(member, discord.Member):
             return False
-        if is_admin(member):
+        if is_admin(member) or is_bot_mod(member):
             return True
         if game_state and game_state.gm_user_id == member.id:
             return True
@@ -3760,7 +3760,7 @@ class GameBoardManager:
             author_id = author_obj.id if author_obj else 'unknown'
             # DIAGNOSTIC: Track admin/player status during reconstruction
             is_gm_reconstruct = self._is_actual_gm(author_obj, game_state) if author_obj and game_state else False
-            is_admin_reconstruct = is_admin(author_obj) if author_obj else False
+            is_admin_reconstruct = (is_admin(author_obj) or is_bot_mod(author_obj)) if author_obj else False
             player_reconstruct = game_state.players.get(author_id) if game_state else None
             has_character_reconstruct = player_reconstruct and player_reconstruct.character_name
             logger.info("[RECONSTRUCT-STEP-2] Processing queued message %d/%d (message_id=%s, author_id=%s, is_gm=%s, is_admin=%s, has_character=%s, character_name=%s)", 
@@ -4011,7 +4011,7 @@ class GameBoardManager:
         logger.info("command_startgame: is_admin(%s) = %s", ctx.author.id, is_admin_result)
         if not is_admin_result:
             logger.warning("command_startgame: STEP 2 FAILED - User %s is not admin", ctx.author.id)
-            await ctx.reply("Only admins can start new games. The admin who starts the game becomes the GM.", mention_author=False)
+            await ctx.reply("You are not an admin. Only admins can start new games. The admin who starts the game becomes the GM.", mention_author=False)
             return
         
         logger.info("command_startgame: STEP 2 PASSED - User %s is admin, proceeding", ctx.author.id)
@@ -6052,7 +6052,7 @@ class GameBoardManager:
                     return
                 
                 is_gm = self._is_actual_gm(ctx.author, game_state)
-                is_admin_user = is_admin(ctx.author)
+                is_admin_user = is_admin(ctx.author) or is_bot_mod(ctx.author)
                 is_gm_override = False
                 
                 # Check if GM is forcing a roll for another player (admins cannot force rolls)
@@ -6607,7 +6607,7 @@ class GameBoardManager:
             
             # Allow both actual GM and admins to end games
             is_actual_gm = self._is_actual_gm(ctx.author, game_state)
-            is_admin_user = is_admin(ctx.author)
+            is_admin_user = is_admin(ctx.author) or is_bot_mod(ctx.author)
             if not (is_actual_gm or is_admin_user):
                 await ctx.reply("Only the GM or an admin can end games.", mention_author=False)
                 return
@@ -7751,7 +7751,7 @@ class GameBoardManager:
             
             # Allow both actual GM and admins to transfer GM (admins can override in case of disconnect/abuse)
             is_actual_gm = self._is_actual_gm(ctx.author, game_state)
-            is_admin_user = is_admin(ctx.author)
+            is_admin_user = is_admin(ctx.author) or is_bot_mod(ctx.author)
             if not (is_actual_gm or is_admin_user):
                 await ctx.reply("Only the current GM or an admin can transfer the GM role.", mention_author=False)
                 return
@@ -7826,9 +7826,9 @@ class GameBoardManager:
 
 **Visual Customization (GM Only):**
 `!bg @user/all <id>` - Set background
-`!bg_list` - List backgrounds (DMs GM)
+`!bg` (no args) - List backgrounds (DMs GM)
 `!outfit @user/char <outfit>` - Set outfit
-`!outfit_list [char/@user]` - List outfits
+`!outfit` (no args) - List outfits for your character; add target for others
 
 **Save/Load (GM Only):**
 `!savegame` - Save game state
