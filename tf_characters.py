@@ -10,18 +10,15 @@ logger = logging.getLogger("tfbot")
 # Bot name from environment, defaults to "Syn" for backwards compatibility
 # Handle TEST_MODE logic similar to get_setting() in utils.py
 def _get_bot_name() -> str:
-    """Get bot name with TEST_MODE support (backward compatible)."""
+    """Get bot name with TEST_MODE support (not defined or invalid → LIVE)."""
     test_mode_raw = os.getenv("TFBOT_TEST", "").strip().upper()
-    test_mode: Optional[bool] = None
+    test_mode: Optional[bool] = False  # Not defined or invalid → LIVE
     if test_mode_raw in ("YES", "TRUE", "1", "ON"):
         test_mode = True
     elif test_mode_raw in ("NO", "FALSE", "0", "OFF"):
         test_mode = False
     
-    if test_mode is None:
-        # Backward compatible: use base name
-        return os.getenv("TFBOT_NAME", "Syn").strip() or "Syn"
-    elif test_mode:
+    if test_mode:
         # TEST mode: Use _TEST suffix, fallback to base name
         return os.getenv("TFBOT_NAME_TEST", os.getenv("TFBOT_NAME", "Syn")).strip() or "Syn"
     else:
@@ -85,6 +82,69 @@ configured_files = set()
 # Character-to-pack mappings for game filtering
 _PACK_TO_CHARACTERS: Dict[str, Set[str]] = {}  # pack_name -> set of character names
 _CHARACTER_TO_PACK: Dict[str, str] = {}  # character name -> pack_name
+
+_SPRITE_BUCKET_LINK_KEYS = ("genderswap", "ageswap", "gender_age_swap", "default_character")
+
+
+def _build_sprite_bucket_map(pack_configs: list) -> Dict[str, str]:
+    """Map pack module id (tf_characters.json ``file``) -> ``sprite_bucket`` string."""
+    bucket_map: Dict[str, str] = {}
+    for p in pack_configs:
+        if not isinstance(p, dict):
+            continue
+        fid = (p.get("file") or "").strip()
+        bk = (p.get("sprite_bucket") or "").strip()
+        if fid and bk:
+            bucket_map[fid] = bk
+    return bucket_map
+
+
+def _apply_sprite_buckets_to_characters(characters: list, bucket_map: Dict[str, str]) -> None:
+    """Prefix folder and link fields using each row's ``_pack_name`` and config buckets (ex-pack tail logic)."""
+
+    def _pfx_folder(folder, b):
+        if not isinstance(folder, str) or not folder.strip():
+            return folder
+        f = folder.strip().replace("\\", "/").strip("/")
+        bb = b.strip().strip("/")
+        if not f or not bb:
+            return folder
+        if f.startswith(bb + "/") or f == bb:
+            return f
+        return f"{bb}/{f}"
+
+    def _norm_link(val, this_b, bmap):
+        if not isinstance(val, str) or not val.strip():
+            return val
+        val = val.strip()
+        if val.startswith("characters_") and "/" in val:
+            pr, rest = val.split("/", 1)
+            rest = rest.strip()
+            if pr.startswith("characters_"):
+                tb = (bmap.get(pr) or "").strip()
+                if tb and rest and rest != tb and not rest.startswith(tb + "/"):
+                    return f"{pr}/{tb}/{rest}"
+            return val
+        if "/" not in val:
+            return f"{this_b}/{val}" if this_b else val
+        if this_b and (val == this_b or val.startswith(this_b + "/")):
+            return val
+        return val
+
+    for c in characters:
+        if not isinstance(c, dict):
+            continue
+        pack_id = (c.get("_pack_name") or "").strip()
+        this_bucket = (bucket_map.get(pack_id) or "").strip()
+        if not this_bucket:
+            continue
+        fd = c.get("folder")
+        if isinstance(fd, str) and fd.strip():
+            c["folder"] = _pfx_folder(fd, this_bucket)
+        for k in _SPRITE_BUCKET_LINK_KEYS:
+            v = c.get(k)
+            if isinstance(v, str) and v.strip():
+                c[k] = _norm_link(v, this_bucket, bucket_map)
 
 
 def _discover_available_games() -> Set[str]:
@@ -183,6 +243,7 @@ if _config_path.exists():
         
         # Discover available games for validation
         available_games = _discover_available_games()
+        _loaded_pack_files: Set[str] = set()
         
         # Load enabled packs based on bot name
         for pack_config in pack_configs:
@@ -248,6 +309,7 @@ if _config_path.exists():
                                             _CHARACTER_TO_PACK[char_name] = pack_file
                                 
                                 TF_CHARACTERS.extend(pack_chars)
+                                _loaded_pack_files.add(pack_file)
                                 logger.info("    Loaded %d characters from %s", len(pack_chars), pack_file)
                     except Exception as exc:
                         logger.warning("Failed to load pack %s: %s", pack_file, exc)
@@ -273,11 +335,54 @@ if _config_path.exists():
                                                 _CHARACTER_TO_PACK[char_name] = pack_file
                                     
                                     TF_CHARACTERS.extend(pack_chars)
+                                    _loaded_pack_files.add(pack_file)
                                     logger.info("    Loaded %d characters from %s", len(pack_chars), pack_file)
                         except Exception as exc:
                             logger.warning("Failed to load pack %s: %s", pack_file, exc)
                     else:
                         logger.warning("Pack file %s not found in %s", pack_file, _packs_dir)
+
+        _sprite_bucket_map = _build_sprite_bucket_map(pack_configs)
+        _apply_sprite_buckets_to_characters(TF_CHARACTERS, _sprite_bucket_map)
+
+        # Post-process: clear cross-pack link fields when target pack was not loaded (no errors when one pack is off)
+        _link_fields = ("genderswap", "ageswap", "gender_age_swap", "default_character")
+        for char in TF_CHARACTERS:
+            if not isinstance(char, dict):
+                continue
+            for key in _link_fields:
+                val = char.get(key)
+                if isinstance(val, str) and "/" in val:
+                    pack_name = val.split("/", 1)[0].strip()
+                    # Only treat as cross-pack ref when first segment is a pack module id (e.g. characters_ST).
+                    # Bucket-prefixed same-pack paths like st_characters/bradGB must not be cleared here.
+                    if (
+                        pack_name
+                        and pack_name.startswith("characters_")
+                        and pack_name not in _loaded_pack_files
+                    ):
+                        char[key] = None
+        
+        # Message fallback: when message is blank and default_character is set, use the base character's message
+        _pack_folder_to_char: Dict[str, dict] = {}
+        for c in TF_CHARACTERS:
+            if isinstance(c, dict):
+                pack_name = c.get("_pack_name")
+                folder = (c.get("folder") or "").strip()
+                if pack_name and folder:
+                    _pack_folder_to_char[f"{pack_name}/{folder}"] = c
+        for char in TF_CHARACTERS:
+            if not isinstance(char, dict):
+                continue
+            msg = char.get("message")
+            if msg is not None and str(msg).strip():
+                continue
+            ref = char.get("default_character")
+            if not isinstance(ref, str) or "/" not in ref:
+                continue
+            base = _pack_folder_to_char.get(ref.strip())
+            if base and isinstance(base.get("message"), str):
+                char["message"] = base["message"]
     except Exception as exc:
         logger.warning("Failed to load pack config from tf_characters.json: %s", exc)
 

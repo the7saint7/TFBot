@@ -101,7 +101,10 @@ def persist_states() -> None:
         raise RuntimeError("State file not configured. Call configure_state first.")
     TF_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = [serialize_state(state) for state in active_transformations.values()]
-    TF_STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    TF_STATE_FILE.write_text(
+        json.dumps(data, separators=(",", ":")),
+        encoding="utf-8",
+    )
 
 
 def load_states_from_disk() -> Sequence[TransformationState]:

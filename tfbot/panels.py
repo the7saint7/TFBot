@@ -2005,12 +2005,20 @@ def _compose_game_avatar_uncached(
                 logger.debug("VN sprite: loaded cached avatar %s", cache_file)
                 return cached
             except OSError as exc:
-                logger.warning("VN sprite: failed to load cached avatar %s: %s (rebuilding)", cache_file, exc)
+                logger.error(
+                    "VN sprite: failed to load cached avatar %s (rebuilding)",
+                    cache_file,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
     try:
         outfit_image = Image.open(outfit_path).convert("RGBA")
     except OSError as exc:
-        logger.warning("Failed to load outfit %s: %s", outfit_path, exc)
+        logger.error(
+            "Failed to load outfit %s",
+            outfit_path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return None
 
     for layer_path in combined_accessory_layers:
@@ -2020,16 +2028,24 @@ def _compose_game_avatar_uncached(
             layer_image = Image.open(layer_path).convert("RGBA")
             outfit_image.paste(layer_image, (0, 0), layer_image)
         except OSError as exc:
-            logger.warning("Failed to load accessory %s: %s", layer_path, exc)
+            logger.error(
+                "Failed to load accessory %s",
+                layer_path,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     if face_path and face_path.exists():
         try:
             face_image = Image.open(face_path).convert("RGBA")
             outfit_image.paste(face_image, (0, 0), face_image)
         except OSError as exc:
-            logger.warning("Failed to load face %s: %s", face_path, exc)
+            logger.error(
+                "Failed to load face %s",
+                face_path,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
     else:
-        logger.warning(
+        logger.error(
             "VN sprite: face image missing for %s (variant %s, searched %s)",
             character_dir.name,
             variant_dir.name,
@@ -2060,7 +2076,11 @@ def _compose_game_avatar_uncached(
             outfit_image.save(cache_file, format="PNG")
             logger.debug("VN sprite: cached avatar %s", cache_file)
         except OSError as exc:
-            logger.warning("VN sprite: unable to cache avatar %s: %s", cache_file, exc)
+            logger.error(
+                "VN sprite: unable to cache avatar %s",
+                cache_file,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     return outfit_image
 
@@ -2077,7 +2097,11 @@ def _clear_compose_game_avatar_cache() -> None:
                     shutil.rmtree(cache_dir, ignore_errors=True)
             logger.debug("VN sprite: cleared disk cache directory %s", VN_CACHE_DIR)
         except Exception as exc:
-            logger.warning("VN sprite: failed to clear disk cache %s: %s", VN_CACHE_DIR, exc)
+            logger.error(
+                "VN sprite: failed to clear disk cache %s",
+                VN_CACHE_DIR,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
 
 compose_game_avatar.cache_clear = _clear_compose_game_avatar_cache  # type: ignore[attr-defined]
@@ -3108,21 +3132,25 @@ def render_vn_panel(
         if candidate.exists():
             base_image_path = candidate
         else:
-            logger.warning(
+            logger.error(
                 "VN panel: custom base image %s missing for %s",
                 candidate,
                 state.character_name,
             )
 
     if not base_image_path.exists():
-        logger.warning("VN panel: base image missing at %s", base_image_path)
+        logger.error("VN panel: base image missing at %s", base_image_path)
         return None
 
     try:
         with Image.open(base_image_path) as base_image:
             base = base_image.convert("RGBA")
     except OSError as exc:
-        logger.warning("VN panel: failed to open base image %s: %s", base_image_path, exc)
+        logger.error(
+            "VN panel: failed to open base image %s",
+            base_image_path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return None
 
     assets = _get_overlay_assets()

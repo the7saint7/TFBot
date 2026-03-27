@@ -19,6 +19,14 @@ class TFCharacter:
     speech_color: Optional[str] = None
     display_name: Optional[str] = None
     folder: Optional[str] = None
+    # Variables and links for reroll filtering and swap commands (VN only)
+    gender: Optional[str] = None
+    age: Optional[str] = None
+    type: Optional[str] = None  # species, e.g. human
+    _pack_name: Optional[str] = None  # pack file, e.g. characters_ST
+    genderswap: Optional[str] = None
+    ageswap: Optional[str] = None
+    gender_age_swap: Optional[str] = None
 
 
 @dataclass(frozen=True)

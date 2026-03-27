@@ -31,9 +31,12 @@ from .panels import (
     get_selected_pose_outfit,
     list_background_choices,
 )
-from .utils import get_setting
+from .utils import get_channel_id, get_setting
 
 logger = logging.getLogger("tfbot.history")
+
+# Discord limit: total characters across all embeds in one message (title + description + fields + footer + author)
+DISCORD_EMBED_TOTAL_LIMIT = 6000
 
 # Default testing channel; override with TFBOT_HISTORY_SNAPSHOT_CHANNEL
 DEFAULT_HISTORY_CHANNEL_ID = 1433105932392595609
@@ -290,6 +293,22 @@ def _embed_color(
     return discord.Color.from_rgb(r, g, b)
 
 
+def _embed_total_length(embed: discord.Embed) -> int:
+    """Total character count for Discord's 6000 limit (title, description, fields, footer, author)."""
+    total = 0
+    if embed.title:
+        total += len(embed.title)
+    if embed.description:
+        total += len(embed.description)
+    for field in embed.fields:
+        total += len(field.name) + len(field.value)
+    if embed.footer and embed.footer.text:
+        total += len(embed.footer.text)
+    if embed.author and embed.author.name:
+        total += len(embed.author.name)
+    return total
+
+
 def _chunk_sections(sections: Sequence[str], max_length: int = 3600, max_chunks: int = 10) -> List[str]:
     if not sections:
         return []
@@ -332,22 +351,23 @@ def _chunk_sections(sections: Sequence[str], max_length: int = 3600, max_chunks:
 
 async def _fetch_history_channel(bot: discord.Client, channel_id: Optional[int]) -> discord.TextChannel:
     if channel_id is None:
-        # Read TFBOT_TEST flag to determine mode (same logic as bot.py)
+        # Read TFBOT_TEST flag to determine mode (same logic as bot.py: not defined or invalid → LIVE)
         TFBOT_TEST_RAW = os.getenv("TFBOT_TEST", "").strip().upper()
         if not TFBOT_TEST_RAW:
-            test_mode: Optional[bool] = None  # Backward compatible
+            test_mode: Optional[bool] = False  # Not defined → LIVE
         elif TFBOT_TEST_RAW in ("YES", "TRUE", "1", "ON"):
             test_mode = True  # TEST mode
         elif TFBOT_TEST_RAW in ("NO", "FALSE", "0", "OFF"):
             test_mode = False  # LIVE mode
         else:
-            test_mode = None  # Invalid value, default to backward compatible
+            test_mode = False  # Invalid value → LIVE
         
         raw = get_setting("TFBOT_HISTORY_SNAPSHOT_CHANNEL", "", test_mode)
         if raw and raw.isdigit():
             channel_id = int(raw)
         else:
-            channel_id = DEFAULT_HISTORY_CHANNEL_ID
+            # Use main history channel for current mode instead of hardcoded TEST default
+            channel_id = get_channel_id("TFBOT_HISTORY_CHANNEL_ID", 0, test_mode) or DEFAULT_HISTORY_CHANNEL_ID
     channel = bot.get_channel(channel_id)
     if channel is None:
         try:
@@ -635,13 +655,29 @@ async def publish_history_snapshot(
             )
 
     try:
-        active_kwargs: Dict[str, object] = {
-            "embeds": active_embeds,
-            "allowed_mentions": active_allowed_mentions,
-        }
-        if active_files:
-            active_kwargs["files"] = active_files
-        await channel.send(**active_kwargs)
+        # Discord limit: total size of all embeds in one message must not exceed 6000.
+        batches: List[List[discord.Embed]] = []
+        current_batch: List[discord.Embed] = []
+        current_total = 0
+        for embed in active_embeds:
+            size = _embed_total_length(embed)
+            if current_batch and current_total + size > DISCORD_EMBED_TOTAL_LIMIT:
+                batches.append(current_batch)
+                current_batch = []
+                current_total = 0
+            current_batch.append(embed)
+            current_total += size
+        if current_batch:
+            batches.append(current_batch)
+
+        for idx, batch in enumerate(batches):
+            kwargs: Dict[str, object] = {
+                "embeds": batch,
+                "allowed_mentions": active_allowed_mentions,
+            }
+            if active_files and idx == 0:
+                kwargs["files"] = active_files
+            await channel.send(**kwargs)
     except discord.HTTPException as exc:
         logger.warning("Failed to update history channel: %s", exc)
 
