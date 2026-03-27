@@ -73,6 +73,58 @@ VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
 VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
 VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
 VN_AVATAR_SCALE = max(0.1, float_from_env("TFBOT_VN_AVATAR_SCALE", 1.0))
+REROLL_GIF_ORIGINAL_HOLD_MS = 1500
+REROLL_GIF_OLD_TO_SILHOUETTE_MS = 750
+REROLL_GIF_OLD_SILHOUETTE_HOLD_MS = 1000
+REROLL_GIF_BOTH_SILHOUETTES_HOLD_MS = 250
+REROLL_GIF_OLD_SILHOUETTE_FADE_MS = 550
+REROLL_GIF_NEW_SILHOUETTE_HOLD_MS = 550
+REROLL_GIF_NEW_REVEAL_MS = 750
+REROLL_GIF_FINAL_HOLD_MS = 250
+REROLL_GIF_ANIMATION_FPS = 24
+REROLL_GIF_NEW_OVERLAY_ALPHA = 170
+REROLL_PANEL_SIZE_LEGACY: Tuple[int, int] = (300, 190)
+REROLL_PANEL_SIZE: Tuple[int, int] = (800, 250)
+SWAP_GIF_INITIAL_HOLD_MS = 900
+SWAP_GIF_GHOST_APPEAR_MS = 900
+SWAP_GIF_TRAVEL_MS = 2400
+SWAP_GIF_GHOST_DISSOLVE_MS = 700
+SWAP_GIF_FINAL_HOLD_MS = 450
+SWAP_GIF_ANIMATION_FPS = 20
+SWAP_GIF_GHOST_ALPHA = 150
+SWAP_GIF_GHOST_OFFSET_X = 36
+SWAP_GIF_GHOST_END_SCALE = 0.2
+DEVICE_SWAP_GIF_INITIAL_HOLD_MS = 700
+DEVICE_SWAP_GIF_EFFECT_MS = 5000
+DEVICE_SWAP_GIF_FINAL_HOLD_MS = 500
+DEVICE_SWAP_GIF_ANIMATION_FPS = 16
+DEVICE_SWAP_PARTICLE_COUNT = 50
+DEVICE_SWAP_PARTICLE_ALPHA = 210
+DEVICE_SWAP_WASH_ALPHA = 0
+BG_TRANSITION_PANEL_SIZE: Tuple[int, int] = (350, 250)
+BG_GIF_INITIAL_HOLD_MS = 300
+BG_GIF_TRAVEL_MS = 1200
+BG_GIF_FINAL_HOLD_MS = 300
+BG_GIF_ANIMATION_FPS = 20
+APPEARANCE_TRANSITION_PANEL_SIZE_LEGACY: Tuple[int, int] = (350, 190)
+APPEARANCE_TRANSITION_PANEL_SIZE: Tuple[int, int] = (800, 250)
+APPEARANCE_GIF_INITIAL_HOLD_MS = 250
+APPEARANCE_GIF_CROSSFADE_MS = 1400
+APPEARANCE_GIF_FINAL_HOLD_MS = 250
+MASS_SWAP_BACKGROUND_NUMBER = 430
+MASS_SWAP_GIF_WANDER_MS = 3000
+MASS_SWAP_GIF_EXIT_MS = 700
+MASS_SWAP_GIF_FINAL_HOLD_MS = 250
+MASS_SWAP_GIF_ANIMATION_FPS = 18
+MASS_SWAP_GHOST_ALPHA = 195
+MASS_SWAP_GHOST_MAX_HEIGHT = 225
+MASS_REROLL_BACKGROUND_NUMBER = 430
+MASS_REROLL_GIF_INITIAL_HOLD_MS = 350
+MASS_REROLL_GIF_TRANSITION_MS = 700
+MASS_REROLL_GIF_FINAL_HOLD_MS = 350
+MASS_REROLL_GIF_ANIMATION_FPS = 18
+MASS_REROLL_STAGE_COUNT = 3
+APPEARANCE_GIF_ANIMATION_FPS = 20
 _VN_BG_ROOT_SETTING = os.getenv("TFBOT_VN_BG_ROOT", "").strip()
 _VN_BG_DEFAULT_SETTING = os.getenv("TFBOT_VN_BG_DEFAULT", "school/cafeteria.png").strip()
 VN_BACKGROUND_DEFAULT_RELATIVE = Path(_VN_BG_DEFAULT_SETTING) if _VN_BG_DEFAULT_SETTING else None
@@ -195,6 +247,11 @@ def _get_background_root() -> Optional[Path]:
     if VN_BACKGROUND_ROOT and VN_BACKGROUND_ROOT.exists():
         return VN_BACKGROUND_ROOT.resolve()
     return None
+
+
+def get_background_root() -> Optional[Path]:
+    """Public accessor for the effective VN background root."""
+    return _get_background_root()
 
 
 @lru_cache(maxsize=4)
@@ -554,6 +611,49 @@ def _normalize_layout_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
+VN_COMPOSE_DEBUG_DIR = (BASE_DIR / "vn_debug" / "compose").resolve()
+VN_COMPOSE_DEBUG_CHARACTERS: Set[str] = {
+    _normalize_layout_key("kiyoshiShortstack"),
+    _normalize_layout_key("kiyoshiShortStack"),
+    _normalize_layout_key("Kiyoshishortstack (Treats of Summer)"),
+}
+
+
+def _compose_debug_enabled(character_name: str) -> bool:
+    return _normalize_layout_key(character_name) in VN_COMPOSE_DEBUG_CHARACTERS
+
+
+def _create_compose_debug_dir(
+    character_name: str,
+    *,
+    variant_name: str,
+    outfit_name: str,
+) -> Path:
+    safe_character = _normalize_layout_key(character_name) or "unknown"
+    safe_variant = _normalize_layout_key(variant_name) or "variant"
+    safe_outfit = _normalize_layout_key(outfit_name) or "outfit"
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000:06d}"
+    debug_dir = VN_COMPOSE_DEBUG_DIR / safe_character / f"{stamp}-{safe_variant}-{safe_outfit}"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    return debug_dir
+
+
+def _write_compose_debug_metadata(debug_dir: Path, lines: Sequence[str]) -> None:
+    try:
+        (debug_dir / "metadata.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("VN sprite debug: failed to write metadata in %s: %s", debug_dir, exc)
+
+
+def _dump_compose_debug_image(debug_dir: Optional[Path], step_name: str, image: Optional["Image.Image"]) -> None:
+    if debug_dir is None or image is None:
+        return
+    try:
+        image.save(debug_dir / f"{step_name}.png", format="PNG")
+    except OSError as exc:
+        logger.warning("VN sprite debug: failed to save %s in %s: %s", step_name, debug_dir, exc)
+
+
 def _load_panel_layout_overrides() -> Dict[str, Dict]:
     if VN_LAYOUT_FILE is None or not VN_LAYOUT_FILE.exists():
         return {}
@@ -589,6 +689,16 @@ background_selections: Dict[str, str] = {}
 _vn_config_cache: Dict[str, Dict] = {}
 _VN_BACKGROUND_IMAGES: list[Path] = []
 _VN_BACKGROUND_IMAGES_ROOT: Optional[Path] = None
+_DEVICE_HOLDER_USER_IDS_BY_GUILD: Dict[int, int] = {}
+
+
+def set_device_holder_user_ids_by_guild(mapping: Mapping[int, int]) -> None:
+    _DEVICE_HOLDER_USER_IDS_BY_GUILD.clear()
+    for guild_id, user_id in mapping.items():
+        try:
+            _DEVICE_HOLDER_USER_IDS_BY_GUILD[int(guild_id)] = int(user_id)
+        except (TypeError, ValueError):
+            continue
 
 @lru_cache(maxsize=1)
 def _get_overlay_assets() -> Dict[str, "Image.Image"]:
@@ -603,6 +713,7 @@ def _get_overlay_assets() -> Dict[str, "Image.Image"]:
         "rudy": "rudy.png",
         "frog": "frog.png",
         "star": "star.png",
+        "remote": "remote.png",
         "border_gold": "border_gold.png",
         "border_epic": "border_epic.png",
         "border_common": "border_common.png",
@@ -1556,17 +1667,19 @@ def compose_game_avatar(
 ) -> Optional["Image.Image"]:
     scope_key = _normalize_selection_scope(selection_scope)
     cache_key = (character_name, pose_override, outfit_override, scope_key)
-    cached = _COMPOSE_AVATAR_CACHE.get(cache_key)
-    if cached is not None:
-        _COMPOSE_AVATAR_CACHE.move_to_end(cache_key)
-        return cached
+    debug_enabled = _compose_debug_enabled(character_name)
+    if not debug_enabled:
+        cached = _COMPOSE_AVATAR_CACHE.get(cache_key)
+        if cached is not None:
+            _COMPOSE_AVATAR_CACHE.move_to_end(cache_key)
+            return cached
     image = _compose_game_avatar_uncached(
         character_name,
         pose_override,
         outfit_override,
         selection_scope=scope_key,
     )
-    if image is not None:
+    if image is not None and not debug_enabled:
         _COMPOSE_AVATAR_CACHE[cache_key] = image
         _COMPOSE_AVATAR_CACHE.move_to_end(cache_key)
         if len(_COMPOSE_AVATAR_CACHE) > _COMPOSE_AVATAR_CACHE_LIMIT:
@@ -1963,6 +2076,14 @@ def _compose_game_avatar_uncached(
         )
         return None
 
+    debug_dir: Optional[Path] = None
+    if _compose_debug_enabled(character_name):
+        debug_dir = _create_compose_debug_dir(
+            character_name,
+            variant_name=variant_dir.name,
+            outfit_name=outfit_asset.base_path.stem,
+        )
+
     pose_metadata = _get_pose_metadata(config, variant_dir.name)
     sprite_height_limit = _resolve_image_height(config, pose_metadata)
 
@@ -1988,6 +2109,25 @@ def _compose_game_avatar_uncached(
         combined_accessory_layers = list(outfit_asset.accessory_layers)
     combined_accessory_layers.extend(optional_layers)
 
+    if debug_dir is not None:
+        metadata_lines = [
+            f"character_name={character_name}",
+            f"character_dir={character_dir}",
+            f"variant_dir={variant_dir}",
+            f"selected_pose={preferred_pose or 'auto'}",
+            f"selected_outfit={preferred_outfit or 'auto'}",
+            f"resolved_outfit={outfit_path}",
+            f"resolved_face={face_path}",
+            f"selection_scope={selection_scope or ''}",
+            f"sprite_height_limit={sprite_height_limit or 'auto'}",
+            f"suppress_outfit_accessories={suppress_outfit_accessories}",
+        ]
+        if combined_accessory_layers:
+            metadata_lines.extend(
+                [f"accessory_layer_{index + 1}={layer_path}" for index, layer_path in enumerate(combined_accessory_layers)]
+            )
+        _write_compose_debug_metadata(debug_dir, metadata_lines)
+
     cache_file: Optional[Path] = None
     if VN_CACHE_DIR:
         face_token = "noface"
@@ -2003,7 +2143,9 @@ def _compose_game_avatar_uncached(
             try:
                 cached = Image.open(cache_file).convert("RGBA")
                 logger.debug("VN sprite: loaded cached avatar %s", cache_file)
-                return cached
+                if debug_dir is None:
+                    return cached
+                _dump_compose_debug_image(debug_dir, "00_cached_avatar_reference", cached)
             except OSError as exc:
                 logger.error(
                     "VN sprite: failed to load cached avatar %s (rebuilding)",
@@ -2020,13 +2162,24 @@ def _compose_game_avatar_uncached(
             exc_info=(type(exc), exc, exc.__traceback__),
         )
         return None
+    _dump_compose_debug_image(debug_dir, "01_outfit_base", outfit_image)
 
-    for layer_path in combined_accessory_layers:
+    for layer_index, layer_path in enumerate(combined_accessory_layers):
         if not layer_path.exists():
             continue
         try:
             layer_image = Image.open(layer_path).convert("RGBA")
+            _dump_compose_debug_image(
+                debug_dir,
+                f"02_accessory_source_{layer_index + 1:02d}_{_normalize_layout_key(layer_path.stem)}",
+                layer_image,
+            )
             outfit_image.paste(layer_image, (0, 0), layer_image)
+            _dump_compose_debug_image(
+                debug_dir,
+                f"03_after_accessory_{layer_index + 1:02d}_{_normalize_layout_key(layer_path.stem)}",
+                outfit_image,
+            )
         except OSError as exc:
             logger.error(
                 "Failed to load accessory %s",
@@ -2037,7 +2190,9 @@ def _compose_game_avatar_uncached(
     if face_path and face_path.exists():
         try:
             face_image = Image.open(face_path).convert("RGBA")
+            _dump_compose_debug_image(debug_dir, "04_face_source", face_image)
             outfit_image.paste(face_image, (0, 0), face_image)
+            _dump_compose_debug_image(debug_dir, "05_after_face", outfit_image)
         except OSError as exc:
             logger.error(
                 "Failed to load face %s",
@@ -2060,12 +2215,17 @@ def _compose_game_avatar_uncached(
 
         outfit_image = ImageOps.mirror(outfit_image)
         logger.debug("VN sprite: sprite mirrored for pose %s", variant_dir.name)
+        _dump_compose_debug_image(debug_dir, "06_after_mirror", outfit_image)
+    else:
+        _dump_compose_debug_image(debug_dir, "06_no_mirror", outfit_image)
 
     outfit_image = _crop_transparent_vertical(outfit_image)
+    _dump_compose_debug_image(debug_dir, "07_after_vertical_crop", outfit_image)
     if sprite_height_limit:
         limit = min(sprite_height_limit, outfit_image.height)
         if limit > 0 and limit < outfit_image.height:
             outfit_image = outfit_image.crop((0, 0, outfit_image.width, limit))
+            _dump_compose_debug_image(debug_dir, "08_after_height_limit", outfit_image)
 
     # Cache detected face if not already cached
     _cache_character_face(character_dir, variant_dir, outfit_image)
@@ -2082,6 +2242,7 @@ def _compose_game_avatar_uncached(
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
 
+    _dump_compose_debug_image(debug_dir, "99_final_avatar", outfit_image)
     return outfit_image
 
 
@@ -2300,6 +2461,21 @@ def compose_state_avatar_image(
     if len(_PILLOW_AVATAR_CACHE) > _PILLOW_AVATAR_CACHE_LIMIT:
         _PILLOW_AVATAR_CACHE.popitem(last=False)
     return pillow_variant
+
+
+def _compose_swap_identity_avatar_image(
+    state: Optional[TransformationState],
+    *,
+    selection_scope: Optional[str] = None,
+) -> Optional["Image.Image"]:
+    if state is None:
+        return None
+    scope_key = _normalize_selection_scope(selection_scope)
+    identity_name = (state.identity_display_name or "").strip() or state.character_name
+    avatar = compose_game_avatar(identity_name, selection_scope=scope_key)
+    if avatar is not None:
+        return avatar
+    return compose_state_avatar_image(state, selection_scope=scope_key)
 
 
 def _get_pose_metadata(config: Dict, pose_name: str) -> Dict:
@@ -3095,6 +3271,2126 @@ def _crop_transparent_vertical(image: "Image.Image") -> "Image.Image":
     return cropped
 
 
+def _paste_avatar_into_box(
+    base: "Image.Image",
+    avatar_image: "Image.Image",
+    box: Tuple[int, int, int, int],
+    *,
+    fit_width: bool = True,
+    clip_to_box: bool = True,
+) -> bool:
+    from PIL import Image
+
+    if avatar_image.mode != "RGBA":
+        avatar_image = avatar_image.convert("RGBA")
+
+    box_width = max(0, box[2] - box[0])
+    box_height = max(0, box[3] - box[1])
+    if box_width <= 0 or box_height <= 0:
+        return False
+
+    cropped = _crop_transparent_vertical(avatar_image)
+    base_scale = max(VN_AVATAR_SCALE, 0.01)
+    if base_scale != 1.0:
+        scaled_width = max(1, int(cropped.width * base_scale))
+        scaled_height = max(1, int(cropped.height * base_scale))
+        cropped = cropped.resize((scaled_width, scaled_height), Image.LANCZOS)
+
+    if fit_width:
+        fit_scale = min(
+            box_width / cropped.width if cropped.width else 1.0,
+            box_height / cropped.height if cropped.height else 1.0,
+            1.0,
+        )
+    else:
+        fit_scale = min(
+            box_height / cropped.height if cropped.height else 1.0,
+            1.0,
+        )
+    if fit_scale < 1.0:
+        scaled_width = max(1, int(cropped.width * fit_scale))
+        scaled_height = max(1, int(cropped.height * fit_scale))
+        cropped = cropped.resize((scaled_width, scaled_height), Image.LANCZOS)
+
+    offset_x = box[0] + ((box_width - cropped.width) // 2)
+    offset_y = box[1] + max(0, box_height - cropped.height)
+    if clip_to_box:
+        canvas = Image.new("RGBA", (box_width, box_height), (0, 0, 0, 0))
+        canvas_offset_x = max(0, (box_width - cropped.width) // 2)
+        canvas_offset_y = max(0, box_height - cropped.height)
+        canvas.paste(cropped, (canvas_offset_x, canvas_offset_y), cropped)
+        base.paste(canvas, (box[0], box[1]), canvas)
+    else:
+        base.paste(cropped, (offset_x, offset_y), cropped)
+    return True
+
+
+def _compose_avatar_layer(
+    panel_size: Tuple[int, int],
+    avatar_image: Optional["Image.Image"],
+    box: Tuple[int, int, int, int],
+    *,
+    fit_width: bool = True,
+    clip_to_box: bool = True,
+) -> Optional["Image.Image"]:
+    if avatar_image is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    layer = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+    if not _paste_avatar_into_box(
+        layer,
+        avatar_image,
+        box,
+        fit_width=fit_width,
+        clip_to_box=clip_to_box,
+    ):
+        return None
+    return layer
+
+
+def _make_silhouette_layer(
+    placed_layer: Optional["Image.Image"],
+    *,
+    alpha_scale: float = 1.0,
+) -> Optional["Image.Image"]:
+    if placed_layer is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    # Flatten the rendered sprite content first so the silhouette always matches
+    # the fully composited avatar, then tint that flattened result to black.
+    flattened = Image.new("RGBA", placed_layer.size, (0, 0, 0, 0))
+    flattened.alpha_composite(placed_layer.convert("RGBA"))
+    alpha = flattened.getchannel("A")
+    if alpha_scale != 1.0:
+        alpha = alpha.point(lambda value: max(0, min(255, int(value * alpha_scale))))
+    silhouette = Image.new("RGBA", flattened.size, (0, 0, 0, 255))
+    silhouette.putalpha(alpha)
+    return silhouette
+
+
+def _make_outlined_silhouette_layer(
+    placed_layer: Optional["Image.Image"],
+    *,
+    alpha_scale: float = 1.0,
+    outline_alpha_scale: float = 1.0,
+) -> Optional["Image.Image"]:
+    base_silhouette = _make_silhouette_layer(placed_layer, alpha_scale=alpha_scale)
+    if base_silhouette is None:
+        return None
+    try:
+        from PIL import Image, ImageChops
+    except ImportError:
+        return base_silhouette
+    alpha = base_silhouette.getchannel("A")
+    if outline_alpha_scale != 1.0:
+        alpha = alpha.point(lambda value: max(0, min(255, int(value * outline_alpha_scale))))
+    outline_alpha = Image.new("L", base_silhouette.size, 0)
+    for offset_x, offset_y in (
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (-1, 1),
+        (1, -1),
+        (1, 1),
+    ):
+        shifted_alpha = Image.new("L", base_silhouette.size, 0)
+        shifted_alpha.paste(alpha, (offset_x, offset_y))
+        outline_alpha = ImageChops.lighter(outline_alpha, shifted_alpha)
+    outline = Image.new("RGBA", base_silhouette.size, (255, 255, 255, 255))
+    outline.putalpha(outline_alpha)
+    combined = Image.new("RGBA", base_silhouette.size, (0, 0, 0, 0))
+    combined.alpha_composite(outline)
+    combined.alpha_composite(base_silhouette)
+    return combined
+
+
+def _layer_with_alpha_scale(
+    placed_layer: Optional["Image.Image"],
+    *,
+    alpha_scale: float = 1.0,
+) -> Optional["Image.Image"]:
+    if placed_layer is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    layer = placed_layer.convert("RGBA")
+    if alpha_scale == 1.0:
+        return layer
+    alpha = layer.getchannel("A")
+    alpha = alpha.point(lambda value: max(0, min(255, int(value * alpha_scale))))
+    layer.putalpha(alpha)
+    return layer
+
+
+def _make_ghost_layer(
+    placed_layer: Optional["Image.Image"],
+    *,
+    alpha_scale: float = 1.0,
+) -> Optional["Image.Image"]:
+    if placed_layer is None:
+        return None
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    layer = placed_layer.convert("RGBA")
+    alpha = layer.getchannel("A")
+    grayscale = ImageOps.grayscale(layer)
+    ghost = Image.merge("RGBA", (grayscale, grayscale, grayscale, alpha))
+    if alpha_scale != 1.0:
+        ghost_alpha = ghost.getchannel("A").point(
+            lambda value: max(0, min(255, int(value * alpha_scale)))
+        )
+        ghost.putalpha(ghost_alpha)
+    return ghost
+
+
+def _layer_anchor(placed_layer: Optional["Image.Image"]) -> Optional[Tuple[float, float]]:
+    if placed_layer is None:
+        return None
+    bbox = placed_layer.getbbox()
+    if bbox is None:
+        return None
+    center_x = (bbox[0] + bbox[2]) / 2.0
+    bottom_y = float(bbox[3])
+    return center_x, bottom_y
+
+
+def _union_layer_bbox(*layers: Optional["Image.Image"]) -> Optional[Tuple[int, int, int, int]]:
+    bbox: Optional[Tuple[int, int, int, int]] = None
+    for layer in layers:
+        if layer is None:
+            continue
+        current = layer.getbbox()
+        if current is None:
+            continue
+        if bbox is None:
+            bbox = current
+            continue
+        bbox = (
+            min(bbox[0], current[0]),
+            min(bbox[1], current[1]),
+            max(bbox[2], current[2]),
+            max(bbox[3], current[3]),
+        )
+    return bbox
+
+
+def _build_device_particle_overlay(
+    canvas_size: Tuple[int, int],
+    body_regions: Sequence[Tuple[int, int, int, int]],
+    *,
+    progress: float,
+    alpha_scale: float = 1.0,
+    seed: int = 0,
+) -> Optional["Image.Image"]:
+    if not body_regions:
+        return None
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    effect_strength = max(0.0, math.sin(math.pi * max(0.0, min(1.0, progress)))) * alpha_scale
+    if effect_strength <= 0.0:
+        return None
+
+    overlay = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+
+    for region_index, region in enumerate(body_regions):
+        left, top, right, bottom = region
+        region_width = max(1, right - left)
+        region_height = max(1, bottom - top)
+        effect_left = left
+        effect_right = right
+        effect_width = max(1, effect_right - effect_left)
+        rng = random.Random((seed * 7919) + (region_index * 104729))
+        glow_alpha = int(round(135 * effect_strength))
+        core_alpha = int(round(DEVICE_SWAP_PARTICLE_ALPHA * effect_strength))
+
+        # Optional soft wash under the particles; set alpha to 0 to disable entirely.
+        wash_alpha = int(round(DEVICE_SWAP_WASH_ALPHA * effect_strength))
+        if wash_alpha > 0:
+            draw.rounded_rectangle(
+                (effect_left, top, effect_right, bottom),
+                radius=18,
+                fill=(35, 135, 255, wash_alpha),
+            )
+
+        for particle_index in range(DEVICE_SWAP_PARTICLE_COUNT):
+            px = effect_left + int(round(rng.random() * effect_width))
+            py_base = top + int(round(rng.random() * region_height))
+            upward_travel = region_height * (0.06 + (0.16 * rng.random()))
+            px_drift = (rng.random() - 0.5) * 12.0
+            py = py_base - (upward_travel * progress)
+            px = int(round(px + (px_drift * progress)))
+            py = int(round(py))
+            radius = 2 + int(rng.random() * 5)
+            glow_radius = radius + 3 + int(rng.random() * 4)
+            phase = (particle_index / max(DEVICE_SWAP_PARTICLE_COUNT, 1)) + (rng.random() * 0.35)
+            flicker = 0.45 + (0.55 * abs(math.sin((progress + phase) * math.pi * 3.0)))
+            particle_core_alpha = int(round(core_alpha * flicker))
+            particle_glow_alpha = int(round(glow_alpha * flicker))
+            draw.ellipse(
+                (px - glow_radius, py - glow_radius, px + glow_radius, py + glow_radius),
+                fill=(65, 180, 255, particle_glow_alpha),
+            )
+            draw.ellipse(
+                (px - radius, py - radius, px + radius, py + radius),
+                fill=(170, 235, 255, particle_core_alpha),
+            )
+
+    return overlay
+
+
+def _transform_layer(
+    placed_layer: Optional["Image.Image"],
+    *,
+    canvas_size: Tuple[int, int],
+    center_x: float,
+    bottom_y: float,
+    scale: float = 1.0,
+    alpha_scale: float = 1.0,
+    flip_horizontal: bool = False,
+) -> Optional["Image.Image"]:
+    if placed_layer is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    bbox = placed_layer.getbbox()
+    if bbox is None:
+        return None
+    crop = placed_layer.crop(bbox).convert("RGBA")
+    if scale != 1.0:
+        scaled_width = max(1, int(round(crop.width * scale)))
+        scaled_height = max(1, int(round(crop.height * scale)))
+        crop = crop.resize((scaled_width, scaled_height), Image.LANCZOS)
+    if flip_horizontal:
+        crop = crop.transpose(Image.FLIP_LEFT_RIGHT)
+    if alpha_scale != 1.0:
+        alpha = crop.getchannel("A").point(
+            lambda value: max(0, min(255, int(value * alpha_scale)))
+        )
+        crop.putalpha(alpha)
+    layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    paste_x = int(round(center_x - (crop.width / 2.0)))
+    paste_y = int(round(bottom_y - crop.height))
+    layer.paste(crop, (paste_x, paste_y), crop)
+    return layer
+
+
+def _ease_in_out(progress: float) -> float:
+    clamped = max(0.0, min(1.0, progress))
+    return 0.5 - (0.5 * math.cos(math.pi * clamped))
+
+
+def _frame_count_for_duration(duration_ms: int) -> int:
+    seconds = max(0.0, duration_ms / 1000.0)
+    return max(2, int(round(seconds * REROLL_GIF_ANIMATION_FPS)))
+
+
+def _gif_frame_from_rgba(frame: "Image.Image") -> "Image.Image":
+    try:
+        from PIL import Image
+    except ImportError:
+        return frame
+    rgba_frame = frame.convert("RGBA")
+    return rgba_frame.quantize(
+        colors=256,
+        method=Image.FASTOCTREE,
+        dither=Image.FLOYDSTEINBERG,
+    )
+
+
+def render_tf_split_panel(
+    *,
+    left_state: Optional[TransformationState],
+    right_state: Optional[TransformationState],
+    background_user_id: int,
+    right_background_user_id: Optional[int] = None,
+    center_symbol_name: Optional[str] = None,
+    filename: str = "tf_transition.png",
+    left_avatar_image: Optional["Image.Image"] = None,
+    right_avatar_image: Optional["Image.Image"] = None,
+    left_selection_scope: Optional[str] = None,
+    right_selection_scope: Optional[str] = None,
+    panel_size: Optional[Tuple[int, int]] = None,
+    fit_avatar_width: bool = True,
+    duplicate_left_background: bool = True,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    rendered = _build_tf_split_image(
+        left_state=left_state,
+        right_state=right_state,
+        background_user_id=background_user_id,
+        right_background_user_id=right_background_user_id,
+        center_symbol_name=center_symbol_name,
+        left_avatar_image=left_avatar_image,
+        right_avatar_image=right_avatar_image,
+        left_selection_scope=left_selection_scope,
+        right_selection_scope=right_selection_scope,
+        panel_size=panel_size,
+        fit_avatar_width=fit_avatar_width,
+        duplicate_left_background=duplicate_left_background,
+    )
+    if rendered is None:
+        return None
+
+    output = io.BytesIO()
+    rendered.save(output, format="PNG")
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def _build_tf_split_image(
+    *,
+    left_state: Optional[TransformationState],
+    right_state: Optional[TransformationState],
+    background_user_id: int,
+    right_background_user_id: Optional[int] = None,
+    center_symbol_name: Optional[str] = None,
+    left_avatar_image: Optional["Image.Image"] = None,
+    right_avatar_image: Optional["Image.Image"] = None,
+    left_selection_scope: Optional[str] = None,
+    right_selection_scope: Optional[str] = None,
+    panel_size: Optional[Tuple[int, int]] = None,
+    fit_avatar_width: bool = True,
+    duplicate_left_background: bool = True,
+) -> Optional["Image.Image"]:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    resolved_panel_size = panel_size
+    if resolved_panel_size is None and VN_BASE_IMAGE.exists():
+        try:
+            with Image.open(VN_BASE_IMAGE) as base_image:
+                resolved_panel_size = base_image.size
+        except OSError:
+            resolved_panel_size = (800, 250)
+    if resolved_panel_size is None:
+        resolved_panel_size = (800, 250)
+
+    width, height = resolved_panel_size
+    half_width = width // 2
+    base = Image.new("RGBA", resolved_panel_size, (0, 0, 0, 0))
+
+    left_background_path = get_selected_background_path(background_user_id)
+    if duplicate_left_background:
+        background_layer = compose_background_layer(resolved_panel_size, left_background_path)
+        if background_layer is not None:
+            left_crop = background_layer.crop((0, 0, half_width, height))
+            base.paste(left_crop, (0, 0), left_crop)
+            base.paste(left_crop, (half_width, 0), left_crop)
+    else:
+        left_background_layer = compose_background_layer((half_width, height), left_background_path)
+        if left_background_layer is not None:
+            base.paste(left_background_layer, (0, 0), left_background_layer)
+        right_background_path = get_selected_background_path(
+            right_background_user_id if right_background_user_id is not None else background_user_id
+        )
+        right_background_layer = compose_background_layer((half_width, height), right_background_path)
+        if right_background_layer is not None:
+            base.paste(right_background_layer, (half_width, 0), right_background_layer)
+
+    left_box = (20, 4, half_width - 20, height)
+    right_box = (half_width + 20, 4, width - 20, height)
+
+    if left_avatar_image is None and left_state is not None and left_state.character_name.strip():
+        left_avatar_image = compose_state_avatar_image(
+            left_state,
+            selection_scope=left_selection_scope,
+        )
+    if right_avatar_image is None and right_state is not None and right_state.character_name.strip():
+        right_avatar_image = compose_state_avatar_image(
+            right_state,
+            selection_scope=right_selection_scope,
+        )
+
+    if left_avatar_image is not None:
+        _paste_avatar_into_box(
+            base,
+            left_avatar_image,
+            left_box,
+            fit_width=fit_avatar_width,
+            clip_to_box=fit_avatar_width,
+        )
+    if right_avatar_image is not None:
+        _paste_avatar_into_box(
+            base,
+            right_avatar_image,
+            right_box,
+            fit_width=fit_avatar_width,
+            clip_to_box=fit_avatar_width,
+        )
+
+    draw = ImageDraw.Draw(base)
+    divider_left = max(0, half_width - 2)
+    divider_right = min(width, half_width + 2)
+    draw.rectangle((divider_left, 0, divider_right, height), fill=(0, 0, 0, 255))
+
+    if center_symbol_name:
+        symbol_path = Path(center_symbol_name)
+        if not symbol_path.is_absolute():
+            symbol_path = (BASE_DIR / "vn_assets" / symbol_path).resolve()
+        if symbol_path.exists():
+            try:
+                with Image.open(symbol_path) as symbol_image:
+                    symbol = symbol_image.convert("RGBA")
+                if symbol.width == width and symbol.height == height:
+                    symbol_x = 0
+                    symbol_y = 0
+                else:
+                    symbol_x = max(0, (width - symbol.width) // 2)
+                    symbol_y = max(0, (height - symbol.height) // 2)
+                base.paste(symbol, (symbol_x, symbol_y), symbol)
+            except OSError as exc:
+                logger.warning("TF split panel: failed to load center symbol %s: %s", symbol_path, exc)
+
+    return base
+
+
+def render_tf_split_panel_gif(
+    *,
+    left_state: Optional[TransformationState],
+    right_state: Optional[TransformationState],
+    background_user_id: int,
+    center_symbol_name: Optional[str] = None,
+    filename: str = "tf_transition.gif",
+    left_avatar_image: Optional["Image.Image"] = None,
+    right_avatar_image: Optional["Image.Image"] = None,
+    left_selection_scope: Optional[str] = None,
+    right_selection_scope: Optional[str] = None,
+    original_hold_ms: int = REROLL_GIF_ORIGINAL_HOLD_MS,
+    old_to_silhouette_ms: int = REROLL_GIF_OLD_TO_SILHOUETTE_MS,
+    old_silhouette_hold_ms: int = REROLL_GIF_OLD_SILHOUETTE_HOLD_MS,
+    both_silhouettes_hold_ms: int = REROLL_GIF_BOTH_SILHOUETTES_HOLD_MS,
+    old_silhouette_fade_ms: int = REROLL_GIF_OLD_SILHOUETTE_FADE_MS,
+    new_silhouette_hold_ms: int = REROLL_GIF_NEW_SILHOUETTE_HOLD_MS,
+    new_reveal_ms: int = REROLL_GIF_NEW_REVEAL_MS,
+    final_hold_ms: int = REROLL_GIF_FINAL_HOLD_MS,
+    panel_size: Tuple[int, int] = REROLL_PANEL_SIZE,
+    fit_avatar_width: bool = False,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    base = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+    background_path = get_selected_background_path(background_user_id)
+    background_layer = compose_background_layer(panel_size, background_path)
+    if background_layer is not None:
+        base = background_layer.copy()
+
+    left_box = (20, 4, width - 20, height)
+
+    if left_avatar_image is None and left_state is not None and left_state.character_name.strip():
+        left_avatar_image = compose_state_avatar_image(
+            left_state,
+            selection_scope=left_selection_scope,
+        )
+    if right_avatar_image is None and right_state is not None and right_state.character_name.strip():
+        right_avatar_image = compose_state_avatar_image(
+            right_state,
+            selection_scope=right_selection_scope,
+        )
+
+    old_avatar_layer = _compose_avatar_layer(
+        panel_size,
+        left_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    new_avatar_layer = _compose_avatar_layer(
+        panel_size,
+        right_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    old_silhouette_layer = _make_silhouette_layer(old_avatar_layer, alpha_scale=1.0)
+    new_silhouette_layer = _make_silhouette_layer(
+        new_avatar_layer,
+        alpha_scale=REROLL_GIF_NEW_OVERLAY_ALPHA / 255.0,
+    )
+    new_silhouette_full_layer = _make_silhouette_layer(new_avatar_layer, alpha_scale=1.0)
+
+    if old_avatar_layer is None and new_avatar_layer is None:
+        return None
+
+    def _composite_frame(*layers: Optional["Image.Image"]) -> "Image.Image":
+        frame = base.copy()
+        for layer in layers:
+            if layer is not None:
+                frame.alpha_composite(layer)
+        if center_symbol_name:
+            symbol_path = Path(center_symbol_name)
+            if not symbol_path.is_absolute():
+                symbol_path = (BASE_DIR / "vn_assets" / symbol_path).resolve()
+            if symbol_path.exists():
+                try:
+                    with Image.open(symbol_path) as symbol_image:
+                        symbol = symbol_image.convert("RGBA")
+                    if symbol.size == frame.size:
+                        frame.alpha_composite(symbol)
+                    else:
+                        symbol_x = max(0, (frame.width - symbol.width) // 2)
+                        symbol_y = max(0, (frame.height - symbol.height) // 2)
+                        frame.alpha_composite(symbol, (symbol_x, symbol_y))
+                except OSError:
+                    pass
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(old_avatar_layer)))
+    durations.append(max(0, int(original_hold_ms)))
+
+    old_to_silhouette_frames = _frame_count_for_duration(old_to_silhouette_ms)
+    old_to_silhouette_frame_ms = max(20, int(round(old_to_silhouette_ms / old_to_silhouette_frames)))
+    for frame_index in range(1, old_to_silhouette_frames):
+        progress = frame_index / (old_to_silhouette_frames - 1)
+        fading_old = old_avatar_layer.copy() if old_avatar_layer is not None else None
+        growing_silhouette = _make_silhouette_layer(old_avatar_layer, alpha_scale=progress)
+        if fading_old is not None:
+            old_alpha = fading_old.getchannel("A").point(
+                lambda value: max(0, min(255, int(value * (1.0 - progress))))
+            )
+            fading_old.putalpha(old_alpha)
+        frames.append(_gif_frame_from_rgba(_composite_frame(fading_old, growing_silhouette)))
+        durations.append(old_to_silhouette_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(old_silhouette_layer)))
+    durations.append(max(0, int(old_silhouette_hold_ms)))
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(old_silhouette_layer, new_silhouette_layer)))
+    durations.append(max(0, int(both_silhouettes_hold_ms)))
+
+    old_fade_frames = _frame_count_for_duration(old_silhouette_fade_ms)
+    old_fade_frame_ms = max(20, int(round(old_silhouette_fade_ms / old_fade_frames)))
+    for frame_index in range(1, old_fade_frames):
+        progress = frame_index / (old_fade_frames - 1)
+        fading_old_silhouette = _make_silhouette_layer(old_avatar_layer, alpha_scale=(1.0 - progress))
+        frames.append(_gif_frame_from_rgba(_composite_frame(fading_old_silhouette, new_silhouette_full_layer)))
+        durations.append(old_fade_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(new_silhouette_full_layer)))
+    durations.append(max(0, int(new_silhouette_hold_ms)))
+
+    new_reveal_frames = _frame_count_for_duration(new_reveal_ms)
+    new_reveal_frame_ms = max(20, int(round(new_reveal_ms / new_reveal_frames)))
+    for frame_index in range(1, new_reveal_frames):
+        progress = frame_index / (new_reveal_frames - 1)
+        fading_new_silhouette = _make_silhouette_layer(new_avatar_layer, alpha_scale=(1.0 - progress))
+        frames.append(_gif_frame_from_rgba(_composite_frame(new_avatar_layer, fading_new_silhouette)))
+        durations.append(new_reveal_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(new_avatar_layer)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_swap_transition_panel(
+    *,
+    left_state: Optional[TransformationState],
+    right_state: Optional[TransformationState],
+    left_background_user_id: int,
+    right_background_user_id: int,
+    filename: str = "swap_transition.png",
+    center_symbol_name: Optional[str] = None,
+    left_avatar_image: Optional["Image.Image"] = None,
+    right_avatar_image: Optional["Image.Image"] = None,
+    left_selection_scope: Optional[str] = None,
+    right_selection_scope: Optional[str] = None,
+    panel_size: Optional[Tuple[int, int]] = None,
+    fit_avatar_width: bool = True,
+) -> Optional[discord.File]:
+    return render_tf_split_panel(
+        left_state=left_state,
+        right_state=right_state,
+        background_user_id=left_background_user_id,
+        right_background_user_id=right_background_user_id,
+        center_symbol_name=center_symbol_name,
+        filename=filename,
+        left_avatar_image=left_avatar_image,
+        right_avatar_image=right_avatar_image,
+        left_selection_scope=left_selection_scope,
+        right_selection_scope=right_selection_scope,
+        panel_size=panel_size,
+        fit_avatar_width=fit_avatar_width,
+        duplicate_left_background=False,
+    )
+
+
+def render_swap_transition_panel_gif(
+    *,
+    before_left_state: Optional[TransformationState],
+    before_right_state: Optional[TransformationState],
+    after_left_state: Optional[TransformationState],
+    after_right_state: Optional[TransformationState],
+    left_background_user_id: int,
+    right_background_user_id: int,
+    filename: str = "swap_transition.gif",
+    before_left_avatar_image: Optional["Image.Image"] = None,
+    before_right_avatar_image: Optional["Image.Image"] = None,
+    after_left_avatar_image: Optional["Image.Image"] = None,
+    after_right_avatar_image: Optional["Image.Image"] = None,
+    left_before_selection_scope: Optional[str] = None,
+    right_before_selection_scope: Optional[str] = None,
+    left_after_selection_scope: Optional[str] = None,
+    right_after_selection_scope: Optional[str] = None,
+    panel_size: Tuple[int, int] = (800, 250),
+    fit_avatar_width: bool = True,
+    initial_hold_ms: int = SWAP_GIF_INITIAL_HOLD_MS,
+    ghost_appear_ms: int = SWAP_GIF_GHOST_APPEAR_MS,
+    travel_ms: int = SWAP_GIF_TRAVEL_MS,
+    ghost_dissolve_ms: int = SWAP_GIF_GHOST_DISSOLVE_MS,
+    final_hold_ms: int = SWAP_GIF_FINAL_HOLD_MS,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    half_width = width // 2
+    left_box = (20, 4, half_width - 20, height)
+    right_box = (half_width + 20, 4, width - 20, height)
+
+    background_base = _build_tf_split_image(
+        left_state=None,
+        right_state=None,
+        background_user_id=left_background_user_id,
+        right_background_user_id=right_background_user_id,
+        panel_size=panel_size,
+        duplicate_left_background=False,
+    )
+    if background_base is None:
+        return None
+
+    if before_left_avatar_image is None and before_left_state is not None and before_left_state.character_name.strip():
+        before_left_avatar_image = compose_state_avatar_image(
+            before_left_state,
+            selection_scope=left_before_selection_scope,
+        )
+    if before_right_avatar_image is None and before_right_state is not None and before_right_state.character_name.strip():
+        before_right_avatar_image = compose_state_avatar_image(
+            before_right_state,
+            selection_scope=right_before_selection_scope,
+        )
+    if after_left_avatar_image is None and after_left_state is not None and after_left_state.character_name.strip():
+        after_left_avatar_image = compose_state_avatar_image(
+            after_left_state,
+            selection_scope=left_after_selection_scope,
+        )
+    if after_right_avatar_image is None and after_right_state is not None and after_right_state.character_name.strip():
+        after_right_avatar_image = compose_state_avatar_image(
+            after_right_state,
+            selection_scope=right_after_selection_scope,
+        )
+
+    old_left_layer = _compose_avatar_layer(
+        panel_size,
+        before_left_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    old_right_layer = _compose_avatar_layer(
+        panel_size,
+        before_right_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    new_left_layer = _compose_avatar_layer(
+        panel_size,
+        after_left_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    new_right_layer = _compose_avatar_layer(
+        panel_size,
+        after_right_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+
+    if all(layer is None for layer in (old_left_layer, old_right_layer, new_left_layer, new_right_layer)):
+        return None
+
+    before_left_ghost_avatar_image = _compose_swap_identity_avatar_image(
+        before_left_state,
+        selection_scope=left_before_selection_scope,
+    )
+    before_right_ghost_avatar_image = _compose_swap_identity_avatar_image(
+        before_right_state,
+        selection_scope=right_before_selection_scope,
+    )
+    old_left_ghost_layer = _compose_avatar_layer(
+        panel_size,
+        before_left_ghost_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    old_right_ghost_layer = _compose_avatar_layer(
+        panel_size,
+        before_right_ghost_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+
+    old_left_ghost = _make_ghost_layer(old_left_ghost_layer, alpha_scale=SWAP_GIF_GHOST_ALPHA / 255.0)
+    old_right_ghost = _make_ghost_layer(old_right_ghost_layer, alpha_scale=SWAP_GIF_GHOST_ALPHA / 255.0)
+
+    old_left_anchor = _layer_anchor(old_left_layer)
+    old_right_anchor = _layer_anchor(old_right_layer)
+    new_left_anchor = _layer_anchor(new_left_layer)
+    new_right_anchor = _layer_anchor(new_right_layer)
+
+    def _composite_frame(*layers: Optional["Image.Image"]) -> "Image.Image":
+        frame = background_base.copy()
+        for layer in layers:
+            if layer is not None:
+                frame.alpha_composite(layer)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer)))
+    durations.append(max(0, int(initial_hold_ms)))
+
+    ghost_appear_frames = max(2, int(round((max(0, ghost_appear_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS)))
+    ghost_appear_frame_ms = max(20, int(round(ghost_appear_ms / ghost_appear_frames))) if ghost_appear_ms > 0 else 20
+    for frame_index in range(1, ghost_appear_frames):
+        progress = _ease_in_out(frame_index / (ghost_appear_frames - 1))
+        left_ghost_frame = None
+        if old_left_ghost is not None and old_left_anchor is not None:
+            left_ghost_frame = _transform_layer(
+                old_left_ghost,
+                canvas_size=panel_size,
+                center_x=old_left_anchor[0] + (SWAP_GIF_GHOST_OFFSET_X * progress),
+                bottom_y=old_left_anchor[1],
+                scale=1.0,
+                alpha_scale=progress,
+            )
+        right_ghost_frame = None
+        if old_right_ghost is not None and old_right_anchor is not None:
+            right_ghost_frame = _transform_layer(
+                old_right_ghost,
+                canvas_size=panel_size,
+                center_x=old_right_anchor[0] - (SWAP_GIF_GHOST_OFFSET_X * progress),
+                bottom_y=old_right_anchor[1],
+                scale=1.0,
+                alpha_scale=progress,
+            )
+        frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer, left_ghost_frame, right_ghost_frame)))
+        durations.append(ghost_appear_frame_ms)
+
+    travel_frames = max(2, int(round((max(0, travel_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS)))
+    travel_frame_ms = max(20, int(round(travel_ms / travel_frames))) if travel_ms > 0 else 20
+    left_start_center = old_left_anchor[0] + SWAP_GIF_GHOST_OFFSET_X if old_left_anchor is not None else None
+    left_start_bottom = old_left_anchor[1] if old_left_anchor is not None else None
+    right_start_center = old_right_anchor[0] - SWAP_GIF_GHOST_OFFSET_X if old_right_anchor is not None else None
+    right_start_bottom = old_right_anchor[1] if old_right_anchor is not None else None
+    for frame_index in range(travel_frames):
+        raw_progress = frame_index / (travel_frames - 1)
+        progress = _ease_in_out(raw_progress)
+        current_left_body = old_left_layer
+        current_right_body = old_right_layer
+        left_ghost_frame = None
+        if old_left_ghost is not None and left_start_center is not None and left_start_bottom is not None and old_right_anchor is not None:
+            left_ghost_frame = _transform_layer(
+                old_left_ghost,
+                canvas_size=panel_size,
+                center_x=(left_start_center * (1.0 - progress)) + (old_right_anchor[0] * progress),
+                bottom_y=(left_start_bottom * (1.0 - progress)) + (old_right_anchor[1] * progress),
+                scale=1.0,
+                alpha_scale=1.0,
+            )
+        right_ghost_frame = None
+        if old_right_ghost is not None and right_start_center is not None and right_start_bottom is not None and old_left_anchor is not None:
+            right_ghost_frame = _transform_layer(
+                old_right_ghost,
+                canvas_size=panel_size,
+                center_x=(right_start_center * (1.0 - progress)) + (old_left_anchor[0] * progress),
+                bottom_y=(right_start_bottom * (1.0 - progress)) + (old_left_anchor[1] * progress),
+                scale=1.0,
+                alpha_scale=1.0,
+            )
+        frames.append(_gif_frame_from_rgba(_composite_frame(current_left_body, current_right_body, left_ghost_frame, right_ghost_frame)))
+        durations.append(travel_frame_ms)
+
+    dissolve_frames = max(2, int(round((max(0, ghost_dissolve_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS)))
+    dissolve_frame_ms = max(20, int(round(ghost_dissolve_ms / dissolve_frames))) if ghost_dissolve_ms > 0 else 20
+    for frame_index in range(dissolve_frames):
+        raw_progress = frame_index / (dissolve_frames - 1)
+        progress = _ease_in_out(raw_progress)
+        left_ghost_frame = None
+        if old_left_ghost is not None and old_right_anchor is not None:
+            left_ghost_frame = _transform_layer(
+                old_left_ghost,
+                canvas_size=panel_size,
+                center_x=old_right_anchor[0],
+                bottom_y=old_right_anchor[1],
+                scale=1.0 - ((1.0 - SWAP_GIF_GHOST_END_SCALE) * progress),
+                alpha_scale=1.0 - progress,
+            )
+        right_ghost_frame = None
+        if old_right_ghost is not None and old_left_anchor is not None:
+            right_ghost_frame = _transform_layer(
+                old_right_ghost,
+                canvas_size=panel_size,
+                center_x=old_left_anchor[0],
+                bottom_y=old_left_anchor[1],
+                scale=1.0 - ((1.0 - SWAP_GIF_GHOST_END_SCALE) * progress),
+                alpha_scale=1.0 - progress,
+            )
+        frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer, left_ghost_frame, right_ghost_frame)))
+        durations.append(dissolve_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_device_swap_transition_panel_gif(
+    *,
+    before_left_state: Optional[TransformationState],
+    before_right_state: Optional[TransformationState],
+    after_left_state: Optional[TransformationState],
+    after_right_state: Optional[TransformationState],
+    left_background_user_id: int,
+    right_background_user_id: int,
+    filename: str = "device_swap_transition.gif",
+    before_left_avatar_image: Optional["Image.Image"] = None,
+    before_right_avatar_image: Optional["Image.Image"] = None,
+    after_left_avatar_image: Optional["Image.Image"] = None,
+    after_right_avatar_image: Optional["Image.Image"] = None,
+    left_before_selection_scope: Optional[str] = None,
+    right_before_selection_scope: Optional[str] = None,
+    left_after_selection_scope: Optional[str] = None,
+    right_after_selection_scope: Optional[str] = None,
+    panel_size: Tuple[int, int] = (800, 250),
+    fit_avatar_width: bool = True,
+    initial_hold_ms: int = DEVICE_SWAP_GIF_INITIAL_HOLD_MS,
+    effect_ms: int = DEVICE_SWAP_GIF_EFFECT_MS,
+    final_hold_ms: int = DEVICE_SWAP_GIF_FINAL_HOLD_MS,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    half_width = width // 2
+    left_box = (20, 4, half_width - 20, height)
+    right_box = (half_width + 20, 4, width - 20, height)
+
+    background_base = _build_tf_split_image(
+        left_state=None,
+        right_state=None,
+        background_user_id=left_background_user_id,
+        right_background_user_id=right_background_user_id,
+        panel_size=panel_size,
+        duplicate_left_background=False,
+    )
+    if background_base is None:
+        return None
+
+    if before_left_avatar_image is None and before_left_state is not None and before_left_state.character_name.strip():
+        before_left_avatar_image = compose_state_avatar_image(
+            before_left_state,
+            selection_scope=left_before_selection_scope,
+        )
+    if before_right_avatar_image is None and before_right_state is not None and before_right_state.character_name.strip():
+        before_right_avatar_image = compose_state_avatar_image(
+            before_right_state,
+            selection_scope=right_before_selection_scope,
+        )
+    if after_left_avatar_image is None and after_left_state is not None and after_left_state.character_name.strip():
+        after_left_avatar_image = compose_state_avatar_image(
+            after_left_state,
+            selection_scope=left_after_selection_scope,
+        )
+    if after_right_avatar_image is None and after_right_state is not None and after_right_state.character_name.strip():
+        after_right_avatar_image = compose_state_avatar_image(
+            after_right_state,
+            selection_scope=right_after_selection_scope,
+        )
+
+    old_left_layer = _compose_avatar_layer(
+        panel_size,
+        before_left_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    old_right_layer = _compose_avatar_layer(
+        panel_size,
+        before_right_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    new_left_layer = _compose_avatar_layer(
+        panel_size,
+        after_left_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    new_right_layer = _compose_avatar_layer(
+        panel_size,
+        after_right_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+
+    if all(layer is None for layer in (old_left_layer, old_right_layer, new_left_layer, new_right_layer)):
+        return None
+
+    before_left_ghost_avatar_image = _compose_swap_identity_avatar_image(
+        before_left_state,
+        selection_scope=left_before_selection_scope,
+    )
+    before_right_ghost_avatar_image = _compose_swap_identity_avatar_image(
+        before_right_state,
+        selection_scope=right_before_selection_scope,
+    )
+    old_left_ghost_layer = _compose_avatar_layer(
+        panel_size,
+        before_left_ghost_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    old_right_ghost_layer = _compose_avatar_layer(
+        panel_size,
+        before_right_ghost_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    old_left_ghost = _make_ghost_layer(old_left_ghost_layer, alpha_scale=SWAP_GIF_GHOST_ALPHA / 255.0)
+    old_right_ghost = _make_ghost_layer(old_right_ghost_layer, alpha_scale=SWAP_GIF_GHOST_ALPHA / 255.0)
+
+    left_region = _union_layer_bbox(old_left_layer, new_left_layer)
+    right_region = _union_layer_bbox(old_right_layer, new_right_layer)
+    body_regions = [region for region in (left_region, right_region) if region is not None]
+    old_left_anchor = _layer_anchor(old_left_layer)
+    old_right_anchor = _layer_anchor(old_right_layer)
+
+    def _composite_frame(
+        *layers: Optional["Image.Image"],
+        effect_progress: float,
+        effect_alpha: float,
+    ) -> "Image.Image":
+        frame = background_base.copy()
+        for layer in layers:
+            if layer is not None:
+                frame.alpha_composite(layer)
+        particle_overlay = _build_device_particle_overlay(
+            panel_size,
+            body_regions,
+            progress=effect_progress,
+            alpha_scale=effect_alpha,
+            seed=(
+                left_background_user_id
+                ^ (right_background_user_id << 1)
+                ^ ((before_left_state.user_id if before_left_state else 0) << 2)
+                ^ ((before_right_state.user_id if before_right_state else 0) << 3)
+            ),
+        )
+        if particle_overlay is not None:
+            frame.alpha_composite(particle_overlay)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer, effect_progress=0.0, effect_alpha=0.0)))
+    durations.append(max(0, int(initial_hold_ms)))
+
+    ghost_total = SWAP_GIF_GHOST_APPEAR_MS + SWAP_GIF_TRAVEL_MS + SWAP_GIF_GHOST_DISSOLVE_MS
+    ghost_appear_ms = int(round(effect_ms * (SWAP_GIF_GHOST_APPEAR_MS / ghost_total))) if ghost_total else 0
+    travel_ms = int(round(effect_ms * (SWAP_GIF_TRAVEL_MS / ghost_total))) if ghost_total else 0
+    ghost_dissolve_ms = max(0, int(effect_ms) - ghost_appear_ms - travel_ms)
+    total_effect_ms = max(1, ghost_appear_ms + travel_ms + ghost_dissolve_ms)
+    elapsed_ms = 0
+
+    ghost_appear_frames = max(2, int(round((max(0, ghost_appear_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    ghost_appear_frame_ms = max(20, int(round(ghost_appear_ms / ghost_appear_frames))) if ghost_appear_ms > 0 else 20
+    for frame_index in range(1, ghost_appear_frames):
+        raw_progress = frame_index / (ghost_appear_frames - 1)
+        progress = _ease_in_out(raw_progress)
+        elapsed_ms += ghost_appear_frame_ms
+        effect_progress = min(1.0, elapsed_ms / total_effect_ms)
+        frames.append(
+            _gif_frame_from_rgba(
+                _composite_frame(
+                    old_left_layer,
+                    old_right_layer,
+                    _transform_layer(
+                        old_left_ghost,
+                        canvas_size=panel_size,
+                        center_x=old_left_anchor[0] + (SWAP_GIF_GHOST_OFFSET_X * progress),
+                        bottom_y=old_left_anchor[1],
+                        scale=1.0,
+                        alpha_scale=progress,
+                    ) if old_left_ghost is not None and old_left_anchor is not None else None,
+                    _transform_layer(
+                        old_right_ghost,
+                        canvas_size=panel_size,
+                        center_x=old_right_anchor[0] - (SWAP_GIF_GHOST_OFFSET_X * progress),
+                        bottom_y=old_right_anchor[1],
+                        scale=1.0,
+                        alpha_scale=progress,
+                    ) if old_right_ghost is not None and old_right_anchor is not None else None,
+                    effect_progress=effect_progress,
+                    effect_alpha=1.0,
+                )
+            )
+        )
+        durations.append(ghost_appear_frame_ms)
+
+    travel_frames = max(2, int(round((max(0, travel_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    travel_frame_ms = max(20, int(round(travel_ms / travel_frames))) if travel_ms > 0 else 20
+    left_start_center = old_left_anchor[0] + SWAP_GIF_GHOST_OFFSET_X if old_left_anchor is not None else None
+    left_start_bottom = old_left_anchor[1] if old_left_anchor is not None else None
+    right_start_center = old_right_anchor[0] - SWAP_GIF_GHOST_OFFSET_X if old_right_anchor is not None else None
+    right_start_bottom = old_right_anchor[1] if old_right_anchor is not None else None
+    for frame_index in range(travel_frames):
+        raw_progress = frame_index / (travel_frames - 1)
+        progress = _ease_in_out(raw_progress)
+        elapsed_ms += travel_frame_ms
+        effect_progress = min(1.0, elapsed_ms / total_effect_ms)
+        frames.append(
+            _gif_frame_from_rgba(
+                _composite_frame(
+                    old_left_layer,
+                    old_right_layer,
+                    _transform_layer(
+                        old_left_ghost,
+                        canvas_size=panel_size,
+                        center_x=(left_start_center * (1.0 - progress)) + (old_right_anchor[0] * progress),
+                        bottom_y=(left_start_bottom * (1.0 - progress)) + (old_right_anchor[1] * progress),
+                        scale=1.0,
+                        alpha_scale=1.0,
+                    ) if old_left_ghost is not None and left_start_center is not None and left_start_bottom is not None and old_right_anchor is not None else None,
+                    _transform_layer(
+                        old_right_ghost,
+                        canvas_size=panel_size,
+                        center_x=(right_start_center * (1.0 - progress)) + (old_left_anchor[0] * progress),
+                        bottom_y=(right_start_bottom * (1.0 - progress)) + (old_left_anchor[1] * progress),
+                        scale=1.0,
+                        alpha_scale=1.0,
+                    ) if old_right_ghost is not None and right_start_center is not None and right_start_bottom is not None and old_left_anchor is not None else None,
+                    effect_progress=effect_progress,
+                    effect_alpha=1.0,
+                )
+            )
+        )
+        durations.append(travel_frame_ms)
+
+    dissolve_frames = max(2, int(round((max(0, ghost_dissolve_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    dissolve_frame_ms = max(20, int(round(ghost_dissolve_ms / dissolve_frames))) if ghost_dissolve_ms > 0 else 20
+    for frame_index in range(dissolve_frames):
+        raw_progress = frame_index / (dissolve_frames - 1)
+        progress = _ease_in_out(raw_progress)
+        elapsed_ms += dissolve_frame_ms
+        effect_progress = min(1.0, elapsed_ms / total_effect_ms)
+        effect_alpha = max(0.0, 1.0 - progress)
+        frames.append(
+            _gif_frame_from_rgba(
+                _composite_frame(
+                    old_left_layer,
+                    old_right_layer,
+                    _transform_layer(
+                        old_left_ghost,
+                        canvas_size=panel_size,
+                        center_x=old_right_anchor[0],
+                        bottom_y=old_right_anchor[1],
+                        scale=1.0 - ((1.0 - SWAP_GIF_GHOST_END_SCALE) * progress),
+                        alpha_scale=1.0 - progress,
+                    ) if old_left_ghost is not None and old_right_anchor is not None else None,
+                    _transform_layer(
+                        old_right_ghost,
+                        canvas_size=panel_size,
+                        center_x=old_left_anchor[0],
+                        bottom_y=old_left_anchor[1],
+                        scale=1.0 - ((1.0 - SWAP_GIF_GHOST_END_SCALE) * progress),
+                        alpha_scale=1.0 - progress,
+                    ) if old_right_ghost is not None and old_left_anchor is not None else None,
+                    effect_progress=effect_progress,
+                    effect_alpha=effect_alpha,
+                )
+            )
+        )
+        durations.append(dissolve_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer, effect_progress=1.0, effect_alpha=0.0)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_device_reroll_transition_panel_gif(
+    *,
+    previous_state: Optional[TransformationState],
+    current_state: Optional[TransformationState],
+    background_user_id: int,
+    filename: str = "device_reroll_transition.gif",
+    previous_avatar_image: Optional["Image.Image"] = None,
+    current_avatar_image: Optional["Image.Image"] = None,
+    previous_selection_scope: Optional[str] = None,
+    current_selection_scope: Optional[str] = None,
+    panel_size: Tuple[int, int] = REROLL_PANEL_SIZE,
+    fit_avatar_width: bool = False,
+    initial_hold_ms: int = DEVICE_SWAP_GIF_INITIAL_HOLD_MS,
+    effect_ms: int = DEVICE_SWAP_GIF_EFFECT_MS,
+    final_hold_ms: int = DEVICE_SWAP_GIF_FINAL_HOLD_MS,
+    include_particles: bool = True,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    avatar_box = (20, 4, width - 20, height)
+
+    base = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+    background_path = get_selected_background_path(background_user_id)
+    background_layer = compose_background_layer(panel_size, background_path)
+    if background_layer is not None:
+        base = background_layer.copy()
+
+    if previous_avatar_image is None and previous_state is not None and previous_state.character_name.strip():
+        previous_avatar_image = compose_state_avatar_image(
+            previous_state,
+            selection_scope=previous_selection_scope,
+        )
+    if current_avatar_image is None and current_state is not None and current_state.character_name.strip():
+        current_avatar_image = compose_state_avatar_image(
+            current_state,
+            selection_scope=current_selection_scope,
+        )
+
+    old_avatar_layer = _compose_avatar_layer(
+        panel_size,
+        previous_avatar_image,
+        avatar_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    new_avatar_layer = _compose_avatar_layer(
+        panel_size,
+        current_avatar_image,
+        avatar_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    if old_avatar_layer is None and new_avatar_layer is None:
+        return None
+
+    old_silhouette_layer = _make_silhouette_layer(old_avatar_layer, alpha_scale=1.0)
+    new_silhouette_layer = _make_silhouette_layer(new_avatar_layer, alpha_scale=1.0)
+    body_region = _union_layer_bbox(old_avatar_layer, new_avatar_layer)
+    body_regions = [body_region] if body_region is not None else []
+
+    def _composite_frame(
+        old_sprite_alpha: float,
+        old_silhouette_alpha: float,
+        new_silhouette_alpha: float,
+        new_sprite_alpha: float,
+        effect_progress: float,
+        effect_alpha: float,
+    ) -> "Image.Image":
+        frame = base.copy()
+        composited_layers = (
+            _layer_with_alpha_scale(old_avatar_layer, alpha_scale=old_sprite_alpha),
+            _layer_with_alpha_scale(old_silhouette_layer, alpha_scale=old_silhouette_alpha),
+            _layer_with_alpha_scale(new_silhouette_layer, alpha_scale=new_silhouette_alpha),
+            _layer_with_alpha_scale(new_avatar_layer, alpha_scale=new_sprite_alpha),
+        )
+        for layer in composited_layers:
+            if layer is not None:
+                frame.alpha_composite(layer)
+        if include_particles:
+            particle_overlay = _build_device_particle_overlay(
+                panel_size,
+                body_regions,
+                progress=effect_progress,
+                alpha_scale=effect_alpha,
+                seed=(background_user_id ^ ((previous_state.user_id if previous_state else 0) << 2) ^ ((current_state.user_id if current_state else 0) << 3)),
+            )
+            if particle_overlay is not None:
+                frame.alpha_composite(particle_overlay)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(1.0, 0.0, 0.0, 0.0, 0.0, 0.0)))
+    durations.append(max(0, int(initial_hold_ms)))
+
+    effect_frames = max(2, int(round((max(0, effect_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    effect_frame_ms = max(20, int(round(effect_ms / effect_frames))) if effect_ms > 0 else 20
+    for frame_index in range(1, effect_frames):
+        progress = _ease_in_out(frame_index / (effect_frames - 1))
+        if progress < (1.0 / 3.0):
+            local_progress = progress / (1.0 / 3.0)
+            old_sprite_alpha = max(0.0, 1.0 - local_progress)
+            old_silhouette_alpha = min(1.0, local_progress)
+            new_silhouette_alpha = 0.0
+            new_sprite_alpha = 0.0
+        elif progress < (2.0 / 3.0):
+            local_progress = (progress - (1.0 / 3.0)) / (1.0 / 3.0)
+            old_sprite_alpha = 0.0
+            old_silhouette_alpha = max(0.0, 1.0 - local_progress)
+            new_silhouette_alpha = min(1.0, local_progress)
+            new_sprite_alpha = 0.0
+        else:
+            local_progress = (progress - (2.0 / 3.0)) / (1.0 / 3.0)
+            old_sprite_alpha = 0.0
+            old_silhouette_alpha = 0.0
+            new_silhouette_alpha = max(0.0, 1.0 - local_progress)
+            new_sprite_alpha = min(1.0, local_progress)
+        effect_alpha = 0.35 + (0.65 * math.sin(math.pi * progress))
+        frames.append(
+            _gif_frame_from_rgba(
+                _composite_frame(
+                    old_sprite_alpha,
+                    old_silhouette_alpha,
+                    new_silhouette_alpha,
+                    new_sprite_alpha,
+                    progress,
+                    effect_alpha,
+                )
+            )
+        )
+        durations.append(effect_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(0.0, 0.0, 0.0, 1.0, 1.0, 0.0)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_clone_transition_panel_gif(
+    *,
+    source_state: Optional[TransformationState],
+    before_target_state: Optional[TransformationState],
+    after_target_state: Optional[TransformationState],
+    source_background_user_id: int,
+    target_background_user_id: int,
+    filename: str = "clone_transition.gif",
+    source_avatar_image: Optional["Image.Image"] = None,
+    before_target_avatar_image: Optional["Image.Image"] = None,
+    after_target_avatar_image: Optional["Image.Image"] = None,
+    source_selection_scope: Optional[str] = None,
+    before_target_selection_scope: Optional[str] = None,
+    after_target_selection_scope: Optional[str] = None,
+    panel_size: Tuple[int, int] = (800, 250),
+    fit_avatar_width: bool = True,
+    initial_hold_ms: int = DEVICE_SWAP_GIF_INITIAL_HOLD_MS,
+    effect_ms: int = DEVICE_SWAP_GIF_EFFECT_MS,
+    final_hold_ms: int = DEVICE_SWAP_GIF_FINAL_HOLD_MS,
+    include_particles: bool = True,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    half_width = width // 2
+    left_box = (20, 4, half_width - 20, height)
+    right_box = (half_width + 20, 4, width - 20, height)
+
+    background_base = _build_tf_split_image(
+        left_state=None,
+        right_state=None,
+        background_user_id=source_background_user_id,
+        right_background_user_id=target_background_user_id,
+        panel_size=panel_size,
+        duplicate_left_background=False,
+    )
+    if background_base is None:
+        return None
+
+    if source_avatar_image is None and source_state is not None and source_state.character_name.strip():
+        source_avatar_image = compose_state_avatar_image(
+            source_state,
+            selection_scope=source_selection_scope,
+        )
+    if before_target_avatar_image is None and before_target_state is not None and before_target_state.character_name.strip():
+        before_target_avatar_image = compose_state_avatar_image(
+            before_target_state,
+            selection_scope=before_target_selection_scope,
+        )
+    if after_target_avatar_image is None and after_target_state is not None and after_target_state.character_name.strip():
+        after_target_avatar_image = compose_state_avatar_image(
+            after_target_state,
+            selection_scope=after_target_selection_scope,
+        )
+
+    source_layer = _compose_avatar_layer(
+        panel_size,
+        source_avatar_image,
+        left_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    before_target_layer = _compose_avatar_layer(
+        panel_size,
+        before_target_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    after_target_layer = _compose_avatar_layer(
+        panel_size,
+        after_target_avatar_image,
+        right_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+
+    if all(layer is None for layer in (source_layer, before_target_layer, after_target_layer)):
+        return None
+
+    before_target_silhouette = _make_silhouette_layer(before_target_layer, alpha_scale=1.0)
+    after_target_silhouette = _make_silhouette_layer(after_target_layer, alpha_scale=1.0)
+    left_region = _union_layer_bbox(source_layer, source_layer)
+    right_region = _union_layer_bbox(before_target_layer, after_target_layer)
+    body_regions = [region for region in (left_region, right_region) if region is not None]
+
+    def _composite_frame(
+        source_alpha: float,
+        before_target_alpha: float,
+        before_target_silhouette_alpha: float,
+        after_target_silhouette_alpha: float,
+        after_target_alpha: float,
+        effect_progress: float,
+        effect_alpha: float,
+    ) -> "Image.Image":
+        frame = background_base.copy()
+        composited_layers = (
+            _layer_with_alpha_scale(source_layer, alpha_scale=source_alpha),
+            _layer_with_alpha_scale(before_target_layer, alpha_scale=before_target_alpha),
+            _layer_with_alpha_scale(before_target_silhouette, alpha_scale=before_target_silhouette_alpha),
+            _layer_with_alpha_scale(after_target_silhouette, alpha_scale=after_target_silhouette_alpha),
+            _layer_with_alpha_scale(after_target_layer, alpha_scale=after_target_alpha),
+        )
+        for layer in composited_layers:
+            if layer is not None:
+                frame.alpha_composite(layer)
+        if include_particles:
+            particle_overlay = _build_device_particle_overlay(
+                panel_size,
+                body_regions,
+                progress=effect_progress,
+                alpha_scale=effect_alpha,
+                seed=(
+                    source_background_user_id
+                    ^ (target_background_user_id << 1)
+                    ^ ((source_state.user_id if source_state else 0) << 2)
+                    ^ ((before_target_state.user_id if before_target_state else 0) << 3)
+                ),
+            )
+            if particle_overlay is not None:
+                frame.alpha_composite(particle_overlay)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)))
+    durations.append(max(0, int(initial_hold_ms)))
+
+    effect_frames = max(2, int(round((max(0, effect_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    effect_frame_ms = max(20, int(round(effect_ms / effect_frames))) if effect_ms > 0 else 20
+    for frame_index in range(1, effect_frames):
+        progress = _ease_in_out(frame_index / (effect_frames - 1))
+        if progress < (1.0 / 3.0):
+            local_progress = progress / (1.0 / 3.0)
+            before_target_alpha = max(0.0, 1.0 - local_progress)
+            before_target_silhouette_alpha = min(1.0, local_progress)
+            after_target_silhouette_alpha = 0.0
+            after_target_alpha = 0.0
+        elif progress < (2.0 / 3.0):
+            local_progress = (progress - (1.0 / 3.0)) / (1.0 / 3.0)
+            before_target_alpha = 0.0
+            before_target_silhouette_alpha = max(0.0, 1.0 - local_progress)
+            after_target_silhouette_alpha = min(1.0, local_progress)
+            after_target_alpha = 0.0
+        else:
+            local_progress = (progress - (2.0 / 3.0)) / (1.0 / 3.0)
+            before_target_alpha = 0.0
+            before_target_silhouette_alpha = 0.0
+            after_target_silhouette_alpha = max(0.0, 1.0 - local_progress)
+            after_target_alpha = min(1.0, local_progress)
+        effect_alpha = max(0.0, 1.0 - max(0.0, (progress - 0.7) / 0.3))
+        frames.append(
+            _gif_frame_from_rgba(
+                _composite_frame(
+                    1.0,
+                    before_target_alpha,
+                    before_target_silhouette_alpha,
+                    after_target_silhouette_alpha,
+                    after_target_alpha,
+                    progress,
+                    effect_alpha,
+                )
+            )
+        )
+        durations.append(effect_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_mass_swap_transition_panel_gif(
+    *,
+    filename: str = "mass_swap_transition.gif",
+    panel_size: Tuple[int, int] = (800, 250),
+    background_number: int = MASS_SWAP_BACKGROUND_NUMBER,
+    wander_ms: int = MASS_SWAP_GIF_WANDER_MS,
+    exit_ms: int = MASS_SWAP_GIF_EXIT_MS,
+    final_hold_ms: int = MASS_SWAP_GIF_FINAL_HOLD_MS,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    backgrounds = list_background_choices()
+    background_path: Optional[Path] = None
+    if backgrounds:
+        background_index = max(0, min(len(backgrounds) - 1, background_number - 1))
+        background_path = backgrounds[background_index]
+    background_base = compose_background_layer(panel_size, background_path)
+    if background_base is None:
+        return None
+
+    ghost_specs = [
+        {"name": "John Davis", "track_y": float(height), "start_x": 90.0},
+        {"name": "Katrina Morgan", "track_y": float(height), "start_x": 170.0},
+        {"name": "Kiyoshi Honda", "track_y": float(height), "start_x": 250.0},
+        {"name": "Kyoko Hano", "track_y": float(height), "start_x": 330.0},
+        {"name": "Allison Stein", "track_y": float(height), "start_x": 410.0},
+        {"name": "Sayaka Sato", "track_y": float(height), "start_x": 490.0},
+        {"name": "Irene Virelles", "track_y": float(height), "start_x": 570.0},
+        {"name": "Claus Hawkins", "track_y": float(height), "start_x": 650.0},
+        {"name": "Zoey Chambers", "track_y": float(height), "start_x": 710.0},
+    ]
+
+    prepared_ghosts: list[dict[str, object]] = []
+    call_seed = random.randrange(1, 1_000_000_000)
+    random.Random(call_seed).shuffle(ghost_specs)
+    depth_min = 0.84
+    depth_max = 1.12
+    depth_span = max(len(ghost_specs) - 1, 1)
+    for spec_index, spec in enumerate(ghost_specs):
+        avatar_image = compose_game_avatar(str(spec["name"]))
+        if avatar_image is None:
+            continue
+        avatar_rgba = avatar_image.convert("RGBA")
+        if avatar_rgba.height > MASS_SWAP_GHOST_MAX_HEIGHT:
+            fit_scale = MASS_SWAP_GHOST_MAX_HEIGHT / max(avatar_rgba.height, 1)
+            fitted_width = max(1, int(round(avatar_rgba.width * fit_scale)))
+            fitted_height = max(1, int(round(avatar_rgba.height * fit_scale)))
+            avatar_rgba = avatar_rgba.resize((fitted_width, fitted_height), Image.LANCZOS)
+        depth_scale = depth_min + (((depth_max - depth_min) * spec_index) / depth_span)
+        if depth_scale != 1.0:
+            scaled_width = max(1, int(round(avatar_rgba.width * depth_scale)))
+            scaled_height = max(1, int(round(avatar_rgba.height * depth_scale)))
+            avatar_rgba = avatar_rgba.resize((scaled_width, scaled_height), Image.LANCZOS)
+        ghost_layer = _make_ghost_layer(avatar_rgba, alpha_scale=MASS_SWAP_GHOST_ALPHA / 255.0)
+        if ghost_layer is None:
+            continue
+        rng = random.Random(call_seed + (spec_index * 9973))
+        waypoints: list[Tuple[float, float]] = []
+        start_x = float(spec["start_x"])
+        track_y = float(spec["track_y"])
+        current_x = start_x
+        waypoints.append((current_x, track_y))
+        waypoint_count = rng.randint(3, 6)
+        for _ in range(waypoint_count):
+            horizontal_step = rng.uniform(70.0, 210.0)
+            step_direction = rng.choice((-1.0, 1.0))
+            current_x = max(90.0, min(width - 90.0, current_x + (horizontal_step * step_direction)))
+            waypoints.append((current_x, track_y))
+        edge = rng.choice(("left", "right"))
+        if edge == "left":
+            exit_point = (-220.0, track_y)
+        else:
+            exit_point = (width + 220.0, track_y)
+        wander_progress_offset = rng.uniform(0.0, 0.22)
+        wander_progress_scale = rng.uniform(0.62, 0.92)
+        wander_end_progress = min(1.0, wander_progress_offset + wander_progress_scale)
+        prepared_ghosts.append(
+            {
+                "layer": ghost_layer,
+                "waypoints": waypoints,
+                "exit_point": exit_point,
+                "phase_offset": rng.random(),
+                "speed_scale": rng.uniform(0.82, 1.18),
+                "wiggle_amplitude": rng.uniform(10.0, 34.0),
+                "wiggle_cycles": rng.uniform(1.0, 2.8),
+                "wander_progress_offset": wander_progress_offset,
+                "wander_progress_scale": wander_progress_scale,
+                "wander_end_progress": wander_end_progress,
+            }
+        )
+
+    if not prepared_ghosts:
+        return None
+
+    def _position_for_progress(waypoints: Sequence[Tuple[float, float]], progress: float) -> Tuple[float, float]:
+        if len(waypoints) == 1:
+            return waypoints[0]
+        segment_count = max(1, len(waypoints) - 1)
+        scaled = max(0.0, min(0.999999, progress)) * segment_count
+        segment_index = min(segment_count - 1, int(math.floor(scaled)))
+        local_progress = scaled - segment_index
+        start_x, start_y = waypoints[segment_index]
+        end_x, end_y = waypoints[segment_index + 1]
+        eased = _ease_in_out(local_progress)
+        return (
+            (start_x * (1.0 - eased)) + (end_x * eased),
+            (start_y * (1.0 - eased)) + (end_y * eased),
+        )
+
+    def _composite_frame(progress: float, *, exiting: bool = False) -> "Image.Image":
+        frame = background_base.copy()
+        for ghost in prepared_ghosts:
+            ghost_layer = ghost["layer"]
+            waypoints = ghost["waypoints"]
+            exit_point = ghost["exit_point"]
+            phase_offset = float(ghost["phase_offset"])
+            speed_scale = float(ghost["speed_scale"])
+            wiggle_amplitude = float(ghost["wiggle_amplitude"])
+            wiggle_cycles = float(ghost["wiggle_cycles"])
+            wander_progress_offset = float(ghost["wander_progress_offset"])
+            wander_progress_scale = float(ghost["wander_progress_scale"])
+            wander_end_progress = float(ghost["wander_end_progress"])
+            local_progress = progress
+            if not exiting:
+                local_progress = min(
+                    1.0,
+                    wander_progress_offset + (progress * wander_progress_scale * speed_scale),
+                )
+            current_x, current_y = _position_for_progress(waypoints, local_progress)
+            travel_direction_x = 1.0
+            if not exiting:
+                current_x += math.sin((local_progress + phase_offset) * math.pi * 2.0 * wiggle_cycles) * wiggle_amplitude
+                current_x = max(70.0, min(width - 70.0, current_x))
+                lookahead_progress = min(1.0, local_progress + 0.02)
+                next_x, _ = _position_for_progress(waypoints, lookahead_progress)
+                next_x += math.sin((lookahead_progress + phase_offset) * math.pi * 2.0 * wiggle_cycles) * wiggle_amplitude
+                travel_direction_x = next_x - current_x
+            if exiting:
+                last_x, last_y = _position_for_progress(waypoints, wander_end_progress)
+                eased = _ease_in_out(progress)
+                current_x = (last_x * (1.0 - eased)) + (float(exit_point[0]) * eased)
+                current_y = (last_y * (1.0 - eased)) + (float(exit_point[1]) * eased)
+                travel_direction_x = float(exit_point[0]) - last_x
+            ghost_frame = _transform_layer(
+                ghost_layer,  # type: ignore[arg-type]
+                canvas_size=panel_size,
+                center_x=current_x,
+                bottom_y=current_y,
+                scale=1.0,
+                alpha_scale=1.0 - (0.18 * progress if exiting else 0.0),
+                flip_horizontal=travel_direction_x < 0.0,
+            )
+            if ghost_frame is not None:
+                frame.alpha_composite(ghost_frame)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    wander_frames = max(2, int(round((max(0, wander_ms) / 1000.0) * MASS_SWAP_GIF_ANIMATION_FPS)))
+    wander_frame_ms = max(20, int(round(wander_ms / wander_frames))) if wander_ms > 0 else 20
+    for frame_index in range(wander_frames):
+        progress = frame_index / (wander_frames - 1)
+        frames.append(_gif_frame_from_rgba(_composite_frame(progress, exiting=False)))
+        durations.append(wander_frame_ms)
+
+    exit_frames = max(2, int(round((max(0, exit_ms) / 1000.0) * MASS_SWAP_GIF_ANIMATION_FPS)))
+    exit_frame_ms = max(20, int(round(exit_ms / exit_frames))) if exit_ms > 0 else 20
+    for frame_index in range(1, exit_frames):
+        progress = frame_index / (exit_frames - 1)
+        frames.append(_gif_frame_from_rgba(_composite_frame(progress, exiting=True)))
+        durations.append(exit_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(background_base.copy()))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_mass_reroll_transition_panel_gif(
+    *,
+    filename: str = "mass_reroll_transition.gif",
+    panel_size: Tuple[int, int] = (800, 250),
+    background_number: int = MASS_REROLL_BACKGROUND_NUMBER,
+    initial_hold_ms: int = MASS_REROLL_GIF_INITIAL_HOLD_MS,
+    transition_ms: int = MASS_REROLL_GIF_TRANSITION_MS,
+    final_hold_ms: int = MASS_REROLL_GIF_FINAL_HOLD_MS,
+    stage_count: int = MASS_REROLL_STAGE_COUNT,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    backgrounds = list_background_choices()
+    background_path: Optional[Path] = None
+    if backgrounds:
+        background_index = max(0, min(len(backgrounds) - 1, background_number - 1))
+        background_path = backgrounds[background_index]
+    background_base = compose_background_layer(panel_size, background_path)
+    if background_base is None:
+        return None
+
+    silhouette_specs = [
+        {"name": "John Davis", "track_y": float(height), "start_x": 90.0},
+        {"name": "Katrina Morgan", "track_y": float(height), "start_x": 170.0},
+        {"name": "Kiyoshi Honda", "track_y": float(height), "start_x": 250.0},
+        {"name": "Kyoko Hano", "track_y": float(height), "start_x": 330.0},
+        {"name": "Allison Stein", "track_y": float(height), "start_x": 410.0},
+        {"name": "Sayaka Sato", "track_y": float(height), "start_x": 490.0},
+        {"name": "Irene Virelles", "track_y": float(height), "start_x": 570.0},
+        {"name": "Claus Hawkins", "track_y": float(height), "start_x": 650.0},
+        {"name": "Zoey Chambers", "track_y": float(height), "start_x": 710.0},
+    ]
+
+    call_seed = random.randrange(1, 1_000_000_000)
+    random.Random(call_seed).shuffle(silhouette_specs)
+    available_names = [str(spec["name"]) for spec in silhouette_specs]
+    depth_min = 0.84
+    depth_max = 1.12
+    depth_span = max(len(silhouette_specs) - 1, 1)
+    rotation_candidates = [step for step in range(1, len(available_names)) if math.gcd(step, len(available_names)) == 1]
+    if not rotation_candidates:
+        rotation_candidates = [1]
+    rotation_step = random.Random(call_seed + 41).choice(rotation_candidates)
+    prepared_silhouettes: list[dict[str, object]] = []
+
+    for spec_index, spec in enumerate(silhouette_specs):
+        base_name = str(spec["name"])
+        stage_names = [base_name]
+        for stage_offset in range(1, max(1, int(stage_count)) + 1):
+            rotated_index = (spec_index + (stage_offset * rotation_step)) % len(available_names)
+            stage_names.append(available_names[rotated_index])
+
+        silhouette_layers: list["Image.Image"] = []
+        depth_scale = depth_min + (((depth_max - depth_min) * spec_index) / depth_span)
+        for stage_name in stage_names:
+            avatar_image = compose_game_avatar(stage_name)
+            if avatar_image is None:
+                silhouette_layers = []
+                break
+            avatar_rgba = avatar_image.convert("RGBA")
+            if avatar_rgba.height > MASS_SWAP_GHOST_MAX_HEIGHT:
+                fit_scale = MASS_SWAP_GHOST_MAX_HEIGHT / max(avatar_rgba.height, 1)
+                fitted_width = max(1, int(round(avatar_rgba.width * fit_scale)))
+                fitted_height = max(1, int(round(avatar_rgba.height * fit_scale)))
+                avatar_rgba = avatar_rgba.resize((fitted_width, fitted_height), Image.LANCZOS)
+            if depth_scale != 1.0:
+                scaled_width = max(1, int(round(avatar_rgba.width * depth_scale)))
+                scaled_height = max(1, int(round(avatar_rgba.height * depth_scale)))
+                avatar_rgba = avatar_rgba.resize((scaled_width, scaled_height), Image.LANCZOS)
+            silhouette_layer = _make_outlined_silhouette_layer(avatar_rgba, alpha_scale=1.0)
+            if silhouette_layer is None:
+                silhouette_layers = []
+                break
+            silhouette_layers.append(silhouette_layer)
+
+        if not silhouette_layers:
+            continue
+
+        prepared_silhouettes.append(
+            {
+                "layers": silhouette_layers,
+                "center_x": float(spec["start_x"]),
+                "bottom_y": float(spec["track_y"]),
+            }
+        )
+
+    if not prepared_silhouettes:
+        return None
+
+    def _composite_frame(stage_index: int, progress: float) -> "Image.Image":
+        frame = background_base.copy()
+        eased = _ease_in_out(progress)
+        for silhouette in prepared_silhouettes:
+            layers = silhouette["layers"]
+            current_layer = layers[min(stage_index, len(layers) - 1)]  # type: ignore[index]
+            next_layer = layers[min(stage_index + 1, len(layers) - 1)]  # type: ignore[index]
+            center_x = float(silhouette["center_x"])
+            bottom_y = float(silhouette["bottom_y"])
+            current_frame = _transform_layer(
+                current_layer,
+                canvas_size=panel_size,
+                center_x=center_x,
+                bottom_y=bottom_y,
+                scale=1.0,
+                alpha_scale=1.0 - eased,
+            )
+            if current_frame is not None:
+                frame.alpha_composite(current_frame)
+            next_frame = _transform_layer(
+                next_layer,
+                canvas_size=panel_size,
+                center_x=center_x,
+                bottom_y=bottom_y,
+                scale=1.0,
+                alpha_scale=eased,
+            )
+            if next_frame is not None:
+                frame.alpha_composite(next_frame)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(0, 0.0)))
+    durations.append(max(0, int(initial_hold_ms)))
+
+    transition_frames = max(2, int(round((max(0, transition_ms) / 1000.0) * MASS_REROLL_GIF_ANIMATION_FPS)))
+    transition_frame_ms = max(20, int(round(transition_ms / transition_frames))) if transition_ms > 0 else 20
+    for stage_index in range(max(1, int(stage_count))):
+        for frame_index in range(1, transition_frames):
+            progress = frame_index / (transition_frames - 1)
+            frames.append(_gif_frame_from_rgba(_composite_frame(stage_index, progress)))
+            durations.append(transition_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_composite_frame(max(0, int(stage_count) - 1), 1.0)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_background_transition_panel_gif(
+    *,
+    state: Optional[TransformationState],
+    old_background_path: Optional[Path],
+    new_background_path: Optional[Path],
+    filename: str = "bg_transition.gif",
+    avatar_image: Optional["Image.Image"] = None,
+    selection_scope: Optional[str] = None,
+    panel_size: Tuple[int, int] = BG_TRANSITION_PANEL_SIZE,
+    fit_avatar_width: bool = False,
+    initial_hold_ms: int = BG_GIF_INITIAL_HOLD_MS,
+    travel_ms: int = BG_GIF_TRAVEL_MS,
+    final_hold_ms: int = BG_GIF_FINAL_HOLD_MS,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    width, height = panel_size
+    source_old_path = old_background_path or new_background_path
+    source_new_path = new_background_path or old_background_path
+    if source_old_path is None or source_new_path is None:
+        return None
+
+    old_background_layer = compose_background_layer(panel_size, source_old_path)
+    new_background_layer = compose_background_layer(panel_size, source_new_path)
+    if old_background_layer is None or new_background_layer is None:
+        return None
+
+    if avatar_image is None and state is not None and state.character_name.strip():
+        avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
+    avatar_box = (20, 4, width - 20, height)
+    avatar_layer = _compose_avatar_layer(
+        panel_size,
+        avatar_image,
+        avatar_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+
+    strip = Image.new("RGBA", (width * 2, height), (0, 0, 0, 0))
+    strip.paste(old_background_layer, (0, 0), old_background_layer)
+    strip.paste(new_background_layer, (width, 0), new_background_layer)
+
+    def _frame_at(offset_x: int) -> "Image.Image":
+        clamped_offset = max(0, min(width, offset_x))
+        frame = strip.crop((clamped_offset, 0, clamped_offset + width, height)).convert("RGBA")
+        if avatar_layer is not None:
+            frame.alpha_composite(avatar_layer)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+    frames.append(_gif_frame_from_rgba(_frame_at(0)))
+    durations.append(max(0, int(initial_hold_ms)))
+
+    travel_frames = max(2, int(round((max(0, travel_ms) / 1000.0) * BG_GIF_ANIMATION_FPS)))
+    travel_frame_ms = max(20, int(round(travel_ms / travel_frames))) if travel_ms > 0 else 20
+    for frame_index in range(1, travel_frames):
+        progress = _ease_in_out(frame_index / (travel_frames - 1))
+        offset_x = int(round(width * progress))
+        frames.append(_gif_frame_from_rgba(_frame_at(offset_x)))
+        durations.append(travel_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_frame_at(width)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
+def render_appearance_transition_panel_gif(
+    *,
+    state: Optional[TransformationState],
+    background_user_id: int,
+    filename: str = "appearance_transition.gif",
+    before_avatar_image: Optional["Image.Image"] = None,
+    after_avatar_image: Optional["Image.Image"] = None,
+    selection_scope: Optional[str] = None,
+    panel_size: Tuple[int, int] = APPEARANCE_TRANSITION_PANEL_SIZE,
+    fit_avatar_width: bool = False,
+    initial_hold_ms: int = APPEARANCE_GIF_INITIAL_HOLD_MS,
+    crossfade_ms: int = APPEARANCE_GIF_CROSSFADE_MS,
+    final_hold_ms: int = APPEARANCE_GIF_FINAL_HOLD_MS,
+) -> Optional[discord.File]:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    background_path = get_selected_background_path(background_user_id)
+    base = compose_background_layer(panel_size, background_path)
+    if base is None:
+        return None
+
+    width, height = panel_size
+    avatar_box = (20, 4, width - 20, height)
+
+    if after_avatar_image is None and state is not None and state.character_name.strip():
+        after_avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
+
+    before_layer = _compose_avatar_layer(
+        panel_size,
+        before_avatar_image,
+        avatar_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    after_layer = _compose_avatar_layer(
+        panel_size,
+        after_avatar_image,
+        avatar_box,
+        fit_width=fit_avatar_width,
+        clip_to_box=fit_avatar_width,
+    )
+    if before_layer is None and after_layer is None:
+        return None
+
+    before_anchor = _layer_anchor(before_layer)
+    after_anchor = _layer_anchor(after_layer)
+    shared_anchor = after_anchor or before_anchor
+    if shared_anchor is not None:
+        if before_layer is not None:
+            before_layer = _transform_layer(
+                before_layer,
+                canvas_size=panel_size,
+                center_x=shared_anchor[0],
+                bottom_y=shared_anchor[1],
+            )
+        if after_layer is not None:
+            after_layer = _transform_layer(
+                after_layer,
+                canvas_size=panel_size,
+                center_x=shared_anchor[0],
+                bottom_y=shared_anchor[1],
+            )
+
+    def _frame_for_progress(progress: float) -> "Image.Image":
+        frame = base.copy()
+        reveal_height = max(0, min(height, int(round(height * progress))))
+        if before_layer is not None:
+            remaining_before = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+            if reveal_height < height:
+                bottom_slice = before_layer.crop((0, reveal_height, width, height))
+                remaining_before.paste(bottom_slice, (0, reveal_height), bottom_slice)
+            frame.alpha_composite(remaining_before)
+        if after_layer is not None and reveal_height > 0:
+            revealed_after = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+            top_slice = after_layer.crop((0, 0, width, reveal_height))
+            revealed_after.paste(top_slice, (0, 0), top_slice)
+            frame.alpha_composite(revealed_after)
+        return frame
+
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    frames.append(_gif_frame_from_rgba(_frame_for_progress(0.0)))
+    durations.append(max(0, int(initial_hold_ms)))
+
+    crossfade_frames = max(2, int(round((max(0, crossfade_ms) / 1000.0) * APPEARANCE_GIF_ANIMATION_FPS)))
+    crossfade_frame_ms = max(20, int(round(crossfade_ms / crossfade_frames))) if crossfade_ms > 0 else 20
+    for frame_index in range(1, crossfade_frames):
+        progress = _ease_in_out(frame_index / (crossfade_frames - 1))
+        frames.append(_gif_frame_from_rgba(_frame_for_progress(progress)))
+        durations.append(crossfade_frame_ms)
+
+    frames.append(_gif_frame_from_rgba(_frame_for_progress(1.0)))
+    durations.append(max(0, int(final_hold_ms)))
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=1,
+        optimize=False,
+        disposal=2,
+    )
+    output.seek(0)
+    return discord.File(fp=output, filename=filename)
+
+
 def render_vn_panel(
     *,
     state: TransformationState,
@@ -3210,40 +5506,17 @@ def render_vn_panel(
             selection_scope=selection_scope,
         )
     if avatar_image is not None and avatar_box:
-        cropped = _crop_transparent_vertical(avatar_image)
-        base_scale = max(VN_AVATAR_SCALE, 0.01)
-        if base_scale != 1.0:
-            scaled_width = max(1, int(cropped.width * base_scale))
-            scaled_height = max(1, int(cropped.height * base_scale))
-            cropped = cropped.resize((scaled_width, scaled_height), Image.LANCZOS)
-
-        fit_scale = min(
-            avatar_width / cropped.width if cropped.width else 1.0,
-            avatar_height / cropped.height if cropped.height else 1.0,
-            1.0,
-        )
-        if fit_scale < 1.0:
-            scaled_width = max(1, int(cropped.width * fit_scale))
-            scaled_height = max(1, int(cropped.height * fit_scale))
-            cropped = cropped.resize((scaled_width, scaled_height), Image.LANCZOS)
-
-        canvas = Image.new("RGBA", (avatar_width, avatar_height), (0, 0, 0, 0))
-        offset_x = max(0, (avatar_width - cropped.width) // 2)
-        # align sprite bottom with panel bottom; keep centered horizontally
-        offset_y = max(0, avatar_height - cropped.height)
-        canvas.paste(cropped, (offset_x, offset_y), cropped)
-
+        _paste_avatar_into_box(base, avatar_image, avatar_box)
         pos_x = avatar_box[0]
         pos_y = avatar_box[1]
-        base.paste(canvas, (pos_x, pos_y), canvas)
         logger.debug(
             "VN sprite: pasted avatar for %s at (%s, %s) size %s (base_scale=%s fit_scale=%s)",
             state.character_name,
             pos_x,
             pos_y,
-            canvas.size,
-            base_scale,
-            fit_scale,
+            (avatar_width, avatar_height),
+            max(VN_AVATAR_SCALE, 0.01),
+            "auto",
         )
     elif avatar_box:
         logger.warning(
@@ -3533,6 +5806,16 @@ def render_vn_panel(
     if border_img is not None:
         base = Image.alpha_composite(base, border_img)
 
+    if _DEVICE_HOLDER_USER_IDS_BY_GUILD.get(state.guild_id) == state.user_id:
+        remote_img = assets.get("remote")
+        if remote_img is not None:
+            if remote_img.size == base.size:
+                base = Image.alpha_composite(base, remote_img)
+            else:
+                remote_x = max(0, base.width - remote_img.width)
+                remote_y = 0
+                base.alpha_composite(remote_img, (remote_x, remote_y))
+
     output = io.BytesIO()
     base.save(output, format="PNG")
     output.seek(0)
@@ -3645,6 +5928,7 @@ __all__ = [
     "VN_BASE_IMAGE",
     "VN_NAME_DEFAULT_COLOR",
     "VN_BACKGROUND_ROOT",
+    "get_background_root",
     "vn_outfit_selection",
     "background_selections",
     "load_outfit_selections",
@@ -3654,6 +5938,7 @@ __all__ = [
     "list_background_choices",
     "get_selected_background_path",
     "set_selected_background",
+    "set_device_holder_user_ids_by_guild",
     "compose_background_layer",
     "resolve_panel_layout",
     "compose_game_avatar",
@@ -3678,6 +5963,17 @@ __all__ = [
     "parse_discord_formatting",
     "layout_formatted_text",
     "render_vn_panel",
+    "render_tf_split_panel",
+    "render_tf_split_panel_gif",
+    "render_swap_transition_panel",
+    "render_swap_transition_panel_gif",
+    "render_clone_transition_panel_gif",
+    "render_mass_reroll_transition_panel_gif",
+    "render_mass_swap_transition_panel_gif",
+    "render_background_transition_panel_gif",
+    "render_device_swap_transition_panel_gif",
+    "render_device_reroll_transition_panel_gif",
+    "render_appearance_transition_panel_gif",
     "fetch_avatar_bytes",
     "prepare_custom_emoji_images",
 ]

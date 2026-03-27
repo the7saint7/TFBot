@@ -1123,12 +1123,13 @@ class GameBoardManager:
     def _get_game_background_path(self, background_id: Optional[int]) -> Optional[Path]:
         """Get background path from background_id index."""
         # Import here to avoid circular dependency
-        from tfbot.panels import list_background_choices, VN_BACKGROUND_ROOT, VN_BACKGROUND_DEFAULT_RELATIVE
+        from tfbot.panels import get_background_root, list_background_choices, VN_BACKGROUND_DEFAULT_RELATIVE
         
         if background_id is None:
             # Use default background when background_id is None
-            if VN_BACKGROUND_ROOT and VN_BACKGROUND_DEFAULT_RELATIVE:
-                default_path = VN_BACKGROUND_ROOT / VN_BACKGROUND_DEFAULT_RELATIVE
+            bg_root = get_background_root()
+            if bg_root and VN_BACKGROUND_DEFAULT_RELATIVE:
+                default_path = bg_root / VN_BACKGROUND_DEFAULT_RELATIVE
                 if default_path.exists():
                     return default_path
             return None
@@ -1138,8 +1139,9 @@ class GameBoardManager:
             return backgrounds[background_id - 1]  # 1-indexed
         
         # Fall back to default (not first VN background)
-        if VN_BACKGROUND_ROOT and VN_BACKGROUND_DEFAULT_RELATIVE:
-            default_path = VN_BACKGROUND_ROOT / VN_BACKGROUND_DEFAULT_RELATIVE
+        bg_root = get_background_root()
+        if bg_root and VN_BACKGROUND_DEFAULT_RELATIVE:
+            default_path = bg_root / VN_BACKGROUND_DEFAULT_RELATIVE
             if default_path.exists():
                 return default_path
         
@@ -5507,6 +5509,10 @@ class GameBoardManager:
             # Swap TransformationState objects in game_state.player_states (preserve user identity)
             state1 = game_state.player_states.get(resolved_member1.id)
             state2 = game_state.player_states.get(resolved_member2.id)
+            new_state1 = state1
+            new_state2 = state2
+            new_state1 = state1
+            new_state2 = state2
             
             if state1 and state2:
                 # Extract character data from both states
@@ -5634,7 +5640,41 @@ class GameBoardManager:
             
             # Auto-save after characters are swapped
             await self._save_auto_save(game_state, ctx)
-            await ctx.reply(f"Swapped characters and positions: {resolved_member1.display_name} ↔ {resolved_member2.display_name}", mention_author=False)
+            from tfbot.panels import render_swap_transition_panel, render_swap_transition_panel_gif
+
+            left_label = f"{(new_state1.character_name if new_state1 and new_state1.character_name else resolved_member1.display_name)}({resolved_member1.display_name})"
+            right_label = f"{(new_state2.character_name if new_state2 and new_state2.character_name else resolved_member2.display_name)}({resolved_member2.display_name})"
+            message_text = f"<@{ctx.author.id}> swapped {left_label} with {right_label}"
+            transition_file = render_swap_transition_panel_gif(
+                before_left_state=state1,
+                before_right_state=state2,
+                after_left_state=new_state1,
+                after_right_state=new_state2,
+                left_background_user_id=resolved_member1.id,
+                right_background_user_id=resolved_member2.id,
+                filename=f"swap_{resolved_member1.id}_{resolved_member2.id}.gif",
+            )
+            if transition_file is None:
+                transition_file = render_swap_transition_panel(
+                    left_state=new_state1,
+                    right_state=new_state2,
+                    left_background_user_id=resolved_member1.id,
+                    right_background_user_id=resolved_member2.id,
+                    filename=f"swap_{resolved_member1.id}_{resolved_member2.id}.png",
+                )
+            if transition_file is not None:
+                await ctx.reply(
+                    content=message_text,
+                    file=transition_file,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await ctx.reply(
+                    message_text,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             await self._log_action(game_state, f"{resolved_member1.display_name} and {resolved_member2.display_name} swapped characters and positions")
         
         await self._execute_gameboard_command(ctx, _impl)
@@ -5845,7 +5885,41 @@ class GameBoardManager:
             
             # Auto-save after characters are swapped
             await self._save_auto_save(game_state, ctx)
-            await ctx.reply(f"Permanently swapped characters and positions: {resolved_member1.display_name} ↔ {resolved_member2.display_name}", mention_author=False)
+            from tfbot.panels import render_swap_transition_panel, render_swap_transition_panel_gif
+
+            left_label = f"{(new_state1.character_name if new_state1 and new_state1.character_name else resolved_member1.display_name)}({resolved_member1.display_name})"
+            right_label = f"{(new_state2.character_name if new_state2 and new_state2.character_name else resolved_member2.display_name)}({resolved_member2.display_name})"
+            message_text = f"<@{ctx.author.id}> permanently swapped {left_label} with {right_label}"
+            transition_file = render_swap_transition_panel_gif(
+                before_left_state=state1,
+                before_right_state=state2,
+                after_left_state=new_state1,
+                after_right_state=new_state2,
+                left_background_user_id=resolved_member1.id,
+                right_background_user_id=resolved_member2.id,
+                filename=f"pswap_{resolved_member1.id}_{resolved_member2.id}.gif",
+            )
+            if transition_file is None:
+                transition_file = render_swap_transition_panel(
+                    left_state=new_state1,
+                    right_state=new_state2,
+                    left_background_user_id=resolved_member1.id,
+                    right_background_user_id=resolved_member2.id,
+                    filename=f"pswap_{resolved_member1.id}_{resolved_member2.id}.png",
+                )
+            if transition_file is not None:
+                await ctx.reply(
+                    content=message_text,
+                    file=transition_file,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await ctx.reply(
+                    message_text,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             await self._log_action(game_state, f"{resolved_member1.display_name} and {resolved_member2.display_name} permanently swapped characters and positions")
         
         await self._execute_gameboard_command(ctx, _impl)
@@ -6985,7 +7059,7 @@ class GameBoardManager:
 
     async def command_bg_list(self, ctx: commands.Context) -> None:
         """List available backgrounds (game-specific, isolated from global VN). DMs the GM like VN mode."""
-        from tfbot.panels import list_background_choices, VN_BACKGROUND_ROOT, VN_BACKGROUND_DEFAULT_RELATIVE
+        from tfbot.panels import get_background_root, list_background_choices, VN_BACKGROUND_DEFAULT_RELATIVE
         
         game_state = await self._get_game_state_for_context(ctx)
         if not game_state:
@@ -7005,7 +7079,8 @@ class GameBoardManager:
                 await ctx.reply("Only the GM can view the background list.", mention_author=False)
                 return
         
-        if VN_BACKGROUND_ROOT is None:
+        bg_root = get_background_root()
+        if bg_root is None:
             try:
                 await gm_user.send("Backgrounds are not configured on this bot.")
             except discord.Forbidden:
@@ -7025,8 +7100,8 @@ class GameBoardManager:
         lines: list[str] = []
         for idx, path in enumerate(choices, start=1):
             try:
-                if VN_BACKGROUND_ROOT:
-                    relative = path.resolve().relative_to(VN_BACKGROUND_ROOT.resolve())
+                if bg_root:
+                    relative = path.resolve().relative_to(bg_root.resolve())
                     display = relative.as_posix()
                 else:
                     display = path.name

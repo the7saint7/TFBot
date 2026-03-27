@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from .action_log import record_action_event
+
 if TYPE_CHECKING:
     import discord
     from discord.ext import commands
@@ -294,12 +296,29 @@ def register_bot_hooks(bot: "commands.Bot") -> None:
         try:
             if isinstance(error, commands.CommandNotFound):
                 return
-            if isinstance(error, commands.CheckFailure):
-                return
             log = logging.getLogger("tfbot")
             cmd_name = getattr(ctx.command, "qualified_name", None) or getattr(
                 ctx.command, "name", None
             )
+            message = getattr(ctx, "message", None)
+            invocation_text = getattr(message, "content", None)
+            status = "check_failed" if isinstance(error, commands.CheckFailure) else "error"
+            try:
+                record_action_event(
+                    status=status,
+                    source="prefix",
+                    command_display=cmd_name,
+                    invocation_text=invocation_text,
+                    invocation_id=str(getattr(message, "id", "")) or None,
+                    actor=getattr(ctx, "author", None),
+                    channel=getattr(ctx, "channel", None),
+                    guild=getattr(ctx, "guild", None),
+                    error=error,
+                )
+            except Exception:
+                pass
+            if isinstance(error, commands.CheckFailure):
+                return
             if isinstance(error, commands.CommandInvokeError):
                 orig = error.original
                 log.error(
@@ -320,17 +339,48 @@ def register_bot_hooks(bot: "commands.Bot") -> None:
     @bot.tree.interaction_check
     async def _session_err_interaction_check(interaction: discord.Interaction) -> bool:
         _arm_slash(interaction)
+        cmd = interaction.command
+        cmd_name = getattr(cmd, "qualified_name", None) or getattr(cmd, "name", None)
+        invocation_text = f"/{cmd_name}" if cmd_name else None
+        try:
+            record_action_event(
+                status="invoked",
+                source="slash",
+                command_display=cmd_name,
+                invocation_text=invocation_text,
+                invocation_id=str(getattr(interaction, "id", "")) or None,
+                actor=getattr(interaction, "user", None),
+                channel=getattr(interaction, "channel", None),
+                guild=getattr(interaction, "guild", None),
+            )
+        except Exception:
+            pass
         return True
 
     @bot.tree.error
     async def _session_err_app_command_error(
         interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        if isinstance(error, app_commands.CheckFailure):
-            return
         log = logging.getLogger("tfbot")
         cmd = interaction.command
         cmd_name = getattr(cmd, "qualified_name", None) or getattr(cmd, "name", None)
+        status = "check_failed" if isinstance(error, app_commands.CheckFailure) else "error"
+        try:
+            record_action_event(
+                status=status,
+                source="slash",
+                command_display=cmd_name,
+                invocation_text=f"/{cmd_name}" if cmd_name else None,
+                invocation_id=str(getattr(interaction, "id", "")) or None,
+                actor=getattr(interaction, "user", None),
+                channel=getattr(interaction, "channel", None),
+                guild=getattr(interaction, "guild", None),
+                error=error,
+            )
+        except Exception:
+            pass
+        if isinstance(error, app_commands.CheckFailure):
+            return
         if isinstance(error, app_commands.CommandInvokeError):
             orig = error.original
             log.error(

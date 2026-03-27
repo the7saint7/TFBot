@@ -26,3 +26,9 @@ tf_stats.json
 transform_replies.json
 tf_reroll.json
 games/states/
+vn_debug/
+DOCUMENTATION_ADDENDUM_TEST_LIVE.md
+RELEASE_NOTES_ADDENDUM_TEST_LIVE.md
+TF_COMMAND_INVENTORY.md
+TF_FEATURE_PROGRESS.md
+feature_backups/
