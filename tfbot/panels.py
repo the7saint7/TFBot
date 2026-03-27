@@ -2191,7 +2191,7 @@ def _compose_game_avatar_uncached(
         try:
             face_image = Image.open(face_path).convert("RGBA")
             _dump_compose_debug_image(debug_dir, "04_face_source", face_image)
-            outfit_image.paste(face_image, (0, 0), face_image)
+            outfit_image = _alpha_composite_same_canvas(outfit_image, face_image)
             _dump_compose_debug_image(debug_dir, "05_after_face", outfit_image)
         except OSError as exc:
             logger.error(
@@ -2611,6 +2611,23 @@ def _select_face_path(variant_dir: Path) -> Optional[Path]:
             if face.stem.lower() == preferred_face_stem:
                 return face
     return faces[0]
+
+
+def _alpha_composite_same_canvas(
+    base_image: "Image.Image",
+    overlay_image: "Image.Image",
+) -> "Image.Image":
+    try:
+        from PIL import Image
+    except ImportError:
+        return base_image
+    base_rgba = base_image.convert("RGBA")
+    overlay_rgba = overlay_image.convert("RGBA")
+    if overlay_rgba.size != base_rgba.size:
+        overlay_canvas = Image.new("RGBA", base_rgba.size, (0, 0, 0, 0))
+        overlay_canvas.alpha_composite(overlay_rgba)
+        overlay_rgba = overlay_canvas
+    return Image.alpha_composite(base_rgba, overlay_rgba)
 
 
 def _parse_hex_color(raw_color: str) -> Optional[Tuple[int, int, int, int]]:

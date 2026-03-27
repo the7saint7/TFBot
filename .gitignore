@@ -32,3 +32,4 @@ RELEASE_NOTES_ADDENDUM_TEST_LIVE.md
 TF_COMMAND_INVENTORY.md
 TF_FEATURE_PROGRESS.md
 feature_backups/
+overlay_state.json
