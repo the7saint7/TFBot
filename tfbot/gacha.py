@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections import deque
 from datetime import timedelta
 from io import BytesIO
@@ -21,6 +22,7 @@ from discord.abc import Messageable
 from discord.ext import commands
 
 from tfbot.models import TFCharacter, TransformationState
+from tfbot.panel_executor import run_panel_render_vn
 from tfbot.panels import compose_game_avatar, list_pose_outfits, render_vn_panel
 from tfbot.utils import float_from_env, int_from_env, is_admin, path_from_env, utc_now
 
@@ -1066,7 +1068,9 @@ class GachaManager:
             gacha_pose_override=selected_combo.pose if selected_combo else None,
         )
 
-        panel_file = self._build_panel_file(**panel_kwargs)
+        panel_file = await run_panel_render_vn(
+            functools.partial(self._build_panel_file, **panel_kwargs)
+        )
         if panel_file is None:
             await self._relay(
                 message,

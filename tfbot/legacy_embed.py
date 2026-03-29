@@ -16,8 +16,14 @@ from tfbot.utils import utc_now
 async def build_legacy_embed(
     state: TransformationState,
     description: str,
+    *,
+    selection_scope: Optional[str] = None,
 ) -> Tuple[discord.Embed, Optional[discord.File]]:
-    """Return the classic embed representation and optional avatar attachment."""
+    """Return the classic embed representation and optional avatar attachment.
+
+    selection_scope: pass clone-composite scope from _selection_scope_for_state so Pillow avatars
+    match vn_outfit_selection keys for clone overlays.
+    """
     embed_color = 0x9B59B6
     character_name_normalized = (state.character_name or "").strip().lower()
     if state.is_inanimate and character_name_normalized == "ball":
@@ -33,7 +39,7 @@ async def build_legacy_embed(
     avatar_file: Optional[discord.File] = None
     avatar_bytes: Optional[bytes] = None
     if getattr(state, "is_pillow", False):
-        avatar_image = compose_state_avatar_image(state)
+        avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
         if avatar_image is not None:
             buffer = io.BytesIO()
             avatar_image.save(buffer, format="PNG")

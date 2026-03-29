@@ -39,20 +39,40 @@ class InteractionContextAdapter:
         ephemeral = kwargs.pop("ephemeral", self.default_ephemeral)
 
         destination = self.channel if isinstance(self.channel, discord.abc.Messageable) else None
-        if reference is not None or delete_after:
+        # After defer(), channel.send does not complete the interaction (client shows failure).
+        can_use_channel = not self.interaction.response.is_done()
+        if can_use_channel and (reference is not None or delete_after):
             if destination is not None:
-                await destination.send(*args, reference=reference, delete_after=delete_after, **kwargs)
+                await destination.send(
+                    *args,
+                    reference=reference,
+                    delete_after=delete_after,
+                    **kwargs,
+                )
             else:
                 if not self.interaction.response.is_done():
                     await self.interaction.response.defer(ephemeral=ephemeral)
-                await self.interaction.followup.send(*args, ephemeral=ephemeral, **kwargs)
+                await self.interaction.followup.send(
+                    *args,
+                    ephemeral=ephemeral,
+                    **kwargs,
+                )
             self._responded = True
             self._responded_flag = True
             return
 
         if not self.interaction.response.is_done():
             await self.interaction.response.defer(ephemeral=ephemeral)
-        await self.interaction.followup.send(*args, ephemeral=ephemeral, **kwargs)
+        sent = await self.interaction.followup.send(
+            *args,
+            ephemeral=ephemeral,
+            **kwargs,
+        )
+        if delete_after and sent is not None:
+            try:
+                await sent.delete(delay=delete_after)
+            except (discord.HTTPException, discord.Forbidden, TypeError):
+                pass
         self._responded = True
         self._responded_flag = True
 

@@ -12,6 +12,7 @@ import random
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
@@ -24,9 +25,145 @@ import aiohttp
 import discord
 
 from tfbot.models import OutfitAsset, ReplyContext, TransformationState
-from tfbot.utils import float_from_env, normalize_pose_name, path_from_env, utc_now
+from tfbot.utils import float_from_env, int_from_env, normalize_pose_name, path_from_env, utc_now
+from .animation_perf_log import log_event as log_animation_perf_event
+from tfbot.transition_constants import (
+    APPEARANCE_GIF_ANIMATION_FPS,
+    APPEARANCE_GIF_CROSSFADE_MS,
+    APPEARANCE_GIF_FINAL_HOLD_MS,
+    APPEARANCE_GIF_INITIAL_HOLD_MS,
+    APPEARANCE_GIF_MAX_FRAMES,
+    APPEARANCE_TRANSITION_PANEL_SIZE,
+    BG_GIF_ANIMATION_FPS,
+    BG_GIF_FINAL_HOLD_MS,
+    BG_GIF_INITIAL_HOLD_MS,
+    BG_GIF_MAX_FRAMES,
+    BG_GIF_TRAVEL_MS,
+    BG_TRANSITION_PANEL_SIZE,
+    COLOR_PARITY_ENABLED,
+    COLOR_PARITY_EXCLUDED_LABELS,
+    COLOR_PARITY_LABELS,
+    DEVICE_GIF_ADAPTIVE_COLOR_STEP,
+    DEVICE_GIF_ADAPTIVE_MAX_ATTEMPTS,
+    DEVICE_GIF_ADAPTIVE_MIN_COLORS,
+    DEVICE_GIF_INCLUDE_PARTICLES,
+    DEVICE_GIF_TARGET_BYTES,
+    DEVICE_GIF_USE_SHARED_PALETTE,
+    DEVICE_REROLL_GIF_ANIMATION_FPS,
+    DEVICE_REROLL_GIF_EFFECT_MS,
+    DEVICE_REROLL_GIF_FINAL_HOLD_MS,
+    DEVICE_REROLL_GIF_INITIAL_HOLD_MS,
+    DEVICE_REROLL_GIF_MAX_FRAMES,
+    DEVICE_REROLL_INCLUDE_PARTICLES,
+    DEVICE_SWAP_GIF_ANIMATION_FPS,
+    DEVICE_SWAP_GIF_EFFECT_MS,
+    DEVICE_SWAP_GIF_FINAL_HOLD_MS,
+    DEVICE_SWAP_GIF_INITIAL_HOLD_MS,
+    DEVICE_SWAP_GIF_MAX_FRAMES,
+    DEVICE_SWAP_PARTICLE_ALPHA,
+    DEVICE_SWAP_PARTICLE_COUNT,
+    DEVICE_SWAP_PARTICLE_GRID,
+    DEVICE_SWAP_WASH_ALPHA,
+    GIF_ADAPTIVE_COLOR_STEP,
+    GIF_ADAPTIVE_COLOR_STEP_COLOR_PARITY,
+    GIF_ADAPTIVE_MAX_ATTEMPTS,
+    GIF_ADAPTIVE_MIN_COLORS,
+    GIF_ADAPTIVE_MIN_COLORS_COLOR_PARITY,
+    GIF_COLORS,
+    GIF_DITHER_MODE,
+    GIF_POST_OPTIMIZER,
+    GIF_POST_OPTIMIZER_LOSSY,
+    GIF_POST_OPTIMIZER_TIMEOUT_MS,
+    GIF_PREFILTER_RESAMPLE,
+    GIF_PREFILTER_SCALE,
+    GIF_QUANTIZE_METHOD,
+    GIF_SHARED_PALETTE,
+    GIF_SHARED_PALETTE_SAMPLES,
+    GIF_TARGET_BYTES,
+    GIF_TARGET_BYTES_COLOR_PARITY,
+    MASS_REROLL_BACKGROUND_NUMBER,
+    MASS_REROLL_GIF_ANIMATION_FPS,
+    MASS_REROLL_GIF_FINAL_HOLD_MS,
+    MASS_REROLL_GIF_INITIAL_HOLD_MS,
+    MASS_REROLL_GIF_MAX_FRAMES,
+    MASS_REROLL_GIF_TRANSITION_MS,
+    MASS_REROLL_STAGE_COUNT,
+    MASS_SWAP_BACKGROUND_NUMBER,
+    MASS_SWAP_GIF_ANIMATION_FPS,
+    MASS_SWAP_GIF_EXIT_MS,
+    MASS_SWAP_GIF_FINAL_HOLD_MS,
+    MASS_SWAP_GIF_MAX_FRAMES,
+    MASS_SWAP_GIF_WANDER_MS,
+    MASS_SWAP_GHOST_ALPHA,
+    MASS_SWAP_GHOST_MAX_HEIGHT,
+    REROLL_GIF_ANIMATION_FPS,
+    REROLL_GIF_BOTH_SILHOUETTES_HOLD_MS,
+    REROLL_GIF_FINAL_HOLD_MS,
+    REROLL_GIF_MAX_FRAMES,
+    REROLL_GIF_NEW_OVERLAY_ALPHA,
+    REROLL_GIF_NEW_REVEAL_MS,
+    REROLL_GIF_NEW_SILHOUETTE_HOLD_MS,
+    REROLL_GIF_OLD_SILHOUETTE_FADE_MS,
+    REROLL_GIF_OLD_SILHOUETTE_HOLD_MS,
+    REROLL_GIF_OLD_TO_SILHOUETTE_MS,
+    REROLL_GIF_ORIGINAL_HOLD_MS,
+    REROLL_PANEL_SIZE,
+    SWAP_GIF_ANIMATION_FPS,
+    SWAP_GIF_FINAL_HOLD_MS,
+    SWAP_GIF_GHOST_ALPHA,
+    SWAP_GIF_GHOST_APPEAR_MS,
+    SWAP_GIF_GHOST_DISSOLVE_MS,
+    SWAP_GIF_GHOST_END_SCALE,
+    SWAP_GIF_GHOST_OFFSET_X,
+    SWAP_GIF_INITIAL_HOLD_MS,
+    SWAP_GIF_MAX_FRAMES,
+    SWAP_GIF_TRAVEL_MS,
+    TRANSITION_ALLOW_GIF_PRIMARY,
+    TRANSITION_FALLBACK_FORMAT,
+    TRANSITION_PRIMARY_FORMAT,
+    WEBP_ALPHA_QUALITY,
+    WEBP_ALPHA_QUALITY_COLOR_PARITY,
+    WEBP_CALIBRATION_BACKEND,
+    WEBP_FAST_MAX_ATTEMPTS,
+    WEBP_FAST_METHOD,
+    WEBP_FAST_MIN_QUALITY,
+    WEBP_FAST_TRANSITION_LABELS,
+    WEBP_LOSSLESS,
+    WEBP_MAX_ATTEMPTS,
+    WEBP_MAX_ATTEMPTS_MASS,
+    WEBP_MAX_OVERRUN_RATIO,
+    WEBP_MAX_OVERRUN_RATIO_COLOR_PARITY,
+    WEBP_MAX_OVERRUN_RATIO_DEVICE,
+    WEBP_METHOD,
+    WEBP_MIN_QUALITY,
+    WEBP_MIN_QUALITY_COLOR_PARITY,
+    WEBP_MIN_QUALITY_MASS,
+    WEBP_QUALITY,
+    WEBP_QUALITY_GUARDRAILS,
+    WEBP_QUALITY_STEP,
+    WEBP_QUALITY_STEP_MASS,
+    WEBP_TARGET_BYTES,
+    WEBP_TARGET_BYTES_COLOR_PARITY,
+    WEBP_TARGET_BYTES_DEVICE,
+    WEBP_TARGET_BYTES_MASS,
+    WEBP_TARGET_BYTES_STANDARD,
+    WEBP_TARGET_HARD_RATIO,
+    WEBP_TARGET_HARD_RATIO_MASS,
+    WEBP_TARGET_SOFT_RATIO,
+    TRANSITION_ENCODE_MAX_TOTAL_FRAMES,
+    TRANSITION_GIF_FALLBACK,
+    WEBP_ANIMATED_HARD_MAX_BYTES,
+    WEBP_TARGET_SOFT_RATIO_MASS,
+)
 
 logger = logging.getLogger("tfbot.panels")
+
+# Animated transitions encode as WebP first; GIF is fallback only (see _encode_transition_payload).
+if WEBP_CALIBRATION_BACKEND not in {"off", ""}:
+    logger.info(
+        "WEBP calibration backend '%s' requested; runtime path remains Pillow-first unless explicitly wired.",
+        WEBP_CALIBRATION_BACKEND,
+    )
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 BASE_DIR = PACKAGE_DIR.parent
@@ -51,6 +188,7 @@ _FONT_STYLE_PATHS: Dict[str, Optional[Path]] = {
 
 VN_NAME_FONT_SIZE = int(os.getenv("TFBOT_VN_NAME_SIZE", "34"))
 VN_TEXT_FONT_SIZE = int(os.getenv("TFBOT_VN_TEXT_SIZE", "26"))
+VN_BIG_EMOJI_MAX_PX = max(VN_TEXT_FONT_SIZE, int_from_env("TFBOT_VN_BIG_EMOJI_MAX_PX", 128))
 VN_GAME_ROOT = (
     Path(os.getenv("TFBOT_VN_GAME_ROOT", "")).expanduser().resolve()
     if os.getenv("TFBOT_VN_GAME_ROOT")
@@ -73,58 +211,21 @@ VN_DEFAULT_OUTFIT = os.getenv("TFBOT_VN_OUTFIT", "casual.png")
 VN_DEFAULT_FACE = os.getenv("TFBOT_VN_FACE", "0.png")
 VN_AVATAR_MODE = os.getenv("TFBOT_VN_AVATAR_MODE", "game").lower()
 VN_AVATAR_SCALE = max(0.1, float_from_env("TFBOT_VN_AVATAR_SCALE", 1.0))
-REROLL_GIF_ORIGINAL_HOLD_MS = 1500
-REROLL_GIF_OLD_TO_SILHOUETTE_MS = 750
-REROLL_GIF_OLD_SILHOUETTE_HOLD_MS = 1000
-REROLL_GIF_BOTH_SILHOUETTES_HOLD_MS = 250
-REROLL_GIF_OLD_SILHOUETTE_FADE_MS = 550
-REROLL_GIF_NEW_SILHOUETTE_HOLD_MS = 550
-REROLL_GIF_NEW_REVEAL_MS = 750
-REROLL_GIF_FINAL_HOLD_MS = 250
-REROLL_GIF_ANIMATION_FPS = 24
-REROLL_GIF_NEW_OVERLAY_ALPHA = 170
-REROLL_PANEL_SIZE_LEGACY: Tuple[int, int] = (300, 190)
-REROLL_PANEL_SIZE: Tuple[int, int] = (800, 250)
-SWAP_GIF_INITIAL_HOLD_MS = 900
-SWAP_GIF_GHOST_APPEAR_MS = 900
-SWAP_GIF_TRAVEL_MS = 2400
-SWAP_GIF_GHOST_DISSOLVE_MS = 700
-SWAP_GIF_FINAL_HOLD_MS = 450
-SWAP_GIF_ANIMATION_FPS = 20
-SWAP_GIF_GHOST_ALPHA = 150
-SWAP_GIF_GHOST_OFFSET_X = 36
-SWAP_GIF_GHOST_END_SCALE = 0.2
-DEVICE_SWAP_GIF_INITIAL_HOLD_MS = 700
-DEVICE_SWAP_GIF_EFFECT_MS = 5000
-DEVICE_SWAP_GIF_FINAL_HOLD_MS = 500
-DEVICE_SWAP_GIF_ANIMATION_FPS = 16
-DEVICE_SWAP_PARTICLE_COUNT = 50
-DEVICE_SWAP_PARTICLE_ALPHA = 210
-DEVICE_SWAP_WASH_ALPHA = 0
-BG_TRANSITION_PANEL_SIZE: Tuple[int, int] = (350, 250)
-BG_GIF_INITIAL_HOLD_MS = 300
-BG_GIF_TRAVEL_MS = 1200
-BG_GIF_FINAL_HOLD_MS = 300
-BG_GIF_ANIMATION_FPS = 20
-APPEARANCE_TRANSITION_PANEL_SIZE_LEGACY: Tuple[int, int] = (350, 190)
-APPEARANCE_TRANSITION_PANEL_SIZE: Tuple[int, int] = (800, 250)
-APPEARANCE_GIF_INITIAL_HOLD_MS = 250
-APPEARANCE_GIF_CROSSFADE_MS = 1400
-APPEARANCE_GIF_FINAL_HOLD_MS = 250
-MASS_SWAP_BACKGROUND_NUMBER = 430
-MASS_SWAP_GIF_WANDER_MS = 3000
-MASS_SWAP_GIF_EXIT_MS = 700
-MASS_SWAP_GIF_FINAL_HOLD_MS = 250
-MASS_SWAP_GIF_ANIMATION_FPS = 18
-MASS_SWAP_GHOST_ALPHA = 195
-MASS_SWAP_GHOST_MAX_HEIGHT = 225
-MASS_REROLL_BACKGROUND_NUMBER = 430
-MASS_REROLL_GIF_INITIAL_HOLD_MS = 350
-MASS_REROLL_GIF_TRANSITION_MS = 700
-MASS_REROLL_GIF_FINAL_HOLD_MS = 350
-MASS_REROLL_GIF_ANIMATION_FPS = 18
-MASS_REROLL_STAGE_COUNT = 3
-APPEARANCE_GIF_ANIMATION_FPS = 20
+VN_MASK_GUIDE_ENABLED = os.getenv("TFBOT_VN_MASK_GUIDE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+_VN_MASK_GUIDE_PATH_SETTING = os.getenv("TFBOT_VN_MASK_GUIDE_PATH", "vn_assets/vn_mask.webp").strip()
+VN_MASK_GUIDE_THRESHOLD = max(1, min(255, int_from_env("TFBOT_VN_MASK_GUIDE_THRESHOLD", 200)))
+VN_MASK_GUIDE_DEBUG = os.getenv("TFBOT_VN_MASK_GUIDE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+VN_MASK_VISIBLE_ALPHA_THRESHOLD = max(0, min(254, int_from_env("TFBOT_VN_MASK_VISIBLE_ALPHA_THRESHOLD", 12)))
+# Tune this single value during live testing if edges look too soft/hard.
+SPRITE_EDGE_AA_STRENGTH = 0.32
+if _VN_MASK_GUIDE_PATH_SETTING:
+    _vn_mask_guide_path = Path(_VN_MASK_GUIDE_PATH_SETTING)
+    if not _vn_mask_guide_path.is_absolute():
+        VN_MASK_GUIDE_PATH = (BASE_DIR / _vn_mask_guide_path).resolve()
+    else:
+        VN_MASK_GUIDE_PATH = _vn_mask_guide_path.resolve()
+else:
+    VN_MASK_GUIDE_PATH = None
 _VN_BG_ROOT_SETTING = os.getenv("TFBOT_VN_BG_ROOT", "").strip()
 _VN_BG_DEFAULT_SETTING = os.getenv("TFBOT_VN_BG_DEFAULT", "school/cafeteria.png").strip()
 VN_BACKGROUND_DEFAULT_RELATIVE = Path(_VN_BG_DEFAULT_SETTING) if _VN_BG_DEFAULT_SETTING else None
@@ -200,6 +301,10 @@ if _VN_CACHE_DIR_SETTING:
         VN_CACHE_DIR = _vn_cache_path.resolve()
 else:
     VN_CACHE_DIR = None
+
+_BG_LAYER_CACHE_LIMIT = max(16, int(os.environ.get("TFBOT_BG_LAYER_CACHE_LIMIT", "96")))
+_BG_LAYER_CACHE: "OrderedDict[Tuple[str, int, int, int], Image.Image]" = OrderedDict()
+_BG_LAYER_CACHE_LOCK = threading.Lock()
 
 # Face cache directory for pre-cached detected faces
 # Must be in the characters_repo git repository
@@ -684,6 +789,77 @@ def resolve_panel_layout(character_name: str) -> Optional[Dict]:
         return None
     return _PANEL_LAYOUT_OVERRIDES.get(key)
 
+
+@lru_cache(maxsize=4)
+def _load_vn_mask_guide_image(
+    panel_size: Tuple[int, int],
+    mask_path: str,
+    threshold: int,
+) -> Optional["Image.Image"]:
+    if not mask_path:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    mask_file = Path(mask_path)
+    if not mask_file.exists():
+        logger.warning("VN mask guide missing at %s; using default avatar placement.", mask_file)
+        return None
+    try:
+        with Image.open(mask_file) as mask_src:
+            mask = mask_src.convert("L")
+    except OSError as exc:
+        logger.warning("VN mask guide failed to load at %s: %s", mask_file, exc)
+        return None
+    if mask.size != panel_size:
+        logger.warning(
+            "VN mask guide size mismatch %s (expected %s); using default avatar placement.",
+            mask.size,
+            panel_size,
+        )
+        return None
+    binary = mask.point(lambda px: 255 if px >= threshold else 0, mode="L")
+    return binary
+
+
+@lru_cache(maxsize=64)
+def _resolve_vn_mask_allowed_rows(
+    panel_size: Tuple[int, int],
+    box: Tuple[int, int, int, int],
+) -> Optional[Tuple[Optional[Tuple[int, int]], ...]]:
+    if not VN_MASK_GUIDE_ENABLED or VN_MASK_GUIDE_PATH is None:
+        return None
+    mask = _load_vn_mask_guide_image(panel_size, str(VN_MASK_GUIDE_PATH), VN_MASK_GUIDE_THRESHOLD)
+    if mask is None:
+        return None
+    panel_width, panel_height = panel_size
+    x0 = max(0, min(panel_width, int(box[0])))
+    y0 = max(0, min(panel_height, int(box[1])))
+    x1 = max(x0, min(panel_width, int(box[2])))
+    y1 = max(y0, min(panel_height, int(box[3])))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    px = mask.load()
+    rows: List[Optional[Tuple[int, int]]] = []
+    any_row = False
+    for y in range(y0, y1):
+        row_left: Optional[int] = None
+        row_right: Optional[int] = None
+        for x in range(x0, x1):
+            if px[x, y] > 0:
+                if row_left is None:
+                    row_left = x - x0
+                row_right = (x - x0) + 1
+        if row_left is None or row_right is None:
+            rows.append(None)
+            continue
+        rows.append((row_left, row_right))
+        any_row = True
+    if not any_row:
+        return None
+    return tuple(rows)
+
 vn_outfit_selection: Dict[str, Dict[str, object]] = {}
 background_selections: Dict[str, str] = {}
 _vn_config_cache: Dict[str, Dict] = {}
@@ -941,6 +1117,19 @@ def compose_background_layer(
         if not backgrounds:
             return None
         background_path = random.choice(backgrounds)
+    cache_key: Optional[Tuple[str, int, int, int]] = None
+    if background_path is not None and background_path.exists():
+        try:
+            st = background_path.stat()
+            cache_key = (str(background_path.resolve()), st.st_mtime_ns, int(panel_size[0]), int(panel_size[1]))
+        except OSError:
+            cache_key = None
+    if cache_key is not None:
+        with _BG_LAYER_CACHE_LOCK:
+            cached = _BG_LAYER_CACHE.get(cache_key)
+            if cached is not None:
+                _BG_LAYER_CACHE.move_to_end(cache_key)
+                return cached.copy()
     try:
         from PIL import Image, ImageOps
 
@@ -960,6 +1149,12 @@ def compose_background_layer(
         return None
     layer = Image.new("RGBA", panel_size, (0, 0, 0, 0))
     layer.paste(fitted, (0, 0), fitted)
+    if cache_key is not None:
+        with _BG_LAYER_CACHE_LOCK:
+            _BG_LAYER_CACHE[cache_key] = layer.copy()
+            _BG_LAYER_CACHE.move_to_end(cache_key)
+            while len(_BG_LAYER_CACHE) > _BG_LAYER_CACHE_LIMIT:
+                _BG_LAYER_CACHE.popitem(last=False)
     return layer
 
 
@@ -1650,6 +1845,63 @@ def set_selected_pose_outfit(
         matched_pose,
         matched_outfit,
     )
+    return True
+
+
+def seed_vn_selection_from_scopes(
+    character_name: str,
+    *,
+    from_scope: Optional[str],
+    to_scope: Optional[str],
+    persist: bool = True,
+) -> bool:
+    """Copy effective pose, outfit, and accessory-on states from from_scope into to_scope.
+
+    Used when a user becomes a clone so their VN selection is keyed under the clone scope
+    instead of falling through to the shared character fallback.
+    """
+    directory, _attempted = resolve_character_directory(character_name)
+    if directory is None:
+        return False
+    pose_outfits = list_pose_outfits(character_name)
+    if not pose_outfits:
+        return False
+    src_pose, src_outfit = get_selected_pose_outfit(character_name, scope=from_scope)
+    if not src_pose or not src_outfit:
+        return False
+    pose_lookup = {p.lower(): p for p in pose_outfits.keys()}
+    if src_pose.lower() not in pose_lookup:
+        return False
+    canonical_pose = pose_lookup[src_pose.lower()]
+    outfit_options = pose_outfits.get(canonical_pose) or []
+    outfit_lookup = {o.lower(): o for o in outfit_options}
+    if src_outfit.lower() not in outfit_lookup:
+        return False
+    canonical_outfit = outfit_lookup[src_outfit.lower()]
+
+    accessory_states = get_accessory_states(character_name, scope=from_scope)
+    accessory_entry: Optional[Dict[str, str]] = None
+    if accessory_states:
+        on_keys = {k.lower(): "on" for k, v in accessory_states.items() if str(v).strip().lower() == "on"}
+        if on_keys:
+            accessory_entry = on_keys
+
+    new_entry: Dict[str, object] = {"pose": canonical_pose, "outfit": canonical_outfit}
+    if accessory_entry:
+        new_entry["accessories"] = accessory_entry
+
+    store_key = _selection_store_key(directory, to_scope)
+    vn_outfit_selection[store_key] = new_entry
+    if persist:
+        persist_outfit_selections()
+        compose_game_avatar.cache_clear()
+        _PILLOW_AVATAR_CACHE.clear()
+        logger.info(
+            "VN sprite: seeded selection for %s from scope to clone scope (pose=%s outfit=%s)",
+            directory.name,
+            canonical_pose,
+            canonical_outfit,
+        )
     return True
 
 
@@ -3288,6 +3540,86 @@ def _crop_transparent_vertical(image: "Image.Image") -> "Image.Image":
     return cropped
 
 
+def _crop_horizontal_visible_bounds(image: "Image.Image", *, alpha_threshold: int = 0) -> "Image.Image":
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    if image.width <= 1:
+        return image
+    alpha = image.getchannel("A")
+    pixels = alpha.load()
+    left = 0
+    right = image.width - 1
+    while left <= right:
+        found = False
+        for y in range(image.height):
+            if int(pixels[left, y]) > alpha_threshold:
+                found = True
+                break
+        if found:
+            break
+        left += 1
+    while right >= left:
+        found = False
+        for y in range(image.height):
+            if int(pixels[right, y]) > alpha_threshold:
+                found = True
+                break
+        if found:
+            break
+        right -= 1
+    if left >= image.width or right < left:
+        return image
+    return image.crop((left, 0, right + 1, image.height))
+
+
+def _visible_row_bounds(
+    image: "Image.Image",
+    *,
+    alpha_threshold: int = 0,
+) -> List[Optional[Tuple[int, int]]]:
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    alpha = image.getchannel("A")
+    px = alpha.load()
+    rows: List[Optional[Tuple[int, int]]] = []
+    for y in range(image.height):
+        left: Optional[int] = None
+        right: Optional[int] = None
+        for x in range(image.width):
+            if int(px[x, y]) > alpha_threshold:
+                if left is None:
+                    left = x
+                right = x + 1
+        if left is None or right is None:
+            rows.append(None)
+        else:
+            rows.append((left, right))
+    return rows
+
+
+def _apply_sprite_edge_antialias(image: "Image.Image", *, strength: float) -> "Image.Image":
+    if strength <= 0.0:
+        return image
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    try:
+        from PIL import Image, ImageChops, ImageFilter
+    except ImportError:
+        return image
+    alpha = image.getchannel("A")
+    edge_outer = alpha.filter(ImageFilter.MaxFilter(3))
+    edge_inner = alpha.filter(ImageFilter.MinFilter(3))
+    edge_mask = ImageChops.subtract(edge_outer, edge_inner)
+    if edge_mask.getbbox() is None:
+        return image
+    softened_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1.0))
+    mixed_alpha = Image.blend(alpha, softened_alpha, max(0.0, min(strength, 1.0)))
+    final_alpha = Image.composite(mixed_alpha, alpha, edge_mask)
+    out = image.copy()
+    out.putalpha(final_alpha)
+    return out
+
+
 def _paste_avatar_into_box(
     base: "Image.Image",
     avatar_image: "Image.Image",
@@ -3295,6 +3627,7 @@ def _paste_avatar_into_box(
     *,
     fit_width: bool = True,
     clip_to_box: bool = True,
+    use_mask_guide: bool = False,
 ) -> bool:
     from PIL import Image
 
@@ -3329,13 +3662,78 @@ def _paste_avatar_into_box(
         scaled_height = max(1, int(cropped.height * fit_scale))
         cropped = cropped.resize((scaled_width, scaled_height), Image.LANCZOS)
 
+    cropped = _apply_sprite_edge_antialias(cropped, strength=SPRITE_EDGE_AA_STRENGTH)
+
+    if use_mask_guide and VN_MASK_GUIDE_ENABLED:
+        # Ignore faint/empty horizontal margins for placement so right-snap
+        # calculations track visible pixels only.
+        cropped = _crop_horizontal_visible_bounds(
+            cropped,
+            alpha_threshold=VN_MASK_VISIBLE_ALPHA_THRESHOLD,
+        )
+
     offset_x = box[0] + ((box_width - cropped.width) // 2)
     offset_y = box[1] + max(0, box_height - cropped.height)
+    local_x = (box_width - cropped.width) // 2
+    if use_mask_guide and VN_MASK_GUIDE_ENABLED:
+        row_bounds = _resolve_vn_mask_allowed_rows(base.size, box)
+        if row_bounds is not None and len(row_bounds) == box_height:
+            sprite_rows = _visible_row_bounds(cropped, alpha_threshold=VN_MASK_VISIBLE_ALPHA_THRESHOLD)
+            canvas_offset_y = max(0, box_height - cropped.height)
+            clip_left = 0
+            for _ in range(3):
+                left_limit = -10_000
+                right_limit = 10_000
+                has_constraints = False
+                for row_idx, row in enumerate(sprite_rows):
+                    if row is None:
+                        continue
+                    box_y = canvas_offset_y + row_idx
+                    if box_y < 0 or box_y >= box_height:
+                        continue
+                    allowed = row_bounds[box_y]
+                    if allowed is None:
+                        continue
+                    vis_left, vis_right = row
+                    mask_left, mask_right = allowed
+                    left_limit = max(left_limit, mask_left - vis_left)
+                    right_limit = min(right_limit, mask_right - vis_right)
+                    has_constraints = True
+                if not has_constraints:
+                    break
+                local_x = right_limit  # right-snap always
+                if local_x >= left_limit:
+                    break
+                # Too wide for at least one constrained row -> clip left only.
+                clip_needed = left_limit - local_x
+                if clip_needed <= 0:
+                    break
+                clip_left += int(math.ceil(clip_needed))
+                if clip_left >= cropped.width:
+                    return False
+                cropped = cropped.crop((clip_left, 0, cropped.width, cropped.height))
+                sprite_rows = _visible_row_bounds(cropped, alpha_threshold=VN_MASK_VISIBLE_ALPHA_THRESHOLD)
+                clip_left = 0
+            if VN_MASK_GUIDE_DEBUG:
+                logger.debug(
+                    "VN mask row-fit: box=%s sprite=%sx%s local_x=%s",
+                    box,
+                    cropped.width,
+                    cropped.height,
+                    local_x,
+                )
+        offset_x = box[0] + local_x
     if clip_to_box:
         canvas = Image.new("RGBA", (box_width, box_height), (0, 0, 0, 0))
-        canvas_offset_x = max(0, (box_width - cropped.width) // 2)
+        canvas_offset_x = max(0, local_x)
         canvas_offset_y = max(0, box_height - cropped.height)
-        canvas.paste(cropped, (canvas_offset_x, canvas_offset_y), cropped)
+        clipped = cropped
+        if local_x < 0:
+            src_x0 = min(-local_x, cropped.width)
+            if src_x0 >= cropped.width:
+                return False
+            clipped = cropped.crop((src_x0, 0, cropped.width, cropped.height))
+        canvas.paste(clipped, (canvas_offset_x, canvas_offset_y), clipped)
         base.paste(canvas, (box[0], box[1]), canvas)
     else:
         base.paste(cropped, (offset_x, offset_y), cropped)
@@ -3368,6 +3766,34 @@ def _compose_avatar_layer(
     return layer
 
 
+def _flatten_avatar_layer(placed_layer: Optional["Image.Image"]) -> Optional["Image.Image"]:
+    """Single composited RGBA used for silhouette generation (avoids repeated flatten work)."""
+    if placed_layer is None:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    flattened = Image.new("RGBA", placed_layer.size, (0, 0, 0, 0))
+    flattened.alpha_composite(placed_layer.convert("RGBA"))
+    return flattened
+
+
+def _silhouette_from_flattened(
+    flattened: "Image.Image",
+    *,
+    alpha_scale: float = 1.0,
+) -> "Image.Image":
+    from PIL import Image
+
+    alpha = flattened.getchannel("A")
+    if alpha_scale != 1.0:
+        alpha = alpha.point(lambda value: max(0, min(255, int(value * alpha_scale))))
+    silhouette = Image.new("RGBA", flattened.size, (0, 0, 0, 255))
+    silhouette.putalpha(alpha)
+    return silhouette
+
+
 def _make_silhouette_layer(
     placed_layer: Optional["Image.Image"],
     *,
@@ -3375,20 +3801,10 @@ def _make_silhouette_layer(
 ) -> Optional["Image.Image"]:
     if placed_layer is None:
         return None
-    try:
-        from PIL import Image
-    except ImportError:
+    flattened = _flatten_avatar_layer(placed_layer)
+    if flattened is None:
         return None
-    # Flatten the rendered sprite content first so the silhouette always matches
-    # the fully composited avatar, then tint that flattened result to black.
-    flattened = Image.new("RGBA", placed_layer.size, (0, 0, 0, 0))
-    flattened.alpha_composite(placed_layer.convert("RGBA"))
-    alpha = flattened.getchannel("A")
-    if alpha_scale != 1.0:
-        alpha = alpha.point(lambda value: max(0, min(255, int(value * alpha_scale))))
-    silhouette = Image.new("RGBA", flattened.size, (0, 0, 0, 255))
-    silhouette.putalpha(alpha)
-    return silhouette
+    return _silhouette_from_flattened(flattened, alpha_scale=alpha_scale)
 
 
 def _make_outlined_silhouette_layer(
@@ -3503,6 +3919,17 @@ def _union_layer_bbox(*layers: Optional["Image.Image"]) -> Optional[Tuple[int, i
     return bbox
 
 
+def _compose_static_background_frame(
+    background_layer: "Image.Image",
+    *layers: Optional["Image.Image"],
+) -> "Image.Image":
+    frame = background_layer.copy()
+    for layer in layers:
+        if layer is not None:
+            frame.alpha_composite(layer)
+    return frame
+
+
 def _build_device_particle_overlay(
     canvas_size: Tuple[int, int],
     body_regions: Sequence[Tuple[int, int, int, int]],
@@ -3553,10 +3980,13 @@ def _build_device_particle_overlay(
             py = py_base - (upward_travel * progress)
             px = int(round(px + (px_drift * progress)))
             py = int(round(py))
+            if DEVICE_SWAP_PARTICLE_GRID > 1:
+                px = int(round(px / DEVICE_SWAP_PARTICLE_GRID) * DEVICE_SWAP_PARTICLE_GRID)
+                py = int(round(py / DEVICE_SWAP_PARTICLE_GRID) * DEVICE_SWAP_PARTICLE_GRID)
             radius = 2 + int(rng.random() * 5)
             glow_radius = radius + 3 + int(rng.random() * 4)
             phase = (particle_index / max(DEVICE_SWAP_PARTICLE_COUNT, 1)) + (rng.random() * 0.35)
-            flicker = 0.45 + (0.55 * abs(math.sin((progress + phase) * math.pi * 3.0)))
+            flicker = 0.55 + (0.45 * abs(math.sin((progress + phase) * math.pi * 1.5)))
             particle_core_alpha = int(round(core_alpha * flicker))
             particle_glow_alpha = int(round(glow_alpha * flicker))
             draw.ellipse(
@@ -3616,7 +4046,55 @@ def _ease_in_out(progress: float) -> float:
 
 def _frame_count_for_duration(duration_ms: int) -> int:
     seconds = max(0.0, duration_ms / 1000.0)
-    return max(2, int(round(seconds * REROLL_GIF_ANIMATION_FPS)))
+    frames = max(2, int(round(seconds * REROLL_GIF_ANIMATION_FPS)))
+    if REROLL_GIF_MAX_FRAMES > 0:
+        frames = min(frames, max(2, REROLL_GIF_MAX_FRAMES))
+    return frames
+
+
+def _cap_frames(frames: int, cap: int) -> int:
+    if cap <= 0:
+        return max(2, frames)
+    return max(2, min(frames, cap))
+
+
+
+def _thin_animation_frames(
+    frames: list["Image.Image"],
+    durations: list[int],
+    max_total: int,
+) -> tuple[list["Image.Image"], list[int]]:
+    n = len(frames)
+    if max_total <= 0 or n <= max_total:
+        return list(frames), list(durations)
+    picked: list[int] = [0, n - 1]
+    inner_budget = max_total - 2
+    if inner_budget > 0 and n > 2:
+        step = (n - 1) / (inner_budget + 1)
+        for i in range(1, inner_budget + 1):
+            idx = int(round(i * step))
+            idx = max(1, min(n - 2, idx))
+            if idx not in picked:
+                picked.append(idx)
+        picked.sort()
+    while len(picked) > max_total:
+        best_i = 1
+        best_cost = 10**18
+        for i in range(1, len(picked) - 1):
+            a, b = picked[i - 1], picked[i + 1]
+            cost = sum(durations[t] for t in range(a, b) if t < len(durations))
+            if cost < best_cost:
+                best_cost = cost
+                best_i = i
+        picked.pop(best_i)
+    new_frames: list["Image.Image"] = []
+    new_durations: list[int] = []
+    for i, start in enumerate(picked):
+        new_frames.append(frames[start])
+        end = picked[i + 1] if i + 1 < len(picked) else n
+        seg = sum(durations[t] for t in range(start, end) if t < len(durations))
+        new_durations.append(max(1, seg))
+    return new_frames, new_durations
 
 
 def _gif_frame_from_rgba(frame: "Image.Image") -> "Image.Image":
@@ -3625,11 +4103,751 @@ def _gif_frame_from_rgba(frame: "Image.Image") -> "Image.Image":
     except ImportError:
         return frame
     rgba_frame = frame.convert("RGBA")
-    return rgba_frame.quantize(
-        colors=256,
-        method=Image.FASTOCTREE,
-        dither=Image.FLOYDSTEINBERG,
+    if GIF_PREFILTER_SCALE > 1:
+        try:
+            resample_lut = {
+                "nearest": Image.Resampling.NEAREST,
+                "bilinear": Image.Resampling.BILINEAR,
+                "bicubic": Image.Resampling.BICUBIC,
+                "lanczos": Image.Resampling.LANCZOS,
+            }
+            resample = resample_lut.get(GIF_PREFILTER_RESAMPLE, Image.Resampling.LANCZOS)
+            enlarged = rgba_frame.resize(
+                (rgba_frame.width * GIF_PREFILTER_SCALE, rgba_frame.height * GIF_PREFILTER_SCALE),
+                resample=resample,
+            )
+            rgba_frame = enlarged.resize((rgba_frame.width, rgba_frame.height), resample=resample)
+        except Exception:
+            pass
+    return rgba_frame
+
+
+def _quantize_frame(
+    frame: "Image.Image",
+    palette_source: Optional["Image.Image"] = None,
+    *,
+    colors_override: Optional[int] = None,
+    conservative: bool = False,
+) -> "Image.Image":
+    from PIL import Image
+
+    method_lut = {
+        "fastoctree": Image.FASTOCTREE,
+        "mediancut": Image.MEDIANCUT,
+    }
+    dither_lut = {
+        "none": Image.Dither.NONE,
+        "floyd": Image.Dither.FLOYDSTEINBERG,
+    }
+    method = method_lut.get(GIF_QUANTIZE_METHOD, Image.FASTOCTREE)
+    dither = dither_lut.get(GIF_DITHER_MODE, Image.Dither.NONE)
+    colors = max(32, min(256, int(colors_override if colors_override is not None else GIF_COLORS)))
+    if conservative:
+        method = Image.FASTOCTREE
+        dither = Image.Dither.NONE
+        colors = min(colors, 96)
+    if palette_source is not None:
+        palette_image = palette_source if palette_source.mode == "P" else palette_source.convert("P")
+        return frame.convert("RGB").quantize(palette=palette_image, dither=dither)
+    return frame.convert("RGBA").quantize(
+        colors=colors,
+        method=method,
+        dither=dither,
     )
+
+
+def _palette_sample_indices(total: int, sample_count: int) -> list[int]:
+    if total <= 0:
+        return []
+    picks = {0, total - 1, total // 2}
+    if sample_count <= 3:
+        return sorted(picks)
+    span = max(1, sample_count - 1)
+    for i in range(sample_count):
+        idx = int(round((total - 1) * (i / span)))
+        picks.add(idx)
+    return sorted(picks)
+
+
+def _build_shared_palette_source(
+    frames: list["Image.Image"],
+    *,
+    sample_count: int,
+    colors: int,
+) -> Optional["Image.Image"]:
+    if not frames:
+        return None
+    from PIL import Image
+
+    indices = _palette_sample_indices(len(frames), sample_count)
+    if not indices:
+        return None
+    width, height = frames[0].size
+    canvas = Image.new("RGB", (width, height * len(indices)), (0, 0, 0))
+    for row, idx in enumerate(indices):
+        sample = frames[idx].convert("RGB")
+        canvas.paste(sample, (0, row * height))
+    return _quantize_frame(canvas, colors_override=colors)
+
+
+def _dedupe_gif_frames(frames: list["Image.Image"], durations: list[int]) -> tuple[list["Image.Image"], list[int]]:
+    if not frames:
+        return frames, durations
+    merged_frames: list["Image.Image"] = [frames[0]]
+    merged_durations: list[int] = [max(0, int(durations[0])) if durations else 0]
+    prev = frames[0]
+    prev_bytes = prev.tobytes()
+    prev_palette = tuple(prev.getpalette() or [])
+    for idx in range(1, len(frames)):
+        frame = frames[idx]
+        duration = max(0, int(durations[idx])) if idx < len(durations) else 0
+        frame_bytes = frame.tobytes()
+        frame_palette = tuple(frame.getpalette() or [])
+        if frame_bytes == prev_bytes and frame_palette == prev_palette:
+            merged_durations[-1] += duration
+            continue
+        merged_frames.append(frame)
+        merged_durations.append(duration)
+        prev_bytes = frame_bytes
+        prev_palette = frame_palette
+    return merged_frames, merged_durations
+
+
+def _frame_has_partial_alpha(frame: "Image.Image") -> bool:
+    rgba = frame.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    minimum, maximum = alpha.getextrema()
+    if minimum >= 255 or maximum <= 0:
+        return False
+    if minimum == 0 and maximum == 255:
+        histogram = alpha.histogram()
+        return any(count > 0 for count in histogram[1:255])
+    return True
+
+
+def _prepare_gif_frames(
+    frames: list["Image.Image"],
+    durations: list[int],
+    *,
+    use_shared_palette: bool,
+    dedupe: bool,
+    colors_override: Optional[int] = None,
+) -> tuple[list["Image.Image"], list[int]]:
+    if not frames:
+        return frames, durations
+    rgba_frames = [_gif_frame_from_rgba(frame) for frame in frames]
+    colors = max(32, min(256, int(colors_override if colors_override is not None else GIF_COLORS)))
+    has_partial_alpha = any(_frame_has_partial_alpha(frame) for frame in rgba_frames)
+    use_shared_palette_effective = use_shared_palette and GIF_SHARED_PALETTE and not has_partial_alpha
+    if use_shared_palette_effective:
+        try:
+            palette_source = _build_shared_palette_source(
+                rgba_frames,
+                sample_count=GIF_SHARED_PALETTE_SAMPLES,
+                colors=colors,
+            )
+            if palette_source is None:
+                quantized_frames = [_quantize_frame(frame, colors_override=colors) for frame in rgba_frames]
+            else:
+                quantized_frames = [
+                    _quantize_frame(frame, palette_source=palette_source, colors_override=colors)
+                    for frame in rgba_frames
+                ]
+        except Exception:
+            try:
+                quantized_frames = [_quantize_frame(frame, colors_override=colors) for frame in rgba_frames]
+            except Exception:
+                quantized_frames = [_quantize_frame(frame, colors_override=colors, conservative=True) for frame in rgba_frames]
+    else:
+        try:
+            quantized_frames = [_quantize_frame(frame, colors_override=colors) for frame in rgba_frames]
+        except Exception:
+            quantized_frames = [_quantize_frame(frame, colors_override=colors, conservative=True) for frame in rgba_frames]
+    normalized_durations = [max(0, int(value)) for value in durations]
+    if dedupe:
+        quantized_frames, normalized_durations = _dedupe_gif_frames(quantized_frames, normalized_durations)
+    return quantized_frames, normalized_durations
+
+
+def _maybe_run_gifsicle(payload: bytes, *, colors_override: Optional[int] = None) -> bytes:
+    if GIF_POST_OPTIMIZER != "gifsicle":
+        return payload
+    try:
+        with tempfile.TemporaryDirectory(prefix="tfbot-gifopt-") as tmp_dir:
+            in_path = Path(tmp_dir) / "in.gif"
+            out_path = Path(tmp_dir) / "out.gif"
+            in_path.write_bytes(payload)
+            colors = max(32, min(256, int(colors_override if colors_override is not None else GIF_COLORS)))
+            options = ["-O3", "--careful", f"--colors={colors}"]
+            if GIF_POST_OPTIMIZER_LOSSY > 0:
+                options.append(f"--lossy={GIF_POST_OPTIMIZER_LOSSY}")
+            try:
+                from pygifsicle import optimize as pygifsicle_optimize  # type: ignore
+
+                pygifsicle_optimize(str(in_path), str(out_path), options=options)
+            except Exception:
+                gifsicle_bin = shutil.which("gifsicle")
+                if not gifsicle_bin:
+                    return payload
+                cmd = [gifsicle_bin, *options, str(in_path), "-o", str(out_path)]
+                completed = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=max(0.1, GIF_POST_OPTIMIZER_TIMEOUT_MS / 1000.0),
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    return payload
+            if not out_path.exists():
+                return payload
+            optimized = out_path.read_bytes()
+            if optimized and len(optimized) < len(payload):
+                return optimized
+    except Exception:
+        return payload
+    return payload
+
+
+def _encode_gif_payload(
+    frames: list["Image.Image"],
+    durations: list[int],
+    *,
+    loop: int,
+    optimize: bool,
+    disposal: int,
+    shared_palette: bool,
+    dedupe: bool,
+    allow_post_opt: bool,
+    profile: str = "default",
+    label: Optional[str] = None,
+    target_bytes_override: Optional[int] = None,
+    adaptive_min_colors_override: Optional[int] = None,
+    adaptive_color_step_override: Optional[int] = None,
+    adaptive_max_attempts_override: Optional[int] = None,
+) -> Optional[bytes]:
+    target_bytes = max(0, int(target_bytes_override if target_bytes_override is not None else GIF_TARGET_BYTES))
+    min_colors = min(
+        GIF_COLORS,
+        max(32, int(adaptive_min_colors_override if adaptive_min_colors_override is not None else GIF_ADAPTIVE_MIN_COLORS)),
+    )
+    attempts = max(1, int(adaptive_max_attempts_override if adaptive_max_attempts_override is not None else GIF_ADAPTIVE_MAX_ATTEMPTS))
+    step = max(4, int(adaptive_color_step_override if adaptive_color_step_override is not None else GIF_ADAPTIVE_COLOR_STEP))
+
+    colors_to_try: list[int] = [GIF_COLORS]
+    next_colors = GIF_COLORS
+    for _ in range(attempts - 1):
+        next_colors = max(min_colors, next_colors - step)
+        if next_colors == colors_to_try[-1]:
+            break
+        colors_to_try.append(next_colors)
+
+    best_payload: Optional[bytes] = None
+    best_colors = GIF_COLORS
+    attempts_used = 0
+    for idx, colors in enumerate(colors_to_try, start=1):
+        attempts_used = idx
+        prepared_frames, prepared_durations = _prepare_gif_frames(
+            frames,
+            durations,
+            use_shared_palette=shared_palette,
+            dedupe=dedupe,
+            colors_override=colors,
+        )
+        if not prepared_frames:
+            return None
+        output = io.BytesIO()
+        prepared_frames[0].save(
+            output,
+            format="GIF",
+            save_all=True,
+            append_images=prepared_frames[1:],
+            duration=prepared_durations,
+            loop=loop,
+            optimize=optimize,
+            disposal=disposal,
+        )
+        payload = output.getvalue()
+        if allow_post_opt:
+            payload = _maybe_run_gifsicle(payload, colors_override=colors)
+        if best_payload is None or len(payload) < len(best_payload):
+            best_payload = payload
+            best_colors = colors
+        if target_bytes > 0 and len(payload) <= target_bytes:
+            break
+        if target_bytes <= 0:
+            break
+
+    if best_payload is None:
+        return None
+
+    log_animation_perf_event(
+        "gif_encode_final",
+        profile=profile,
+        label=label or "unknown",
+        bytes=len(best_payload),
+        colors=best_colors,
+        dither=GIF_DITHER_MODE,
+        shared_palette=int(bool(shared_palette and GIF_SHARED_PALETTE)),
+        dedupe=int(bool(dedupe)),
+        post_opt=int(bool(allow_post_opt and GIF_POST_OPTIMIZER == "gifsicle")),
+        target_bytes=target_bytes if target_bytes > 0 else "off",
+        attempts_used=attempts_used,
+        attempts_planned=len(colors_to_try),
+    )
+    return best_payload
+
+
+def _normalize_transition_format(value: str, *, default: str = "gif") -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {"webp", "gif"}:
+        return normalized
+    return default
+
+
+def _filename_with_ext(filename: str, ext: str) -> str:
+    suffix = f".{ext.lstrip('.').lower()}"
+    stem = Path(filename or "transition").stem
+    if not stem:
+        stem = "transition"
+    return f"{stem}{suffix}"
+
+
+def _encode_webp_payload(
+    frames: list["Image.Image"],
+    durations: list[int],
+    *,
+    loop: int,
+    dedupe: bool,
+    profile: str = "default",
+    label: Optional[str] = None,
+    target_bytes_override: Optional[int] = None,
+    quality_override: Optional[int] = None,
+    method_override: Optional[int] = None,
+    min_quality_override: Optional[int] = None,
+    quality_step_override: Optional[int] = None,
+    max_attempts_override: Optional[int] = None,
+    alpha_quality_override: Optional[int] = None,
+) -> Optional[bytes]:
+    if not frames:
+        return None
+    target_bytes = max(0, int(target_bytes_override if target_bytes_override is not None else WEBP_TARGET_BYTES))
+    method = max(0, min(6, int(method_override if method_override is not None else WEBP_METHOD)))
+    alpha_quality = max(1, min(100, int(alpha_quality_override if alpha_quality_override is not None else WEBP_ALPHA_QUALITY)))
+    start_quality = max(1, min(100, int(quality_override if quality_override is not None else WEBP_QUALITY)))
+    quality_values: list[int] = [start_quality]
+    min_quality = max(25, min(100, int(min_quality_override if min_quality_override is not None else WEBP_MIN_QUALITY)))
+    quality_step = max(1, min(20, int(quality_step_override if quality_step_override is not None else WEBP_QUALITY_STEP)))
+    max_attempts = max(1, min(8, int(max_attempts_override if max_attempts_override is not None else WEBP_MAX_ATTEMPTS)))
+    if not WEBP_LOSSLESS:
+        next_quality = start_quality
+        for _ in range(max_attempts - 1):
+            next_quality = max(min_quality, next_quality - quality_step)
+            if next_quality == quality_values[-1]:
+                break
+            quality_values.append(next_quality)
+
+    rgba_frames = [_gif_frame_from_rgba(frame).convert("RGBA") for frame in frames]
+    normalized_durations = [max(0, int(value)) for value in durations]
+    if dedupe:
+        deduped_frames: list["Image.Image"] = [rgba_frames[0]]
+        deduped_durations: list[int] = [normalized_durations[0] if normalized_durations else 0]
+        prev = rgba_frames[0].tobytes()
+        for idx in range(1, len(rgba_frames)):
+            cur_img = rgba_frames[idx]
+            duration = normalized_durations[idx] if idx < len(normalized_durations) else 0
+            if cur_img is deduped_frames[-1]:
+                deduped_durations[-1] += duration
+                continue
+            current = cur_img.tobytes()
+            if current == prev:
+                deduped_durations[-1] += duration
+            else:
+                deduped_frames.append(rgba_frames[idx])
+                deduped_durations.append(duration)
+                prev = current
+        rgba_frames = deduped_frames
+        normalized_durations = deduped_durations
+
+    selected_payload: Optional[bytes] = None
+    selected_quality = quality_values[0]
+    smallest_payload: Optional[bytes] = None
+    smallest_quality = quality_values[0]
+    first_payload: Optional[bytes] = None
+    first_quality = quality_values[0]
+    soft_ratio = WEBP_TARGET_SOFT_RATIO_MASS if profile == "mass" else WEBP_TARGET_SOFT_RATIO
+    hard_ratio = WEBP_TARGET_HARD_RATIO_MASS if profile == "mass" else WEBP_TARGET_HARD_RATIO
+    apply_color_parity = _is_color_parity_transition(label, profile=profile)
+    if profile == "device":
+        max_overrun_ratio = WEBP_MAX_OVERRUN_RATIO_DEVICE
+    else:
+        max_overrun_ratio = WEBP_MAX_OVERRUN_RATIO_COLOR_PARITY if apply_color_parity else WEBP_MAX_OVERRUN_RATIO
+    soft_target = max(0, int(round(target_bytes * soft_ratio))) if target_bytes > 0 else 0
+    hard_target = max(soft_target, int(round(target_bytes * hard_ratio))) if target_bytes > 0 else 0
+    max_overrun_target = max(hard_target, int(round(target_bytes * max_overrun_ratio))) if target_bytes > 0 else 0
+    decision = "smallest"
+    attempts_used = 0
+    for idx, quality in enumerate(quality_values, start=1):
+        attempts_used = idx
+        output = io.BytesIO()
+        _append = rgba_frames[1:] if len(rgba_frames) > 1 else []
+        rgba_frames[0].save(
+            output,
+            format="WEBP",
+            save_all=bool(_append),
+            append_images=_append,
+            duration=normalized_durations,
+            loop=max(0, int(loop)),
+            quality=quality,
+            method=method,
+            lossless=WEBP_LOSSLESS,
+            minimize_size=True,
+            alpha_quality=alpha_quality,
+            exact=False,
+        )
+        payload = output.getvalue()
+        if first_payload is None:
+            first_payload = payload
+            first_quality = quality
+        if smallest_payload is None or len(payload) < len(smallest_payload):
+            smallest_payload = payload
+            smallest_quality = quality
+
+        if WEBP_QUALITY_GUARDRAILS and target_bytes > 0:
+            if len(payload) <= soft_target:
+                selected_payload = payload
+                selected_quality = quality
+                decision = "soft_target"
+                break
+            if len(payload) <= hard_target and selected_payload is None:
+                selected_payload = payload
+                selected_quality = quality
+                decision = "hard_target"
+        elif target_bytes > 0 and len(payload) <= target_bytes:
+            selected_payload = payload
+            selected_quality = quality
+            decision = "target"
+            break
+        elif target_bytes <= 0:
+            selected_payload = payload
+            selected_quality = quality
+            decision = "quality_first"
+            break
+
+    if selected_payload is None:
+        if WEBP_QUALITY_GUARDRAILS and target_bytes > 0 and selected_payload is None:
+            if first_payload is not None and hard_target > 0 and len(first_payload) <= hard_target:
+                selected_payload = first_payload
+                selected_quality = first_quality
+                decision = "first_under_hard_cap"
+            elif first_payload is not None and max_overrun_target > 0 and len(first_payload) <= max_overrun_target:
+                selected_payload = first_payload
+                selected_quality = first_quality
+                decision = "first_under_overrun_cap"
+        if selected_payload is None:
+            selected_payload = smallest_payload
+            selected_quality = smallest_quality
+            decision = "smallest"
+
+    if selected_payload is None:
+        return None
+    hard_cap = max(0, int(WEBP_ANIMATED_HARD_MAX_BYTES))
+    if hard_cap > 0 and len(selected_payload) > hard_cap:
+        q_cap = max(38, int(selected_quality))
+        best_blob: Optional[bytes] = selected_payload
+        capped_ok = False
+        for _ in range(12):
+            q_cap = max(38, q_cap - 5)
+            out_try = io.BytesIO()
+            ap = rgba_frames[1:] if len(rgba_frames) > 1 else []
+            rgba_frames[0].save(
+                out_try,
+                format="WEBP",
+                save_all=bool(ap),
+                append_images=ap,
+                duration=normalized_durations,
+                loop=max(0, int(loop)),
+                quality=q_cap,
+                method=min(method, WEBP_FAST_METHOD),
+                lossless=WEBP_LOSSLESS,
+                minimize_size=True,
+                alpha_quality=alpha_quality,
+                exact=False,
+            )
+            blob = out_try.getvalue()
+            if len(blob) < len(best_blob):
+                best_blob = blob
+            if len(blob) <= hard_cap:
+                selected_payload = blob
+                selected_quality = q_cap
+                decision = "hard_cap_quality"
+                capped_ok = True
+                break
+        if not capped_ok:
+            thin_f = list(rgba_frames)
+            thin_d = list(normalized_durations)
+            for _ in range(4):
+                if len(thin_f) <= 8:
+                    break
+                cap_n = max(8, (len(thin_f) * 2) // 3)
+                thin_f, thin_d = _thin_animation_frames(thin_f, thin_d, cap_n)
+                out_try = io.BytesIO()
+                ap2 = thin_f[1:] if len(thin_f) > 1 else []
+                thin_f[0].save(
+                    out_try,
+                    format="WEBP",
+                    save_all=bool(ap2),
+                    append_images=ap2,
+                    duration=thin_d,
+                    loop=max(0, int(loop)),
+                    quality=max(38, min(q_cap, 68)),
+                    method=min(method, WEBP_FAST_METHOD),
+                    lossless=WEBP_LOSSLESS,
+                    minimize_size=True,
+                    alpha_quality=alpha_quality,
+                    exact=False,
+                )
+                blob = out_try.getvalue()
+                if len(blob) < len(best_blob):
+                    best_blob = blob
+                if len(blob) <= hard_cap:
+                    selected_payload = blob
+                    selected_quality = max(38, min(q_cap, 68))
+                    decision = "hard_cap_thin"
+                    capped_ok = True
+                    break
+        if not capped_ok:
+            selected_payload = best_blob
+            decision = "hard_cap_best_effort"
+        if len(selected_payload) > hard_cap:
+            decision = "hard_cap_rejected"
+            logger.warning(
+                "WebP transition exceeds hard cap (%d > %d bytes, label=%s); rejecting (caller may use static fallback)",
+                len(selected_payload),
+                hard_cap,
+                label or "unknown",
+            )
+    log_animation_perf_event(
+        "webp_encode_final",
+        profile=profile,
+        label=label or "unknown",
+        bytes=len(selected_payload),
+        quality=selected_quality,
+        method=method,
+        lossless=int(WEBP_LOSSLESS),
+        dedupe=int(bool(dedupe)),
+        target_bytes=target_bytes if target_bytes > 0 else "off",
+        attempts_used=attempts_used,
+        attempts_planned=len(quality_values),
+        min_quality=min_quality,
+        quality_step=quality_step,
+        soft_target=soft_target if soft_target > 0 else "off",
+        hard_target=hard_target if hard_target > 0 else "off",
+        max_overrun_target=max_overrun_target if max_overrun_target > 0 else "off",
+        max_overrun_ratio=max_overrun_ratio,
+        alpha_quality=alpha_quality,
+        quality_guardrails=int(WEBP_QUALITY_GUARDRAILS),
+        decision=decision,
+    )
+    if decision == "hard_cap_rejected":
+        return None
+    return selected_payload
+
+
+def _is_color_parity_transition(label: Optional[str], *, profile: str) -> bool:
+    if not COLOR_PARITY_ENABLED:
+        return False
+    normalized = (label or "").strip().lower()
+    if not normalized:
+        return False
+    if profile == "mass":
+        return False
+    if normalized in COLOR_PARITY_EXCLUDED_LABELS:
+        return False
+    return normalized in COLOR_PARITY_LABELS
+
+
+def _encode_transition_payload(
+    frames: list["Image.Image"],
+    durations: list[int],
+    *,
+    loop: int,
+    optimize: bool,
+    disposal: int,
+    shared_palette: bool,
+    dedupe: bool,
+    allow_post_opt: bool,
+    profile: str = "default",
+    label: Optional[str] = None,
+    gif_target_bytes_override: Optional[int] = None,
+    gif_adaptive_min_colors_override: Optional[int] = None,
+    gif_adaptive_color_step_override: Optional[int] = None,
+    gif_adaptive_max_attempts_override: Optional[int] = None,
+    webp_target_bytes_override: Optional[int] = None,
+    webp_min_quality_override: Optional[int] = None,
+    webp_quality_step_override: Optional[int] = None,
+    webp_max_attempts_override: Optional[int] = None,
+) -> tuple[Optional[bytes], str, bool]:
+    apply_color_parity = _is_color_parity_transition(label, profile=profile)
+    shared_palette_effective = shared_palette
+    gif_target_bytes_effective = gif_target_bytes_override
+    gif_min_colors_effective = gif_adaptive_min_colors_override
+    gif_color_step_effective = gif_adaptive_color_step_override
+    webp_target_bytes_effective = webp_target_bytes_override
+    webp_min_quality_effective = webp_min_quality_override
+    webp_alpha_quality_effective: Optional[int] = None
+    if apply_color_parity:
+        shared_palette_effective = False
+        gif_target_bytes_effective = max(
+            int(gif_target_bytes_override) if gif_target_bytes_override is not None else GIF_TARGET_BYTES,
+            GIF_TARGET_BYTES_COLOR_PARITY,
+        )
+        gif_min_colors_effective = max(
+            int(gif_adaptive_min_colors_override)
+            if gif_adaptive_min_colors_override is not None
+            else GIF_ADAPTIVE_MIN_COLORS,
+            GIF_ADAPTIVE_MIN_COLORS_COLOR_PARITY,
+        )
+        gif_color_step_effective = min(
+            int(gif_adaptive_color_step_override)
+            if gif_adaptive_color_step_override is not None
+            else GIF_ADAPTIVE_COLOR_STEP,
+            GIF_ADAPTIVE_COLOR_STEP_COLOR_PARITY,
+        )
+        webp_target_bytes_effective = max(
+            int(webp_target_bytes_override) if webp_target_bytes_override is not None else WEBP_TARGET_BYTES_STANDARD,
+            WEBP_TARGET_BYTES_COLOR_PARITY,
+        )
+        webp_min_quality_effective = max(
+            int(webp_min_quality_override) if webp_min_quality_override is not None else WEBP_MIN_QUALITY,
+            WEBP_MIN_QUALITY_COLOR_PARITY,
+        )
+        webp_alpha_quality_effective = WEBP_ALPHA_QUALITY_COLOR_PARITY
+
+    norm_label = (label or "").strip().lower()
+    webp_method_override: Optional[int] = None
+    webp_max_eff = webp_max_attempts_override
+    webp_min_eff = webp_min_quality_effective
+    if norm_label in WEBP_FAST_TRANSITION_LABELS:
+        webp_method_override = WEBP_FAST_METHOD
+        webp_max_eff = WEBP_FAST_MAX_ATTEMPTS
+        base_mq = (
+            int(webp_min_quality_effective)
+            if webp_min_quality_effective is not None
+            else WEBP_MIN_QUALITY
+        )
+        webp_min_eff = min(base_mq, WEBP_FAST_MIN_QUALITY)
+
+    primary = _normalize_transition_format(TRANSITION_PRIMARY_FORMAT, default="webp")
+    if primary == "gif":
+        if not TRANSITION_ALLOW_GIF_PRIMARY:
+            logger.warning(
+                "TRANSITION_PRIMARY_FORMAT=gif is ignored; transitions encode WebP first. "
+                "Set TRANSITION_ALLOW_GIF_PRIMARY=True in tfbot/transition_constants.py to use GIF as primary."
+            )
+            primary = "webp"
+    fallback = _normalize_transition_format(TRANSITION_FALLBACK_FORMAT, default="gif")
+    frames, durations = _thin_animation_frames(list(frames), list(durations), TRANSITION_ENCODE_MAX_TOTAL_FRAMES)
+
+    # Always try animated WebP first for every transition label; GIF runs only if enabled and WebP fails.
+    payload = _encode_webp_payload(
+        frames,
+        durations,
+        loop=loop,
+        dedupe=dedupe,
+        profile=profile,
+        label=label,
+        target_bytes_override=webp_target_bytes_effective,
+        min_quality_override=webp_min_eff,
+        quality_step_override=webp_quality_step_override,
+        max_attempts_override=webp_max_eff,
+        alpha_quality_override=webp_alpha_quality_effective,
+        method_override=webp_method_override,
+    )
+    if payload is not None:
+        webp_method_logged = (
+            webp_method_override if webp_method_override is not None else WEBP_METHOD
+        )
+        log_animation_perf_event(
+            "transition_encode_selected",
+            profile=profile,
+            label=label or "unknown",
+            format="webp",
+            selected_format="webp",
+            primary_format=primary,
+            fallback_format=fallback,
+            fallback_used=0,
+            color_parity=int(apply_color_parity),
+            bytes=len(payload),
+            webp_quality=WEBP_QUALITY,
+            webp_method=webp_method_logged,
+            webp_target_bytes=webp_target_bytes_effective if webp_target_bytes_effective is not None else WEBP_TARGET_BYTES,
+            gif_colors=GIF_COLORS,
+            gif_target_bytes=gif_target_bytes_effective if gif_target_bytes_effective is not None else GIF_TARGET_BYTES,
+        )
+        return payload, "webp", False
+
+    if TRANSITION_GIF_FALLBACK:
+        gif_payload = _encode_gif_payload(
+            frames,
+            durations,
+            loop=loop,
+            optimize=optimize,
+            disposal=disposal,
+            shared_palette=shared_palette_effective,
+            dedupe=dedupe,
+            allow_post_opt=False,
+            profile=profile,
+            label=label,
+            target_bytes_override=gif_target_bytes_effective,
+            adaptive_min_colors_override=gif_min_colors_effective,
+            adaptive_color_step_override=gif_color_step_effective,
+            adaptive_max_attempts_override=gif_adaptive_max_attempts_override,
+        )
+        if gif_payload is not None:
+            log_animation_perf_event(
+                "transition_encode_selected",
+                profile=profile,
+                label=label or "unknown",
+                format="gif",
+                selected_format="gif",
+                primary_format=primary,
+                fallback_format=fallback,
+                fallback_used=1,
+                color_parity=int(apply_color_parity),
+                bytes=len(gif_payload),
+                webp_quality=WEBP_QUALITY,
+                webp_method=webp_method_override if webp_method_override is not None else WEBP_METHOD,
+                webp_target_bytes=webp_target_bytes_effective if webp_target_bytes_effective is not None else WEBP_TARGET_BYTES,
+                gif_colors=GIF_COLORS,
+                gif_target_bytes=gif_target_bytes_effective if gif_target_bytes_effective is not None else GIF_TARGET_BYTES,
+            )
+            return gif_payload, "gif", True
+
+    log_animation_perf_event(
+        "transition_encode_selected",
+        profile=profile,
+        label=label or "unknown",
+        format="none",
+        selected_format="none",
+        primary_format=primary,
+        fallback_format=fallback,
+        fallback_used=0,
+        color_parity=int(apply_color_parity),
+        bytes=0,
+        webp_quality=WEBP_QUALITY,
+        webp_method=webp_method_override if webp_method_override is not None else WEBP_METHOD,
+        webp_target_bytes=webp_target_bytes_effective if webp_target_bytes_effective is not None else WEBP_TARGET_BYTES,
+        gif_colors=GIF_COLORS,
+        gif_target_bytes=gif_target_bytes_effective if gif_target_bytes_effective is not None else GIF_TARGET_BYTES,
+    )
+    return None, "webp", False
+
+
+def _build_transition_file(payload: bytes, *, filename: str, output_format: str) -> discord.File:
+    output = io.BytesIO(payload)
+    output.seek(0)
+    return discord.File(fp=output, filename=_filename_with_ext(filename, output_format))
 
 
 def render_tf_split_panel(
@@ -3645,7 +4863,7 @@ def render_tf_split_panel(
     left_selection_scope: Optional[str] = None,
     right_selection_scope: Optional[str] = None,
     panel_size: Optional[Tuple[int, int]] = None,
-    fit_avatar_width: bool = True,
+    fit_avatar_width: bool = False,
     duplicate_left_background: bool = True,
 ) -> Optional[discord.File]:
     try:
@@ -3846,37 +5064,39 @@ def render_tf_split_panel_gif(
         fit_width=fit_avatar_width,
         clip_to_box=fit_avatar_width,
     )
-    old_silhouette_layer = _make_silhouette_layer(old_avatar_layer, alpha_scale=1.0)
-    new_silhouette_layer = _make_silhouette_layer(
-        new_avatar_layer,
-        alpha_scale=REROLL_GIF_NEW_OVERLAY_ALPHA / 255.0,
+    flat_old = _flatten_avatar_layer(old_avatar_layer)
+    flat_new = _flatten_avatar_layer(new_avatar_layer)
+    old_silhouette_layer = _silhouette_from_flattened(flat_old, alpha_scale=1.0) if flat_old else None
+    new_silhouette_layer = (
+        _silhouette_from_flattened(flat_new, alpha_scale=REROLL_GIF_NEW_OVERLAY_ALPHA / 255.0)
+        if flat_new
+        else None
     )
-    new_silhouette_full_layer = _make_silhouette_layer(new_avatar_layer, alpha_scale=1.0)
+    new_silhouette_full_layer = _silhouette_from_flattened(flat_new, alpha_scale=1.0) if flat_new else None
+    center_symbol_layer: Optional[Image.Image] = None
+    if center_symbol_name:
+        symbol_path = Path(center_symbol_name)
+        if not symbol_path.is_absolute():
+            symbol_path = (BASE_DIR / "vn_assets" / symbol_path).resolve()
+        if symbol_path.exists():
+            try:
+                with Image.open(symbol_path) as symbol_image:
+                    center_symbol_layer = symbol_image.convert("RGBA")
+            except OSError:
+                center_symbol_layer = None
 
     if old_avatar_layer is None and new_avatar_layer is None:
         return None
 
     def _composite_frame(*layers: Optional["Image.Image"]) -> "Image.Image":
-        frame = base.copy()
-        for layer in layers:
-            if layer is not None:
-                frame.alpha_composite(layer)
-        if center_symbol_name:
-            symbol_path = Path(center_symbol_name)
-            if not symbol_path.is_absolute():
-                symbol_path = (BASE_DIR / "vn_assets" / symbol_path).resolve()
-            if symbol_path.exists():
-                try:
-                    with Image.open(symbol_path) as symbol_image:
-                        symbol = symbol_image.convert("RGBA")
-                    if symbol.size == frame.size:
-                        frame.alpha_composite(symbol)
-                    else:
-                        symbol_x = max(0, (frame.width - symbol.width) // 2)
-                        symbol_y = max(0, (frame.height - symbol.height) // 2)
-                        frame.alpha_composite(symbol, (symbol_x, symbol_y))
-                except OSError:
-                    pass
+        frame = _compose_static_background_frame(base, *layers)
+        if center_symbol_layer is not None:
+            if center_symbol_layer.size == frame.size:
+                frame.alpha_composite(center_symbol_layer)
+            else:
+                symbol_x = max(0, (frame.width - center_symbol_layer.width) // 2)
+                symbol_y = max(0, (frame.height - center_symbol_layer.height) // 2)
+                frame.alpha_composite(center_symbol_layer, (symbol_x, symbol_y))
         return frame
 
     frames: list[Image.Image] = []
@@ -3889,13 +5109,10 @@ def render_tf_split_panel_gif(
     old_to_silhouette_frame_ms = max(20, int(round(old_to_silhouette_ms / old_to_silhouette_frames)))
     for frame_index in range(1, old_to_silhouette_frames):
         progress = frame_index / (old_to_silhouette_frames - 1)
-        fading_old = old_avatar_layer.copy() if old_avatar_layer is not None else None
-        growing_silhouette = _make_silhouette_layer(old_avatar_layer, alpha_scale=progress)
-        if fading_old is not None:
-            old_alpha = fading_old.getchannel("A").point(
-                lambda value: max(0, min(255, int(value * (1.0 - progress))))
-            )
-            fading_old.putalpha(old_alpha)
+        fading_old = _layer_with_alpha_scale(old_avatar_layer, alpha_scale=1.0 - progress)
+        growing_silhouette = (
+            _silhouette_from_flattened(flat_old, alpha_scale=progress) if flat_old is not None else None
+        )
         frames.append(_gif_frame_from_rgba(_composite_frame(fading_old, growing_silhouette)))
         durations.append(old_to_silhouette_frame_ms)
 
@@ -3909,7 +5126,9 @@ def render_tf_split_panel_gif(
     old_fade_frame_ms = max(20, int(round(old_silhouette_fade_ms / old_fade_frames)))
     for frame_index in range(1, old_fade_frames):
         progress = frame_index / (old_fade_frames - 1)
-        fading_old_silhouette = _make_silhouette_layer(old_avatar_layer, alpha_scale=(1.0 - progress))
+        fading_old_silhouette = (
+            _silhouette_from_flattened(flat_old, alpha_scale=(1.0 - progress)) if flat_old is not None else None
+        )
         frames.append(_gif_frame_from_rgba(_composite_frame(fading_old_silhouette, new_silhouette_full_layer)))
         durations.append(old_fade_frame_ms)
 
@@ -3920,26 +5139,31 @@ def render_tf_split_panel_gif(
     new_reveal_frame_ms = max(20, int(round(new_reveal_ms / new_reveal_frames)))
     for frame_index in range(1, new_reveal_frames):
         progress = frame_index / (new_reveal_frames - 1)
-        fading_new_silhouette = _make_silhouette_layer(new_avatar_layer, alpha_scale=(1.0 - progress))
+        fading_new_silhouette = (
+            _silhouette_from_flattened(flat_new, alpha_scale=(1.0 - progress)) if flat_new is not None else None
+        )
         frames.append(_gif_frame_from_rgba(_composite_frame(new_avatar_layer, fading_new_silhouette)))
         durations.append(new_reveal_frame_ms)
 
     frames.append(_gif_frame_from_rgba(_composite_frame(new_avatar_layer)))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=0,
-        optimize=False,
+        optimize=True,
         disposal=2,
+        shared_palette=True,
+        dedupe=True,
+        allow_post_opt=True,
+        profile="standard",
+        label="reroll_transition",
+        webp_target_bytes_override=WEBP_TARGET_BYTES_STANDARD,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
 
 
 def render_swap_transition_panel(
@@ -4117,7 +5341,7 @@ def render_swap_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer)))
     durations.append(max(0, int(initial_hold_ms)))
 
-    ghost_appear_frames = max(2, int(round((max(0, ghost_appear_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS)))
+    ghost_appear_frames = _cap_frames(max(2, int(round((max(0, ghost_appear_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS))), SWAP_GIF_MAX_FRAMES)
     ghost_appear_frame_ms = max(20, int(round(ghost_appear_ms / ghost_appear_frames))) if ghost_appear_ms > 0 else 20
     for frame_index in range(1, ghost_appear_frames):
         progress = _ease_in_out(frame_index / (ghost_appear_frames - 1))
@@ -4144,7 +5368,7 @@ def render_swap_transition_panel_gif(
         frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer, left_ghost_frame, right_ghost_frame)))
         durations.append(ghost_appear_frame_ms)
 
-    travel_frames = max(2, int(round((max(0, travel_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS)))
+    travel_frames = _cap_frames(max(2, int(round((max(0, travel_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS))), SWAP_GIF_MAX_FRAMES)
     travel_frame_ms = max(20, int(round(travel_ms / travel_frames))) if travel_ms > 0 else 20
     left_start_center = old_left_anchor[0] + SWAP_GIF_GHOST_OFFSET_X if old_left_anchor is not None else None
     left_start_bottom = old_left_anchor[1] if old_left_anchor is not None else None
@@ -4178,7 +5402,7 @@ def render_swap_transition_panel_gif(
         frames.append(_gif_frame_from_rgba(_composite_frame(current_left_body, current_right_body, left_ghost_frame, right_ghost_frame)))
         durations.append(travel_frame_ms)
 
-    dissolve_frames = max(2, int(round((max(0, ghost_dissolve_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS)))
+    dissolve_frames = _cap_frames(max(2, int(round((max(0, ghost_dissolve_ms) / 1000.0) * SWAP_GIF_ANIMATION_FPS))), SWAP_GIF_MAX_FRAMES)
     dissolve_frame_ms = max(20, int(round(ghost_dissolve_ms / dissolve_frames))) if ghost_dissolve_ms > 0 else 20
     for frame_index in range(dissolve_frames):
         raw_progress = frame_index / (dissolve_frames - 1)
@@ -4209,19 +5433,26 @@ def render_swap_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer)))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=1,
-        optimize=False,
+        optimize=True,
         disposal=2,
+        shared_palette=DEVICE_GIF_USE_SHARED_PALETTE,
+        dedupe=True,
+        allow_post_opt=True,
+        profile="device",
+        label="device_swap_transition",
+        gif_target_bytes_override=DEVICE_GIF_TARGET_BYTES,
+        gif_adaptive_min_colors_override=DEVICE_GIF_ADAPTIVE_MIN_COLORS,
+        gif_adaptive_color_step_override=DEVICE_GIF_ADAPTIVE_COLOR_STEP,
+        gif_adaptive_max_attempts_override=DEVICE_GIF_ADAPTIVE_MAX_ATTEMPTS,
+        webp_target_bytes_override=WEBP_TARGET_BYTES_DEVICE,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
 
 
 def render_device_swap_transition_panel_gif(
@@ -4361,20 +5592,21 @@ def render_device_swap_transition_panel_gif(
         for layer in layers:
             if layer is not None:
                 frame.alpha_composite(layer)
-        particle_overlay = _build_device_particle_overlay(
-            panel_size,
-            body_regions,
-            progress=effect_progress,
-            alpha_scale=effect_alpha,
-            seed=(
-                left_background_user_id
-                ^ (right_background_user_id << 1)
-                ^ ((before_left_state.user_id if before_left_state else 0) << 2)
-                ^ ((before_right_state.user_id if before_right_state else 0) << 3)
-            ),
-        )
-        if particle_overlay is not None:
-            frame.alpha_composite(particle_overlay)
+        if DEVICE_GIF_INCLUDE_PARTICLES:
+            particle_overlay = _build_device_particle_overlay(
+                panel_size,
+                body_regions,
+                progress=effect_progress,
+                alpha_scale=effect_alpha,
+                seed=(
+                    left_background_user_id
+                    ^ (right_background_user_id << 1)
+                    ^ ((before_left_state.user_id if before_left_state else 0) << 2)
+                    ^ ((before_right_state.user_id if before_right_state else 0) << 3)
+                ),
+            )
+            if particle_overlay is not None:
+                frame.alpha_composite(particle_overlay)
         return frame
 
     frames: list[Image.Image] = []
@@ -4390,7 +5622,7 @@ def render_device_swap_transition_panel_gif(
     total_effect_ms = max(1, ghost_appear_ms + travel_ms + ghost_dissolve_ms)
     elapsed_ms = 0
 
-    ghost_appear_frames = max(2, int(round((max(0, ghost_appear_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    ghost_appear_frames = _cap_frames(max(2, int(round((max(0, ghost_appear_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS))), DEVICE_SWAP_GIF_MAX_FRAMES)
     ghost_appear_frame_ms = max(20, int(round(ghost_appear_ms / ghost_appear_frames))) if ghost_appear_ms > 0 else 20
     for frame_index in range(1, ghost_appear_frames):
         raw_progress = frame_index / (ghost_appear_frames - 1)
@@ -4425,7 +5657,7 @@ def render_device_swap_transition_panel_gif(
         )
         durations.append(ghost_appear_frame_ms)
 
-    travel_frames = max(2, int(round((max(0, travel_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    travel_frames = _cap_frames(max(2, int(round((max(0, travel_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS))), DEVICE_SWAP_GIF_MAX_FRAMES)
     travel_frame_ms = max(20, int(round(travel_ms / travel_frames))) if travel_ms > 0 else 20
     left_start_center = old_left_anchor[0] + SWAP_GIF_GHOST_OFFSET_X if old_left_anchor is not None else None
     left_start_bottom = old_left_anchor[1] if old_left_anchor is not None else None
@@ -4464,7 +5696,7 @@ def render_device_swap_transition_panel_gif(
         )
         durations.append(travel_frame_ms)
 
-    dissolve_frames = max(2, int(round((max(0, ghost_dissolve_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    dissolve_frames = _cap_frames(max(2, int(round((max(0, ghost_dissolve_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS))), DEVICE_SWAP_GIF_MAX_FRAMES)
     dissolve_frame_ms = max(20, int(round(ghost_dissolve_ms / dissolve_frames))) if ghost_dissolve_ms > 0 else 20
     for frame_index in range(dissolve_frames):
         raw_progress = frame_index / (dissolve_frames - 1)
@@ -4503,19 +5735,26 @@ def render_device_swap_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(old_left_layer, old_right_layer, effect_progress=1.0, effect_alpha=0.0)))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=1,
-        optimize=False,
+        optimize=True,
         disposal=2,
+        shared_palette=DEVICE_GIF_USE_SHARED_PALETTE,
+        dedupe=True,
+        allow_post_opt=True,
+        profile="device",
+        label="device_reroll_transition",
+        gif_target_bytes_override=DEVICE_GIF_TARGET_BYTES,
+        gif_adaptive_min_colors_override=DEVICE_GIF_ADAPTIVE_MIN_COLORS,
+        gif_adaptive_color_step_override=DEVICE_GIF_ADAPTIVE_COLOR_STEP,
+        gif_adaptive_max_attempts_override=DEVICE_GIF_ADAPTIVE_MAX_ATTEMPTS,
+        webp_target_bytes_override=WEBP_TARGET_BYTES_DEVICE,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
 
 
 def render_device_reroll_transition_panel_gif(
@@ -4529,11 +5768,16 @@ def render_device_reroll_transition_panel_gif(
     previous_selection_scope: Optional[str] = None,
     current_selection_scope: Optional[str] = None,
     panel_size: Tuple[int, int] = REROLL_PANEL_SIZE,
-    fit_avatar_width: bool = False,
-    initial_hold_ms: int = DEVICE_SWAP_GIF_INITIAL_HOLD_MS,
-    effect_ms: int = DEVICE_SWAP_GIF_EFFECT_MS,
-    final_hold_ms: int = DEVICE_SWAP_GIF_FINAL_HOLD_MS,
-    include_particles: bool = True,
+    fit_avatar_width: bool = True,
+    initial_hold_ms: int = DEVICE_REROLL_GIF_INITIAL_HOLD_MS,
+    effect_ms: int = DEVICE_REROLL_GIF_EFFECT_MS,
+    final_hold_ms: int = DEVICE_REROLL_GIF_FINAL_HOLD_MS,
+    include_particles: bool = DEVICE_REROLL_INCLUDE_PARTICLES,
+    animation_fps: int = DEVICE_REROLL_GIF_ANIMATION_FPS,
+    max_frames: int = DEVICE_REROLL_GIF_MAX_FRAMES,
+    webp_target_bytes_override: Optional[int] = None,
+    gif_target_bytes_override: Optional[int] = None,
+    transition_label: str = "device_reroll_transition",
 ) -> Optional[discord.File]:
     try:
         from PIL import Image
@@ -4590,16 +5834,13 @@ def render_device_reroll_transition_panel_gif(
         effect_progress: float,
         effect_alpha: float,
     ) -> "Image.Image":
-        frame = base.copy()
         composited_layers = (
             _layer_with_alpha_scale(old_avatar_layer, alpha_scale=old_sprite_alpha),
             _layer_with_alpha_scale(old_silhouette_layer, alpha_scale=old_silhouette_alpha),
             _layer_with_alpha_scale(new_silhouette_layer, alpha_scale=new_silhouette_alpha),
             _layer_with_alpha_scale(new_avatar_layer, alpha_scale=new_sprite_alpha),
         )
-        for layer in composited_layers:
-            if layer is not None:
-                frame.alpha_composite(layer)
+        frame = _compose_static_background_frame(base, *composited_layers)
         if include_particles:
             particle_overlay = _build_device_particle_overlay(
                 panel_size,
@@ -4618,7 +5859,7 @@ def render_device_reroll_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(1.0, 0.0, 0.0, 0.0, 0.0, 0.0)))
     durations.append(max(0, int(initial_hold_ms)))
 
-    effect_frames = max(2, int(round((max(0, effect_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    effect_frames = _cap_frames(max(2, int(round((max(0, effect_ms) / 1000.0) * max(6, animation_fps)))), max_frames)
     effect_frame_ms = max(20, int(round(effect_ms / effect_frames))) if effect_ms > 0 else 20
     for frame_index in range(1, effect_frames):
         progress = _ease_in_out(frame_index / (effect_frames - 1))
@@ -4658,19 +5899,26 @@ def render_device_reroll_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(0.0, 0.0, 0.0, 1.0, 1.0, 0.0)))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=1,
-        optimize=False,
+        optimize=True,
         disposal=2,
+        shared_palette=DEVICE_GIF_USE_SHARED_PALETTE,
+        dedupe=True,
+        allow_post_opt=True,
+        profile="device",
+        label=transition_label,
+        gif_target_bytes_override=gif_target_bytes_override if gif_target_bytes_override is not None else DEVICE_GIF_TARGET_BYTES,
+        gif_adaptive_min_colors_override=DEVICE_GIF_ADAPTIVE_MIN_COLORS,
+        gif_adaptive_color_step_override=DEVICE_GIF_ADAPTIVE_COLOR_STEP,
+        gif_adaptive_max_attempts_override=DEVICE_GIF_ADAPTIVE_MAX_ATTEMPTS,
+        webp_target_bytes_override=webp_target_bytes_override if webp_target_bytes_override is not None else WEBP_TARGET_BYTES_DEVICE,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
 
 
 def render_clone_transition_panel_gif(
@@ -4692,7 +5940,7 @@ def render_clone_transition_panel_gif(
     initial_hold_ms: int = DEVICE_SWAP_GIF_INITIAL_HOLD_MS,
     effect_ms: int = DEVICE_SWAP_GIF_EFFECT_MS,
     final_hold_ms: int = DEVICE_SWAP_GIF_FINAL_HOLD_MS,
-    include_particles: bool = True,
+    include_particles: bool = DEVICE_GIF_INCLUDE_PARTICLES,
 ) -> Optional[discord.File]:
     try:
         from PIL import Image
@@ -4771,7 +6019,6 @@ def render_clone_transition_panel_gif(
         effect_progress: float,
         effect_alpha: float,
     ) -> "Image.Image":
-        frame = background_base.copy()
         composited_layers = (
             _layer_with_alpha_scale(source_layer, alpha_scale=source_alpha),
             _layer_with_alpha_scale(before_target_layer, alpha_scale=before_target_alpha),
@@ -4779,9 +6026,7 @@ def render_clone_transition_panel_gif(
             _layer_with_alpha_scale(after_target_silhouette, alpha_scale=after_target_silhouette_alpha),
             _layer_with_alpha_scale(after_target_layer, alpha_scale=after_target_alpha),
         )
-        for layer in composited_layers:
-            if layer is not None:
-                frame.alpha_composite(layer)
+        frame = _compose_static_background_frame(background_base, *composited_layers)
         if include_particles:
             particle_overlay = _build_device_particle_overlay(
                 panel_size,
@@ -4805,7 +6050,7 @@ def render_clone_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)))
     durations.append(max(0, int(initial_hold_ms)))
 
-    effect_frames = max(2, int(round((max(0, effect_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS)))
+    effect_frames = _cap_frames(max(2, int(round((max(0, effect_ms) / 1000.0) * DEVICE_SWAP_GIF_ANIMATION_FPS))), DEVICE_SWAP_GIF_MAX_FRAMES)
     effect_frame_ms = max(20, int(round(effect_ms / effect_frames))) if effect_ms > 0 else 20
     for frame_index in range(1, effect_frames):
         progress = _ease_in_out(frame_index / (effect_frames - 1))
@@ -4846,24 +6091,27 @@ def render_clone_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0)))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=1,
-        optimize=False,
+        optimize=True,
         disposal=2,
+        shared_palette=True,
+        dedupe=True,
+        allow_post_opt=True,
+        profile="standard",
+        label="swap_transition",
+        webp_target_bytes_override=WEBP_TARGET_BYTES_STANDARD,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
 
 
 def render_mass_swap_transition_panel_gif(
     *,
-    filename: str = "mass_swap_transition.gif",
+    filename: str = "mass_swap_transition.webp",
     panel_size: Tuple[int, int] = (800, 250),
     background_number: int = MASS_SWAP_BACKGROUND_NUMBER,
     wander_ms: int = MASS_SWAP_GIF_WANDER_MS,
@@ -5024,14 +6272,20 @@ def render_mass_swap_transition_panel_gif(
     frames: list[Image.Image] = []
     durations: list[int] = []
 
-    wander_frames = max(2, int(round((max(0, wander_ms) / 1000.0) * MASS_SWAP_GIF_ANIMATION_FPS)))
+    wander_frames = _cap_frames(
+        max(2, int(round((max(0, wander_ms) / 1000.0) * MASS_SWAP_GIF_ANIMATION_FPS))),
+        MASS_SWAP_GIF_MAX_FRAMES,
+    )
     wander_frame_ms = max(20, int(round(wander_ms / wander_frames))) if wander_ms > 0 else 20
     for frame_index in range(wander_frames):
         progress = frame_index / (wander_frames - 1)
         frames.append(_gif_frame_from_rgba(_composite_frame(progress, exiting=False)))
         durations.append(wander_frame_ms)
 
-    exit_frames = max(2, int(round((max(0, exit_ms) / 1000.0) * MASS_SWAP_GIF_ANIMATION_FPS)))
+    exit_frames = _cap_frames(
+        max(2, int(round((max(0, exit_ms) / 1000.0) * MASS_SWAP_GIF_ANIMATION_FPS))),
+        MASS_SWAP_GIF_MAX_FRAMES,
+    )
     exit_frame_ms = max(20, int(round(exit_ms / exit_frames))) if exit_ms > 0 else 20
     for frame_index in range(1, exit_frames):
         progress = frame_index / (exit_frames - 1)
@@ -5041,24 +6295,31 @@ def render_mass_swap_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(background_base.copy()))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=1,
         optimize=False,
         disposal=2,
+        shared_palette=False,
+        dedupe=True,
+        allow_post_opt=False,
+        profile="mass",
+        label="mass_swap_transition",
+        gif_target_bytes_override=GIF_TARGET_BYTES,
+        webp_target_bytes_override=WEBP_TARGET_BYTES_MASS,
+        webp_min_quality_override=WEBP_MIN_QUALITY_MASS,
+        webp_quality_step_override=WEBP_QUALITY_STEP_MASS,
+        webp_max_attempts_override=WEBP_MAX_ATTEMPTS_MASS,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
 
 
 def render_mass_reroll_transition_panel_gif(
     *,
-    filename: str = "mass_reroll_transition.gif",
+    filename: str = "mass_reroll_transition.webp",
     panel_size: Tuple[int, int] = (800, 250),
     background_number: int = MASS_REROLL_BACKGROUND_NUMBER,
     initial_hold_ms: int = MASS_REROLL_GIF_INITIAL_HOLD_MS,
@@ -5186,7 +6447,10 @@ def render_mass_reroll_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(0, 0.0)))
     durations.append(max(0, int(initial_hold_ms)))
 
-    transition_frames = max(2, int(round((max(0, transition_ms) / 1000.0) * MASS_REROLL_GIF_ANIMATION_FPS)))
+    transition_frames = _cap_frames(
+        max(2, int(round((max(0, transition_ms) / 1000.0) * MASS_REROLL_GIF_ANIMATION_FPS))),
+        MASS_REROLL_GIF_MAX_FRAMES,
+    )
     transition_frame_ms = max(20, int(round(transition_ms / transition_frames))) if transition_ms > 0 else 20
     for stage_index in range(max(1, int(stage_count))):
         for frame_index in range(1, transition_frames):
@@ -5197,19 +6461,26 @@ def render_mass_reroll_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_composite_frame(max(0, int(stage_count) - 1), 1.0)))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=1,
         optimize=False,
         disposal=2,
+        shared_palette=False,
+        dedupe=True,
+        allow_post_opt=False,
+        profile="mass",
+        label="mass_reroll_transition",
+        gif_target_bytes_override=GIF_TARGET_BYTES,
+        webp_target_bytes_override=WEBP_TARGET_BYTES_MASS,
+        webp_min_quality_override=WEBP_MIN_QUALITY_MASS,
+        webp_quality_step_override=WEBP_QUALITY_STEP_MASS,
+        webp_max_attempts_override=WEBP_MAX_ATTEMPTS_MASS,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
 
 
 def render_background_transition_panel_gif(
@@ -5231,68 +6502,75 @@ def render_background_transition_panel_gif(
     except ImportError:
         return None
 
-    width, height = panel_size
-    source_old_path = old_background_path or new_background_path
-    source_new_path = new_background_path or old_background_path
-    if source_old_path is None or source_new_path is None:
+    try:
+        width, height = panel_size
+        source_old_path = old_background_path or new_background_path
+        source_new_path = new_background_path or old_background_path
+        if source_old_path is None or source_new_path is None:
+            return None
+
+        old_background_layer = compose_background_layer(panel_size, source_old_path)
+        new_background_layer = compose_background_layer(panel_size, source_new_path)
+        if old_background_layer is None or new_background_layer is None:
+            return None
+
+        if avatar_image is None and state is not None and state.character_name.strip():
+            avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
+        avatar_box = (20, 4, width - 20, height)
+        avatar_layer = _compose_avatar_layer(
+            panel_size,
+            avatar_image,
+            avatar_box,
+            fit_width=fit_avatar_width,
+            clip_to_box=fit_avatar_width,
+        )
+
+        strip = Image.new("RGBA", (width * 2, height), (0, 0, 0, 0))
+        strip.paste(old_background_layer, (0, 0), old_background_layer)
+        strip.paste(new_background_layer, (width, 0), new_background_layer)
+
+        def _frame_at(offset_x: int) -> "Image.Image":
+            clamped_offset = max(0, min(width, offset_x))
+            frame = strip.crop((clamped_offset, 0, clamped_offset + width, height)).convert("RGBA")
+            if avatar_layer is not None:
+                frame.alpha_composite(avatar_layer)
+            return frame
+
+        frames: list[Image.Image] = []
+        durations: list[int] = []
+        frames.append(_gif_frame_from_rgba(_frame_at(0)))
+        durations.append(max(0, int(initial_hold_ms)))
+
+        travel_frames = _cap_frames(max(2, int(round((max(0, travel_ms) / 1000.0) * BG_GIF_ANIMATION_FPS))), BG_GIF_MAX_FRAMES)
+        travel_frame_ms = max(20, int(round(travel_ms / travel_frames))) if travel_ms > 0 else 20
+        for frame_index in range(1, travel_frames):
+            progress = _ease_in_out(frame_index / (travel_frames - 1))
+            offset_x = int(round(width * progress))
+            frames.append(_gif_frame_from_rgba(_frame_at(offset_x)))
+            durations.append(travel_frame_ms)
+
+        frames.append(_gif_frame_from_rgba(_frame_at(width)))
+        durations.append(max(0, int(final_hold_ms)))
+
+        payload, output_format, _ = _encode_transition_payload(
+            frames,
+            durations,
+            loop=1,
+            optimize=True,
+            disposal=2,
+            shared_palette=True,
+            dedupe=True,
+            allow_post_opt=True,
+            profile="standard",
+            label="background_transition",
+            webp_target_bytes_override=WEBP_TARGET_BYTES_STANDARD,
+        )
+        if payload is None:
+            return None
+        return _build_transition_file(payload, filename=filename, output_format=output_format)
+    except Exception:
+        logger.exception("VN bg transition GIF failed")
         return None
-
-    old_background_layer = compose_background_layer(panel_size, source_old_path)
-    new_background_layer = compose_background_layer(panel_size, source_new_path)
-    if old_background_layer is None or new_background_layer is None:
-        return None
-
-    if avatar_image is None and state is not None and state.character_name.strip():
-        avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
-    avatar_box = (20, 4, width - 20, height)
-    avatar_layer = _compose_avatar_layer(
-        panel_size,
-        avatar_image,
-        avatar_box,
-        fit_width=fit_avatar_width,
-        clip_to_box=fit_avatar_width,
-    )
-
-    strip = Image.new("RGBA", (width * 2, height), (0, 0, 0, 0))
-    strip.paste(old_background_layer, (0, 0), old_background_layer)
-    strip.paste(new_background_layer, (width, 0), new_background_layer)
-
-    def _frame_at(offset_x: int) -> "Image.Image":
-        clamped_offset = max(0, min(width, offset_x))
-        frame = strip.crop((clamped_offset, 0, clamped_offset + width, height)).convert("RGBA")
-        if avatar_layer is not None:
-            frame.alpha_composite(avatar_layer)
-        return frame
-
-    frames: list[Image.Image] = []
-    durations: list[int] = []
-    frames.append(_gif_frame_from_rgba(_frame_at(0)))
-    durations.append(max(0, int(initial_hold_ms)))
-
-    travel_frames = max(2, int(round((max(0, travel_ms) / 1000.0) * BG_GIF_ANIMATION_FPS)))
-    travel_frame_ms = max(20, int(round(travel_ms / travel_frames))) if travel_ms > 0 else 20
-    for frame_index in range(1, travel_frames):
-        progress = _ease_in_out(frame_index / (travel_frames - 1))
-        offset_x = int(round(width * progress))
-        frames.append(_gif_frame_from_rgba(_frame_at(offset_x)))
-        durations.append(travel_frame_ms)
-
-    frames.append(_gif_frame_from_rgba(_frame_at(width)))
-    durations.append(max(0, int(final_hold_ms)))
-
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
-        loop=1,
-        optimize=False,
-        disposal=2,
-    )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
 
 
 def render_appearance_transition_panel_gif(
@@ -5310,7 +6588,7 @@ def render_appearance_transition_panel_gif(
     final_hold_ms: int = APPEARANCE_GIF_FINAL_HOLD_MS,
 ) -> Optional[discord.File]:
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageChops, ImageDraw
     except ImportError:
         return None
 
@@ -5362,20 +6640,20 @@ def render_appearance_transition_panel_gif(
             )
 
     def _frame_for_progress(progress: float) -> "Image.Image":
-        frame = base.copy()
+        composed_layers: list["Image.Image"] = []
         reveal_height = max(0, min(height, int(round(height * progress))))
         if before_layer is not None:
             remaining_before = Image.new("RGBA", panel_size, (0, 0, 0, 0))
             if reveal_height < height:
                 bottom_slice = before_layer.crop((0, reveal_height, width, height))
                 remaining_before.paste(bottom_slice, (0, reveal_height), bottom_slice)
-            frame.alpha_composite(remaining_before)
+            composed_layers.append(remaining_before)
         if after_layer is not None and reveal_height > 0:
             revealed_after = Image.new("RGBA", panel_size, (0, 0, 0, 0))
             top_slice = after_layer.crop((0, 0, width, reveal_height))
             revealed_after.paste(top_slice, (0, 0), top_slice)
-            frame.alpha_composite(revealed_after)
-        return frame
+            composed_layers.append(revealed_after)
+        return _compose_static_background_frame(base, *composed_layers)
 
     frames: list[Image.Image] = []
     durations: list[int] = []
@@ -5383,7 +6661,7 @@ def render_appearance_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_frame_for_progress(0.0)))
     durations.append(max(0, int(initial_hold_ms)))
 
-    crossfade_frames = max(2, int(round((max(0, crossfade_ms) / 1000.0) * APPEARANCE_GIF_ANIMATION_FPS)))
+    crossfade_frames = _cap_frames(max(2, int(round((max(0, crossfade_ms) / 1000.0) * APPEARANCE_GIF_ANIMATION_FPS))), APPEARANCE_GIF_MAX_FRAMES)
     crossfade_frame_ms = max(20, int(round(crossfade_ms / crossfade_frames))) if crossfade_ms > 0 else 20
     for frame_index in range(1, crossfade_frames):
         progress = _ease_in_out(frame_index / (crossfade_frames - 1))
@@ -5393,19 +6671,31 @@ def render_appearance_transition_panel_gif(
     frames.append(_gif_frame_from_rgba(_frame_for_progress(1.0)))
     durations.append(max(0, int(final_hold_ms)))
 
-    output = io.BytesIO()
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
+    payload, output_format, _ = _encode_transition_payload(
+        frames,
+        durations,
         loop=1,
-        optimize=False,
+        optimize=True,
         disposal=2,
+        shared_palette=True,
+        dedupe=True,
+        allow_post_opt=True,
+        profile="standard",
+        label="appearance_transition",
+        webp_target_bytes_override=WEBP_TARGET_BYTES_STANDARD,
     )
-    output.seek(0)
-    return discord.File(fp=output, filename=filename)
+    if payload is None:
+        return None
+    return _build_transition_file(payload, filename=filename, output_format=output_format)
+
+
+class _PanelBackgroundUnset:
+    """Sentinel: use get_selected_background_path(state.user_id) in render_vn_panel."""
+
+    __slots__ = ()
+
+
+_PANEL_BACKGROUND_UNSET = _PanelBackgroundUnset()
 
 
 def render_vn_panel(
@@ -5426,9 +6716,10 @@ def render_vn_panel(
     gacha_pose_override: Optional[str] = None,
     gacha_border: Optional[str] = None,
     override_avatar_image: Optional["Image.Image"] = None,
+    panel_background_path: Union[Optional[Path], _PanelBackgroundUnset] = _PANEL_BACKGROUND_UNSET,
 ) -> Optional[discord.File]:
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageChops, ImageDraw
     except ImportError:
         return None
 
@@ -5523,7 +6814,7 @@ def render_vn_panel(
             selection_scope=selection_scope,
         )
     if avatar_image is not None and avatar_box:
-        _paste_avatar_into_box(base, avatar_image, avatar_box)
+        _paste_avatar_into_box(base, avatar_image, avatar_box, use_mask_guide=True)
         pos_x = avatar_box[0]
         pos_y = avatar_box[1]
         logger.debug(
@@ -5690,15 +6981,24 @@ def render_vn_panel(
     working_content = message_content.strip()
     # Removed fallback message - empty content is allowed for image-only posts
 
-    background_path = get_selected_background_path(state.user_id)
+    if panel_background_path is _PANEL_BACKGROUND_UNSET:
+        background_path = get_selected_background_path(state.user_id)
+    else:
+        background_path = panel_background_path
     background_layer = compose_background_layer((base.width, base.height), background_path)
     if background_layer:
         base = Image.alpha_composite(background_layer, base)
         draw = ImageDraw.Draw(base)
 
     base_text_font = _load_vn_font(VN_TEXT_FONT_SIZE)
-    max_width = text_box[2] - text_box[0] - text_padding * 2
-    total_height = text_box[3] - text_box[1] - text_padding * 2
+    # Clamp text bounds to panel size first so custom layouts (e.g., Narrator)
+    # follow the same emoji sizing/centering rules as default panels.
+    text_left = max(0, min(base.width - 1, text_box[0] + text_padding))
+    text_top = max(0, min(base.height - 1, text_box[1] + text_padding))
+    text_right = max(text_left + 1, min(base.width, text_box[2] - text_padding))
+    text_bottom = max(text_top + 1, min(base.height, text_box[3] - text_padding))
+    max_width = max(1, text_right - text_left)
+    total_height = max(1, text_bottom - text_top)
 
     reply_font = None
     reply_line: Optional[str] = None
@@ -5728,6 +7028,7 @@ def render_vn_panel(
     emoji_target_size: Optional[int] = None
     if big_emoji_mode:
         target_size = int(min(max_width, available_height) * 0.9)
+        target_size = min(target_size, VN_BIG_EMOJI_MAX_PX)
         if target_size < VN_TEXT_FONT_SIZE:
             target_size = VN_TEXT_FONT_SIZE
         emoji_target_size = target_size
@@ -5738,12 +7039,14 @@ def render_vn_panel(
     if big_emoji_mode:
         block_height = emoji_target_size or getattr(text_font, "size", VN_TEXT_FONT_SIZE)
         vertical_offset = max(0, (available_height - block_height) // 2)
-    text_y = text_box[1] + text_padding + vertical_offset
+    text_y = text_top + vertical_offset
+    text_overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    text_overlay_draw = ImageDraw.Draw(text_overlay)
 
     if reply_font and reply_line:
         reply_fill = (190, 190, 190, 255)
-        text_x = text_box[0] + text_padding
-        draw.text((text_x, text_y), reply_line, fill=reply_fill, font=reply_font)
+        text_x = text_left
+        text_overlay_draw.text((text_x, text_y), reply_line, fill=reply_fill, font=reply_font)
         text_y += _font_line_height(reply_font) + 6
 
     base_line_height = getattr(text_font, "size", VN_TEXT_FONT_SIZE)
@@ -5766,9 +7069,9 @@ def render_vn_panel(
             line_width += segment_width
 
         if big_emoji_mode:
-            text_x = text_box[0] + text_padding + max(0, (max_width - line_width) // 2)
+            text_x = text_left + max(0, (max_width - line_width) // 2)
         else:
-            text_x = text_box[0] + text_padding
+            text_x = text_left
 
         for segment in line:
             fill = segment.get("color", (240, 240, 240, 255))
@@ -5786,23 +7089,34 @@ def render_vn_panel(
                 target_h = int(height) or base_line_height
                 if big_emoji_mode and emoji_target_size:
                     target_w = target_h = emoji_target_size
+                target_w = max(1, min(int(target_w), max_width))
+                target_h = max(1, min(int(target_h), available_height))
                 advance = width or target_w
                 if big_emoji_mode and emoji_target_size:
                     advance = emoji_target_size
+                advance = max(1, min(int(advance), max_width))
                 if emoji_img is not None:
-                    emoji_render = emoji_img.copy().resize((target_w, target_h), Image.LANCZOS)
+                    emoji_source = emoji_img.copy()
+                    if emoji_source.mode != "RGBA":
+                        emoji_source = emoji_source.convert("RGBA")
+                    # Ignore transparent padding so emoji sizing is consistent
+                    # across custom layouts (e.g., Narrator) and default panels.
+                    alpha_bbox = emoji_source.getchannel("A").getbbox()
+                    if alpha_bbox:
+                        emoji_source = emoji_source.crop(alpha_bbox)
+                    emoji_render = emoji_source.resize((target_w, target_h), Image.LANCZOS)
                     if big_emoji_mode:
                         offset_y = text_y + max(0, (line_height - emoji_render.height) // 2)
                     else:
                         offset_y = text_y + max(0, base_line_height - emoji_render.height)
-                    base.paste(emoji_render, (int(text_x), int(offset_y)), emoji_render)
+                    text_overlay.paste(emoji_render, (int(text_x), int(offset_y)), emoji_render)
                 else:
                     fallback = segment.get("fallback_text") or text_segment or custom_meta.get("name") or ""
                     if fallback:
                         draw_y = text_y
                         if big_emoji_mode:
                             draw_y = text_y + max(0, (line_height - height) // 2)
-                        draw.text((text_x, draw_y), fallback, fill=fill, font=text_font)
+                        text_overlay_draw.text((text_x, draw_y), fallback, fill=fill, font=text_font)
                 height = max(height, target_h)
                 text_x += advance
                 continue
@@ -5810,16 +7124,26 @@ def render_vn_panel(
                 draw_y = text_y
                 if big_emoji_mode:
                     draw_y = text_y + max(0, (line_height - height) // 2)
-                draw.text((text_x, draw_y), text_segment, fill=fill, font=font_segment)
+                text_overlay_draw.text((text_x, draw_y), text_segment, fill=fill, font=font_segment)
                 if segment.get("strike"):
                     strike_y = draw_y + height / 2
-                    draw.line(
+                    text_overlay_draw.line(
                         (text_x, strike_y, text_x + width, strike_y),
                         fill=fill,
                         width=max(1, int(height / 10)),
                     )
             text_x += width
         text_y += line_height + line_spacing
+    clip_mask = Image.new("L", base.size, 0)
+    clip_mask_draw = ImageDraw.Draw(clip_mask)
+    clip_left = text_left
+    clip_top = text_top
+    clip_right = text_right
+    clip_bottom = text_bottom
+    clip_mask_draw.rectangle((clip_left, clip_top, clip_right - 1, clip_bottom - 1), fill=255)
+    clipped_alpha = ImageChops.multiply(text_overlay.getchannel("A"), clip_mask)
+    text_overlay.putalpha(clipped_alpha)
+    base = Image.alpha_composite(base, text_overlay)
     if border_img is not None:
         base = Image.alpha_composite(base, border_img)
 
@@ -5875,6 +7199,8 @@ async def prepare_custom_emoji_images(
     message: discord.Message,
     segments: Sequence[dict],
 ) -> Dict[str, "Image.Image"]:
+    if segments is None:
+        return {}
     try:
         from PIL import Image
     except ImportError:
@@ -5972,6 +7298,7 @@ __all__ = [
     "get_selected_pose_outfit",
     "set_selected_outfit_name",
     "set_selected_pose_outfit",
+    "seed_vn_selection_from_scopes",
     "set_character_directory_overrides",
     "strip_urls",
     "prepare_panel_mentions",

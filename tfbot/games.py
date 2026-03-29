@@ -11,6 +11,7 @@ import os
 import time
 import random
 import secrets
+from collections import deque
 from datetime import datetime, timedelta
 
 # SystemRandom instance for statistically accurate dice rolls
@@ -23,13 +24,121 @@ from discord.ext import commands
 
 from .game_models import GameConfig, GamePlayer, GameState
 from .game_board import render_game_board, validate_coordinate, _resolve_face_cache_path
+from .panel_executor import run_panel_render_gif, run_panel_render_vn
 from .game_pack_loader import get_game_pack
 from .utils import get_channel_id, is_admin, is_bot_mod, int_from_env, path_from_env
 from .models import TransformationState, TFCharacter
 from .swaps import ensure_form_owner
 from .state import serialize_state, deserialize_state
+from .animation_perf_log import log_event as log_animation_perf_event
+from tfbot.transition_constants import (
+    GIF_COLORS,
+    GIF_DITHER_MODE,
+    GIF_SHARED_PALETTE,
+    GIF_TARGET_BYTES,
+    TRANSITION_FALLBACK_FORMAT,
+    TRANSITION_PRIMARY_FORMAT,
+    WEBP_METHOD,
+    WEBP_QUALITY,
+    WEBP_TARGET_BYTES,
+)
 
 logger = logging.getLogger("tfbot.games")
+_SEND_TIMINGS: deque[float] = deque(maxlen=200)
+_SEND_COUNT = 0
+
+
+def _send_pctl(values: deque[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+    return ordered[idx]
+
+
+async def _timed_send(label: str, awaitable):
+    global _SEND_COUNT
+    started = time.perf_counter()
+    result = await awaitable
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    _SEND_TIMINGS.append(elapsed_ms)
+    _SEND_COUNT += 1
+    if _SEND_COUNT % 25 == 0:
+        logger.info(
+            "games-send n=%d upload p50=%.0fms p95=%.0fms",
+            _SEND_COUNT,
+            _send_pctl(_SEND_TIMINGS, 0.5),
+            _send_pctl(_SEND_TIMINGS, 0.95),
+        )
+    if elapsed_ms >= 3000:
+        logger.warning("games-send slow label=%s upload=%.0fms", label, elapsed_ms)
+    return result
+
+
+async def _timed_send_ms(label: str, awaitable):
+    started = time.perf_counter()
+    result = await _timed_send(label, awaitable)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return result, elapsed_ms
+
+
+def _discord_file_size_bytes(file_obj) -> Optional[int]:
+    if file_obj is None:
+        return None
+    fp = getattr(file_obj, "fp", None)
+    if fp is None:
+        return None
+    try:
+        if hasattr(fp, "getvalue"):
+            data = fp.getvalue()
+            if isinstance(data, (bytes, bytearray)):
+                return len(data)
+        pos = fp.tell() if hasattr(fp, "tell") else None
+        if hasattr(fp, "seek"):
+            fp.seek(0)
+        data = fp.read()
+        if pos is not None and hasattr(fp, "seek"):
+            fp.seek(pos)
+        if isinstance(data, (bytes, bytearray)):
+            return len(data)
+    except Exception:
+        return None
+    return None
+
+
+def _log_transition_send_metrics(
+    *,
+    label: str,
+    render_ms: float,
+    upload_ms: float,
+    total_ms: float,
+    payload_bytes: Optional[int],
+) -> None:
+    logger.info(
+        "game-transition-send label=%s bytes=%s render=%.0fms upload=%.0fms total=%.0fms",
+        label,
+        payload_bytes if payload_bytes is not None else "unknown",
+        render_ms,
+        upload_ms,
+        total_ms,
+    )
+    log_animation_perf_event(
+        "game_transition_send",
+        label=label,
+        bytes=payload_bytes if payload_bytes is not None else "unknown",
+        render_ms=f"{render_ms:.0f}",
+        upload_ms=f"{upload_ms:.0f}",
+        total_ms=f"{total_ms:.0f}",
+        format=TRANSITION_PRIMARY_FORMAT,
+        fallback_format=TRANSITION_FALLBACK_FORMAT,
+        webp_quality=str(WEBP_QUALITY),
+        webp_method=str(WEBP_METHOD),
+        webp_target_bytes=str(WEBP_TARGET_BYTES),
+        gif_colors=str(GIF_COLORS),
+        gif_dither=GIF_DITHER_MODE,
+        gif_shared_palette="1" if GIF_SHARED_PALETTE else "0",
+        gif_target_bytes=str(GIF_TARGET_BYTES),
+    )
 
 
 def _load_game_config(config_path: Path) -> Optional[GameConfig]:
@@ -1698,102 +1807,54 @@ class GameBoardManager:
             # Skip VN panel rendering if only stickers/GIFs are present (no text) - send them directly instead
             files = []
             if MESSAGE_STYLE == "vn" and cleaned_content:
-                # Create a wrapper to use game-specific background without touching global state
-                # We'll temporarily monkey-patch get_selected_background_path for this render
-                from tfbot.panels import get_selected_background_path as global_get_bg
-                
-                def game_background_getter(user_id: int) -> Optional[Path]:
-                    """Override background lookup to use game-specific background.
-                    
-                    CRITICAL: This function uses message.author.id and player.background_id,
-                    NOT form_owner_user_id. This ensures !swap and !pswap have identical
-                    background behavior, differing only in reroll reversal behavior.
-                    """
-                    if user_id == message.author.id:
-                        # Always use gameboard background for this player
-                        # Note: Uses message.author.id, not form_owner_user_id, so !swap and !pswap behave identically
-                        if background_path:
-                            return background_path
-                        # Fallback: if background_path is None, try to get it from player.background_id directly
-                        if player.background_id is not None:
-                            logger.debug("Background path was None in monkey-patch, recalculating from player.background_id=%s", 
-                                       player.background_id)
-                            fallback_path = self._get_game_background_path(player.background_id)
-                            if fallback_path:
-                                return fallback_path
-                            logger.warning("Failed to get background path from player.background_id=%s in monkey-patch", 
-                                         player.background_id)
-                        # If still None, don't fall back to VN mode - return None to use default
-                        logger.debug("No gameboard background available for user_id=%s, returning None (will use default)", user_id)
-                        return None
-                    # Fall back to default behavior for other users (shouldn't happen in games)
-                    return global_get_bg(user_id)
-                
-                # Temporarily replace the function
-                import tfbot.panels as panels_module
-                original_func = panels_module.get_selected_background_path
-                panels_module.get_selected_background_path = game_background_getter
-                
-                try:
-                    # Render with game-specific character (use game-assigned character, not VN mode)
-                    # CRITICAL: Always use player.character_name (the source of truth) not state.character_name
-                    # The state might be stale or incorrect, but player.character_name is always correct
-                    # character_display_name is already defined above
-                    
-                    # CRITICAL: If state.character_name doesn't match, fix the state immediately
-                    if state.character_name != player.character_name:
-                        logger.error("CRITICAL MISMATCH before render: state.character_name='%s' != player.character_name='%s'. Fixing state...", 
-                                    state.character_name, player.character_name)
-                        # Get the character object to update all fields
-                        character = self._get_character_by_name(player.character_name, game_state=game_state)
-                        if character:
-                            # Update ALL character-related fields, not just the name
-                            state.character_name = player.character_name
-                            state.character_folder = character.folder
-                            state.character_avatar_path = character.avatar_path or ""
-                            state.character_message = character.message or ""
-                            logger.info("Updated state with character '%s' (folder='%s', avatar='%s')", 
-                                       character.name, character.folder, character.avatar_path)
-                        else:
-                            # Fallback: just update the name if character lookup fails
-                            logger.warning("Character lookup failed for '%s', only updating name", player.character_name)
-                            state.character_name = player.character_name
-                        # Also update the stored state
-                        game_state.player_states[message.author.id] = state
-                        # Note: Auto-save removed - use !savegame to save manually
-                        logger.info("Fixed state: now state.character_name='%s', folder='%s', avatar='%s'", 
-                                   state.character_name, state.character_folder, state.character_avatar_path)
-                    
-                    logger.info("Rendering VN panel for game player: user_id=%s, player.character_name='%s', state.character_name='%s', character_display_name='%s'", 
-                               message.author.id, player.character_name, state.character_name, character_display_name)
-                    
-                    # CRITICAL: Verify state has all required fields before rendering
-                    if not state.character_name:
-                        logger.error("State missing character_name! Cannot render VN panel.")
-                    elif not state.character_avatar_path:
-                        logger.warning("State missing character_avatar_path for %s", state.character_name)
-                    
-                    vn_file = render_vn_panel(
-                        state=state,
-                        message_content=cleaned_content,
-                        character_display_name=character_display_name,
-                        original_name=message.author.display_name,
-                        attachment_id=str(message.id),
-                        formatted_segments=formatted_segments,
-                        custom_emoji_images=custom_emoji_images,
-                        reply_context=reply_context,
-                        gacha_outfit_override=player.outfit_name if player.outfit_name else None,
-                    )
-                    if vn_file:
-                        logger.info("VN panel rendered successfully for %s", character_display_name)
-                        files.append(vn_file)
+                # Gameboard background is passed into render_vn_panel (no global monkey-patch—thread-safe with run_panel_render).
+                # CRITICAL: Always use player.character_name (the source of truth) not state.character_name
+                if state.character_name != player.character_name:
+                    logger.error("CRITICAL MISMATCH before render: state.character_name='%s' != player.character_name='%s'. Fixing state...", 
+                                state.character_name, player.character_name)
+                    character = self._get_character_by_name(player.character_name, game_state=game_state)
+                    if character:
+                        state.character_name = player.character_name
+                        state.character_folder = character.folder
+                        state.character_avatar_path = character.avatar_path or ""
+                        state.character_message = character.message or ""
+                        logger.info("Updated state with character '%s' (folder='%s', avatar='%s')", 
+                                   character.name, character.folder, character.avatar_path)
                     else:
-                        logger.warning("render_vn_panel returned None for %s (character_name='%s', state.character_name='%s')", 
-                                     character_display_name, player.character_name, state.character_name)
-                finally:
-                    # Restore original function (critical for isolation)
-                    panels_module.get_selected_background_path = original_func
-            
+                        logger.warning("Character lookup failed for '%s', only updating name", player.character_name)
+                        state.character_name = player.character_name
+                    game_state.player_states[message.author.id] = state
+                    logger.info("Fixed state: now state.character_name='%s', folder='%s', avatar='%s'", 
+                               state.character_name, state.character_folder, state.character_avatar_path)
+
+                logger.info("Rendering VN panel for game player: user_id=%s, player.character_name='%s', state.character_name='%s', character_display_name='%s'", 
+                           message.author.id, player.character_name, state.character_name, character_display_name)
+
+                if not state.character_name:
+                    logger.error("State missing character_name! Cannot render VN panel.")
+                elif not state.character_avatar_path:
+                    logger.warning("State missing character_avatar_path for %s", state.character_name)
+
+                vn_file = await run_panel_render_vn(
+                    render_vn_panel,
+                    state=state,
+                    message_content=cleaned_content,
+                    character_display_name=character_display_name,
+                    original_name=message.author.display_name,
+                    attachment_id=str(message.id),
+                    formatted_segments=formatted_segments,
+                    custom_emoji_images=custom_emoji_images,
+                    reply_context=reply_context,
+                    gacha_outfit_override=player.outfit_name if player.outfit_name else None,
+                    panel_background_path=background_path,
+                )
+                if vn_file:
+                    logger.info("VN panel rendered successfully for %s", character_display_name)
+                    files.append(vn_file)
+                else:
+                    logger.warning("render_vn_panel returned None for %s (character_name='%s', state.character_name='%s')", 
+                                 character_display_name, player.character_name, state.character_name)
+
             # If only stickers/GIFs are present (no text), send them directly without VN panel
             if not cleaned_content and (has_attachments or has_stickers or has_embeds):
                 if not is_queued:
@@ -2623,7 +2684,8 @@ class GameBoardManager:
                     })()
             
             # Render VN panel - EXACT same call as VN mode uses
-            vn_file = render_vn_panel(
+            vn_file = await run_panel_render_vn(
+                render_vn_panel,
                 state=narrator_state,
                 message_content=cleaned_content,
                 character_display_name=narrator_char_name,  # Use "Narrator" for display
@@ -5645,17 +5707,20 @@ class GameBoardManager:
             left_label = f"{(new_state1.character_name if new_state1 and new_state1.character_name else resolved_member1.display_name)}({resolved_member1.display_name})"
             right_label = f"{(new_state2.character_name if new_state2 and new_state2.character_name else resolved_member2.display_name)}({resolved_member2.display_name})"
             message_text = f"<@{ctx.author.id}> swapped {left_label} with {right_label}"
-            transition_file = render_swap_transition_panel_gif(
+            transition_started = time.perf_counter()
+            transition_file = await run_panel_render_gif(
+                render_swap_transition_panel_gif,
                 before_left_state=state1,
                 before_right_state=state2,
                 after_left_state=new_state1,
                 after_right_state=new_state2,
                 left_background_user_id=resolved_member1.id,
                 right_background_user_id=resolved_member2.id,
-                filename=f"swap_{resolved_member1.id}_{resolved_member2.id}.gif",
+                filename=f"swap_{resolved_member1.id}_{resolved_member2.id}.webp",
             )
             if transition_file is None:
-                transition_file = render_swap_transition_panel(
+                transition_file = await run_panel_render_gif(
+                    render_swap_transition_panel,
                     left_state=new_state1,
                     right_state=new_state2,
                     left_background_user_id=resolved_member1.id,
@@ -5663,17 +5728,31 @@ class GameBoardManager:
                     filename=f"swap_{resolved_member1.id}_{resolved_member2.id}.png",
                 )
             if transition_file is not None:
-                await ctx.reply(
-                    content=message_text,
-                    file=transition_file,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                render_ms = (time.perf_counter() - transition_started) * 1000.0
+                _, upload_ms = await _timed_send_ms(
+                    "game_swap_transition_send",
+                    ctx.reply(
+                        content=message_text,
+                        file=transition_file,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    ),
+                )
+                _log_transition_send_metrics(
+                    label="game_swap_transition_send",
+                    render_ms=render_ms,
+                    upload_ms=upload_ms,
+                    total_ms=(time.perf_counter() - transition_started) * 1000.0,
+                    payload_bytes=_discord_file_size_bytes(transition_file),
                 )
             else:
-                await ctx.reply(
-                    message_text,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                await _timed_send(
+                    "game_swap_text_send",
+                    ctx.reply(
+                        message_text,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    ),
                 )
             await self._log_action(game_state, f"{resolved_member1.display_name} and {resolved_member2.display_name} swapped characters and positions")
         
@@ -5890,17 +5969,20 @@ class GameBoardManager:
             left_label = f"{(new_state1.character_name if new_state1 and new_state1.character_name else resolved_member1.display_name)}({resolved_member1.display_name})"
             right_label = f"{(new_state2.character_name if new_state2 and new_state2.character_name else resolved_member2.display_name)}({resolved_member2.display_name})"
             message_text = f"<@{ctx.author.id}> permanently swapped {left_label} with {right_label}"
-            transition_file = render_swap_transition_panel_gif(
+            transition_started = time.perf_counter()
+            transition_file = await run_panel_render_gif(
+                render_swap_transition_panel_gif,
                 before_left_state=state1,
                 before_right_state=state2,
                 after_left_state=new_state1,
                 after_right_state=new_state2,
                 left_background_user_id=resolved_member1.id,
                 right_background_user_id=resolved_member2.id,
-                filename=f"pswap_{resolved_member1.id}_{resolved_member2.id}.gif",
+                filename=f"pswap_{resolved_member1.id}_{resolved_member2.id}.webp",
             )
             if transition_file is None:
-                transition_file = render_swap_transition_panel(
+                transition_file = await run_panel_render_gif(
+                    render_swap_transition_panel,
                     left_state=new_state1,
                     right_state=new_state2,
                     left_background_user_id=resolved_member1.id,
@@ -5908,17 +5990,31 @@ class GameBoardManager:
                     filename=f"pswap_{resolved_member1.id}_{resolved_member2.id}.png",
                 )
             if transition_file is not None:
-                await ctx.reply(
-                    content=message_text,
-                    file=transition_file,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                render_ms = (time.perf_counter() - transition_started) * 1000.0
+                _, upload_ms = await _timed_send_ms(
+                    "game_pswap_transition_send",
+                    ctx.reply(
+                        content=message_text,
+                        file=transition_file,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    ),
+                )
+                _log_transition_send_metrics(
+                    label="game_pswap_transition_send",
+                    render_ms=render_ms,
+                    upload_ms=upload_ms,
+                    total_ms=(time.perf_counter() - transition_started) * 1000.0,
+                    payload_bytes=_discord_file_size_bytes(transition_file),
                 )
             else:
-                await ctx.reply(
-                    message_text,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                await _timed_send(
+                    "game_pswap_text_send",
+                    ctx.reply(
+                        message_text,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    ),
                 )
             await self._log_action(game_state, f"{resolved_member1.display_name} and {resolved_member2.display_name} permanently swapped characters and positions")
         
@@ -6265,7 +6361,8 @@ class GameBoardManager:
                                 formatted_segments = parse_discord_formatting(transform_msg)
                                 custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
                                 
-                                vn_file = render_vn_panel(
+                                vn_file = await run_panel_render_vn(
+                                    render_vn_panel,
                                     state=state,
                                     message_content=transform_msg,
                                     character_display_name=state.character_name,

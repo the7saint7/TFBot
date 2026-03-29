@@ -3,21 +3,53 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 logger = logging.getLogger("tfbot.character_lookup")
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_BOT_BASE = PACKAGE_DIR.parent
 
 
 class CharacterNormalizationError(Exception):
     """Raised when a submitted character name cannot be normalized."""
 
 
-class CharacterNameNormalizer:
-    """Normalize submitted character folder names to their canonical casing."""
+def resolve_characters_git_root(base_dir: Optional[Path] = None) -> Optional[Path]:
+    """Directory containing `.git` for the configured characters repository."""
+    root_base = (base_dir or DEFAULT_BOT_BASE).resolve()
+    repo_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip() or "characters_repo"
+    repo_dir = Path(repo_setting)
+    if not repo_dir.is_absolute():
+        repo_dir = (root_base / repo_dir).resolve()
+    if not repo_dir.exists() or not (repo_dir / ".git").exists():
+        return None
+    return repo_dir
 
-    def __init__(self, repo_root: Path, *, extra_candidates: Optional[Sequence[str]] = None):
-        self.repo_root = repo_root
+
+def resolve_characters_content_root(base_dir: Optional[Path] = None) -> Optional[Path]:
+    """Directory whose immediate subfolders are character names (matches `TFBOT_VN_ASSET_ROOT` / startup)."""
+    git_root = resolve_characters_git_root(base_dir)
+    if git_root is None:
+        return None
+    subdir = os.getenv("TFBOT_CHARACTERS_REPO_SUBDIR", "characters").strip()
+    content = (git_root / subdir) if subdir else git_root
+    if not content.is_dir():
+        return None
+    return content.resolve()
+
+
+class CharacterNameNormalizer:
+    """Normalize submitted character folder names to their canonical casing.
+
+    ``content_root`` is the directory that directly contains character folders (not the git root unless
+    ``TFBOT_CHARACTERS_REPO_SUBDIR`` is empty).
+    """
+
+    def __init__(self, content_root: Path, *, extra_candidates: Optional[Sequence[str]] = None):
+        self.content_root = content_root
         self._extra_candidates = tuple(
             str(candidate).strip() for candidate in (extra_candidates or []) if str(candidate).strip()
         )
@@ -79,9 +111,8 @@ class CharacterNameNormalizer:
 
     def _candidate_names(self) -> Iterable[str]:
         names: Set[str] = set()
-        characters_dir = self.repo_root / "characters"
-        if characters_dir.exists():
-            for entry in characters_dir.iterdir():
+        if self.content_root.exists():
+            for entry in self.content_root.iterdir():
                 if entry.is_dir():
                     candidate = entry.name.strip()
                     if candidate:
@@ -93,4 +124,9 @@ class CharacterNameNormalizer:
         return sorted(names, key=str.lower)
 
 
-__all__ = ["CharacterNameNormalizer", "CharacterNormalizationError"]
+__all__ = [
+    "CharacterNameNormalizer",
+    "CharacterNormalizationError",
+    "resolve_characters_git_root",
+    "resolve_characters_content_root",
+]

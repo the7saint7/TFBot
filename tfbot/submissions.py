@@ -12,13 +12,19 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, FrozenSet, Optional, Sequence
 
 import discord
 from discord.ext import commands
 
-from tfbot.character_lookup import CharacterNameNormalizer, CharacterNormalizationError
+from tfbot.character_lookup import (
+    CharacterNameNormalizer,
+    CharacterNormalizationError,
+    resolve_characters_content_root,
+    resolve_characters_git_root,
+)
 from tfbot.models import TransformationState
+from tfbot.panel_executor import run_panel_render_vn
 from tfbot.panels import VN_CACHE_DIR, compose_game_avatar, parse_discord_formatting, render_vn_panel
 from tfbot.utils import _parse_quoted_comma_list, get_setting, is_admin, utc_now
 
@@ -43,18 +49,47 @@ ARCHIVE_DIR = SUBMISSIONS_DIR / "archive"
 
 ACCEPT_EMOJI = "✅"
 DECLINE_EMOJI = "❌"
-SUBMISSION_CHANNEL_ID = int(os.getenv("TFBOT_SUBMISSION_CHANNEL_ID", "0") or 0)
+
+_ALLOWED_SUBMISSION_CHANNEL_IDS: FrozenSet[int] = frozenset()
 
 
-def _resolve_characters_repo_root() -> Optional[Path]:
-    repo_setting = os.getenv("TFBOT_CHARACTERS_REPO_DIR", "characters_repo").strip() or "characters_repo"
-    repo_dir = Path(repo_setting)
-    if not repo_dir.is_absolute():
-        repo_dir = (BASE_DIR / repo_dir).resolve()
-    repo_git = repo_dir / ".git"
-    if not repo_dir.exists() or not repo_git.exists():
+def set_submission_channel_allowlist(*channel_ids: int) -> None:
+    """Register Discord channel IDs where !submit / !mirror / !synch are allowed (from bot.py get_channel_id)."""
+    global _ALLOWED_SUBMISSION_CHANNEL_IDS
+    _ALLOWED_SUBMISSION_CHANNEL_IDS = frozenset(i for i in channel_ids if i > 0)
+
+
+def _submission_channel_bucket_name(channel_id: int) -> str:
+    return f"ch_{int(channel_id)}"
+
+
+def _pending_root_for_channel(channel_id: int) -> Path:
+    return PENDING_DIR / _submission_channel_bucket_name(channel_id)
+
+
+def _archive_bucket_for_channel(channel_id: int) -> Path:
+    return ARCHIVE_DIR / _submission_channel_bucket_name(channel_id)
+
+
+def _storage_root_from_meta_path(meta_path: Path, root: Path) -> Optional[Path]:
+    """Legacy: root/<token>/meta.json -> storage_root root. New: root/ch_<id>/<token>/meta.json -> root/ch_<id>."""
+    try:
+        rel = meta_path.relative_to(root)
+    except ValueError:
         return None
-    return repo_dir
+    parts = rel.parts
+    if len(parts) == 2 and parts[1] == "meta.json":
+        return root
+    if len(parts) == 3 and parts[0].startswith("ch_") and parts[2] == "meta.json":
+        return root / parts[0]
+    return None
+
+
+def _reject_if_submission_channel_forbidden(channel_id: int) -> bool:
+    """True if this channel may not run submission commands."""
+    if not _ALLOWED_SUBMISSION_CHANNEL_IDS:
+        return False
+    return channel_id not in _ALLOWED_SUBMISSION_CHANNEL_IDS
 
 
 def _ensure_directories() -> None:
@@ -153,14 +188,18 @@ class SubmissionRecord:
         self.meta_path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     def move_to_archive(self) -> None:
-        if self.storage_root == ARCHIVE_DIR:
+        try:
+            self.directory.resolve().relative_to(ARCHIVE_DIR.resolve())
             return
-        target_dir = ARCHIVE_DIR / self.token
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        except ValueError:
+            pass
+        bucket = _archive_bucket_for_channel(self.channel_id)
+        target_dir = bucket / self.token
+        bucket.mkdir(parents=True, exist_ok=True)
         if target_dir.exists():
             shutil.rmtree(target_dir)
         shutil.move(str(self.directory), str(target_dir))
-        self.storage_root = ARCHIVE_DIR
+        self.storage_root = bucket
 
 
 class SubmissionManager:
@@ -169,7 +208,8 @@ class SubmissionManager:
         self.records_by_token: Dict[str, SubmissionRecord] = {}
         self.pending_by_message: Dict[int, SubmissionRecord] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
-        self._repo_root: Optional[Path] = None
+        self._git_root: Optional[Path] = None
+        self._content_root: Optional[Path] = None
         self._character_normalizer: Optional[CharacterNameNormalizer] = None
         _ensure_directories()
         self._load_existing()
@@ -178,13 +218,16 @@ class SubmissionManager:
         for root in (PENDING_DIR, ARCHIVE_DIR):
             if not root.exists():
                 continue
-            for meta_path in root.glob("*/meta.json"):
+            for meta_path in root.rglob("meta.json"):
+                storage_root = _storage_root_from_meta_path(meta_path, root)
+                if storage_root is None:
+                    continue
                 try:
                     data = json.loads(meta_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
                     logger.warning("Failed to read submission metadata %s: %s", meta_path, exc)
                     continue
-                record = SubmissionRecord.from_meta(data, storage_root=root)
+                record = SubmissionRecord.from_meta(data, storage_root=storage_root)
                 if record is None:
                     logger.warning("Submission metadata malformed: %s", meta_path)
                     continue
@@ -200,7 +243,7 @@ class SubmissionManager:
         if not isinstance(author, discord.Member) or guild is None:
             await ctx.reply("Run this command inside a server.", mention_author=False)
             return
-        if SUBMISSION_CHANNEL_ID and ctx.channel.id != SUBMISSION_CHANNEL_ID:
+        if _reject_if_submission_channel_forbidden(ctx.channel.id):
             await ctx.reply("This command can only be used in the designated submission channel.", mention_author=False)
             return
         attachment = self._select_attachment(ctx.message.attachments)
@@ -211,15 +254,16 @@ class SubmissionManager:
         if validation:
             await ctx.reply(validation, mention_author=False)
             return
-        repo_root = self._resolve_repo()
-        if repo_root is None:
+        git_root = self._resolve_git_root()
+        content_root = self._resolve_content_root()
+        if git_root is None or content_root is None:
             await ctx.reply("characters_repo is not configured; submissions are unavailable.", mention_author=False)
             return
-        character, normalization_error = self._normalize_character_name(character, repo_root=repo_root)
+        character, normalization_error = self._normalize_character_name(character, content_root=content_root)
         if normalization_error:
             await ctx.reply(normalization_error, mention_author=False)
             return
-        pose_dir = repo_root / "characters" / character / pose
+        pose_dir = content_root / character / pose
         target_dir = pose_dir / "outfits"
         try:
             pose_dir.mkdir(parents=True, exist_ok=True)
@@ -228,8 +272,10 @@ class SubmissionManager:
             logger.warning("Failed to create character/pose directory %s: %s", target_dir, exc)
             await ctx.reply("Unable to create character or pose folders in characters_repo.", mention_author=False)
             return
-        relative_path = self._build_relative_outfit_path(character, pose, outfit)
-        dest_file = repo_root / relative_path
+        relative_path = self._build_relative_outfit_path(
+            character, pose, outfit, git_root=git_root, content_root=content_root
+        )
+        dest_file = git_root / relative_path
         if dest_file.exists():
             await ctx.reply("An outfit with that name already exists. Choose a different outfit name.", mention_author=False)
             return
@@ -246,7 +292,7 @@ class SubmissionManager:
             pose=pose,
             outfit=outfit,
             attachment_url=attachment.url,
-            relative_path=str(relative_path),
+            relative_path=relative_path.as_posix(),
         )
         try:
             self._store_image(record, image)
@@ -258,7 +304,7 @@ class SubmissionManager:
         finally:
             image.close()
         preview_text = f"pose: {pose}\noutfit: {outfit}"
-        panel_file = self._render_preview(record, preview_text)
+        panel_file = await run_panel_render_vn(self._render_preview, record, preview_text)
         if panel_file is None:
             await ctx.reply("Unable to render the VN panel preview. Please contact staff.", mention_author=False)
             self._discard_record(record)
@@ -295,7 +341,7 @@ class SubmissionManager:
         if not isinstance(author, discord.Member) or guild is None:
             await ctx.reply("Run this command inside a server.", mention_author=False)
             return
-        if SUBMISSION_CHANNEL_ID and ctx.channel.id != SUBMISSION_CHANNEL_ID:
+        if _reject_if_submission_channel_forbidden(ctx.channel.id):
             await ctx.reply("This command can only be used in the designated submission channel.", mention_author=False)
             return
         if not self._has_approval_power(author):
@@ -305,15 +351,16 @@ class SubmissionManager:
         if validation:
             await ctx.reply(validation, mention_author=False)
             return
-        repo_root = self._resolve_repo()
-        if repo_root is None:
+        git_root = self._resolve_git_root()
+        content_root = self._resolve_content_root()
+        if git_root is None or content_root is None:
             await ctx.reply("characters_repo is not configured; mirroring is unavailable.", mention_author=False)
             return
-        character, normalization_error = self._normalize_character_name(character, repo_root=repo_root)
+        character, normalization_error = self._normalize_character_name(character, content_root=content_root)
         if normalization_error:
             await ctx.reply(normalization_error, mention_author=False)
             return
-        target_dir = repo_root / "characters" / character / pose / "outfits"
+        target_dir = content_root / character / pose / "outfits"
         outfit_path = target_dir / f"{outfit}.png"
         if not outfit_path.exists():
             await ctx.reply("That outfit image does not exist yet.", mention_author=False)
@@ -321,7 +368,7 @@ class SubmissionManager:
 
         success, detail = await asyncio.to_thread(
             self._mirror_outfit_image,
-            repo_root,
+            git_root,
             outfit_path,
             author.display_name,
             character,
@@ -341,18 +388,18 @@ class SubmissionManager:
         if not isinstance(author, discord.Member) or guild is None:
             await ctx.reply("Run this command inside a server.", mention_author=False)
             return
-        if SUBMISSION_CHANNEL_ID and ctx.channel.id != SUBMISSION_CHANNEL_ID:
+        if _reject_if_submission_channel_forbidden(ctx.channel.id):
             await ctx.reply("This command can only be used in the designated submission channel.", mention_author=False)
             return
         if not self._has_approval_power(author):
             await ctx.reply("You lack permission to run repository sync.", mention_author=False)
             return
-        repo_root = self._resolve_repo()
-        if repo_root is None:
+        git_root = self._resolve_git_root()
+        if git_root is None:
             await ctx.reply("characters_repo is not configured.", mention_author=False)
             return
 
-        success, detail = await asyncio.to_thread(self._sync_characters_repo, repo_root)
+        success, detail = await asyncio.to_thread(self._sync_characters_repo, git_root)
         if success:
             await ctx.reply("characters_repo synced successfully.", mention_author=False)
         else:
@@ -375,21 +422,30 @@ class SubmissionManager:
             return "Outfit names may only contain letters, numbers, or underscores."
         return None
 
-    def _build_relative_outfit_path(self, character: str, pose: str, outfit: str) -> Path:
-        return Path("characters") / character / pose / "outfits" / f"{outfit}.png"
+    def _build_relative_outfit_path(
+        self,
+        character: str,
+        pose: str,
+        outfit: str,
+        *,
+        git_root: Path,
+        content_root: Path,
+    ) -> Path:
+        dest = (content_root / character / pose / "outfits" / f"{outfit}.png").resolve()
+        return dest.relative_to(git_root.resolve())
 
     def _normalize_character_name(
         self,
         character: str,
         *,
-        repo_root: Optional[Path] = None,
+        content_root: Optional[Path] = None,
     ) -> tuple[Optional[str], Optional[str]]:
-        repo = repo_root or self._resolve_repo()
-        if repo is None:
+        root = content_root or self._resolve_content_root()
+        if root is None:
             return None, "characters_repo is not configured."
         normalizer = self._character_normalizer
-        if normalizer is None or normalizer.repo_root != repo:
-            normalizer = CharacterNameNormalizer(repo)
+        if normalizer is None or normalizer.content_root != root:
+            normalizer = CharacterNameNormalizer(root)
             self._character_normalizer = normalizer
         else:
             normalizer.refresh()
@@ -400,8 +456,8 @@ class SubmissionManager:
             return None, str(exc)
         return canonical, None
 
-    def _ensure_canonical_record(self, record: SubmissionRecord, repo_root: Path) -> Optional[str]:
-        canonical, error = self._normalize_character_name(record.character_name, repo_root=repo_root)
+    def _ensure_canonical_record(self, record: SubmissionRecord, git_root: Path, content_root: Path) -> Optional[str]:
+        canonical, error = self._normalize_character_name(record.character_name, content_root=content_root)
         if error:
             return error
         if canonical and canonical != record.character_name:
@@ -412,8 +468,14 @@ class SubmissionManager:
                 canonical,
             )
             record.character_name = canonical
-        relative_path = self._build_relative_outfit_path(record.character_name, record.pose_name, record.outfit_name)
-        new_relative = str(relative_path)
+        relative_path = self._build_relative_outfit_path(
+            record.character_name,
+            record.pose_name,
+            record.outfit_name,
+            git_root=git_root,
+            content_root=content_root,
+        )
+        new_relative = relative_path.as_posix()
         if record.target_relative_path != new_relative:
             record.target_relative_path = new_relative
         return None
@@ -459,7 +521,7 @@ class SubmissionManager:
             attachment_url=attachment_url,
             target_relative_path=relative_path,
             image_filename="submission.png",
-            storage_root=PENDING_DIR,
+            storage_root=_pending_root_for_channel(channel_id),
         )
         record.save()
         return record
@@ -599,10 +661,10 @@ class SubmissionManager:
     def _should_flip_avatar(self, record: SubmissionRecord) -> bool:
         if yaml is None:
             return False
-        repo_root = self._resolve_repo()
-        if repo_root is None:
+        content_root = self._resolve_content_root()
+        if content_root is None:
             return False
-        character_dir = repo_root / "characters" / record.character_name
+        character_dir = content_root / record.character_name
         config_path = character_dir / "character.yml"
         if not config_path.exists():
             return False
@@ -673,13 +735,21 @@ class SubmissionManager:
             if record.message_id:
                 self.pending_by_message.pop(record.message_id, None)
 
-    def _resolve_repo(self) -> Optional[Path]:
-        if self._repo_root and self._repo_root.exists():
-            return self._repo_root
-        repo = _resolve_characters_repo_root()
+    def _resolve_git_root(self) -> Optional[Path]:
+        if self._git_root and self._git_root.exists() and (self._git_root / ".git").exists():
+            return self._git_root
+        repo = resolve_characters_git_root(BASE_DIR)
         if repo and repo.exists():
-            self._repo_root = repo
-        return self._repo_root
+            self._git_root = repo
+        return self._git_root
+
+    def _resolve_content_root(self) -> Optional[Path]:
+        if self._content_root and self._content_root.exists():
+            return self._content_root
+        root = resolve_characters_content_root(BASE_DIR)
+        if root and root.exists():
+            self._content_root = root
+        return self._content_root
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == self.bot.user.id:
@@ -743,15 +813,16 @@ class SubmissionManager:
             logger.debug("Failed to remove unauthorized reaction on message %s", payload.message_id)
 
     async def _handle_approval(self, record: SubmissionRecord, member: discord.Member) -> None:
-        repo_root = self._resolve_repo()
-        if repo_root is None:
+        git_root = self._resolve_git_root()
+        content_root = self._resolve_content_root()
+        if git_root is None or content_root is None:
             await self._notify_channel(record, "characters_repo is unavailable. Cannot approve submissions right now.")
             return
-        normalization_error = self._ensure_canonical_record(record, repo_root)
+        normalization_error = self._ensure_canonical_record(record, git_root, content_root)
         if normalization_error:
             await self._notify_channel(record, f"Cannot approve submission: {normalization_error}")
             return
-        result = await asyncio.to_thread(self._apply_submission_changes, record, repo_root, member.display_name)
+        result = await asyncio.to_thread(self._apply_submission_changes, record, git_root, member.display_name)
         success, detail = result
         if success:
             record.status = "approved"
@@ -804,20 +875,29 @@ class SubmissionManager:
     def _apply_submission_changes(
         self,
         record: SubmissionRecord,
-        repo_root: Path,
+        git_root: Path,
         approver_name: str,
     ) -> tuple[bool, str]:
+        content_root = self._resolve_content_root()
+        if content_root is None:
+            return False, "characters_repo content root is not available."
         try:
-            relative_path = self._build_relative_outfit_path(record.character_name, record.pose_name, record.outfit_name)
-            record.target_relative_path = str(relative_path)
-            destination = (repo_root / relative_path).resolve()
+            relative_path = self._build_relative_outfit_path(
+                record.character_name,
+                record.pose_name,
+                record.outfit_name,
+                git_root=git_root,
+                content_root=content_root,
+            )
+            record.target_relative_path = relative_path.as_posix()
+            destination = (git_root / relative_path).resolve()
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(record.image_path, destination)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Failed to copy submission image into repo: %s", exc)
             return False, "failed to copy image into repository."
         commit_message = f"aprouved by {approver_name}"
-        return self._commit_submission(repo_root, relative_path, commit_message)
+        return self._commit_submission(git_root, relative_path, commit_message)
 
     def _commit_submission(self, repo_root: Path, relative_path: Path, commit_message: str) -> tuple[bool, str]:
         git_executable = shutil.which("git")
@@ -871,4 +951,4 @@ def setup_submission_features(bot: commands.Bot) -> SubmissionManager:
     return manager
 
 
-__all__ = ["setup_submission_features", "SubmissionManager"]
+__all__ = ["set_submission_channel_allowlist", "setup_submission_features", "SubmissionManager"]

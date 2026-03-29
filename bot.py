@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -19,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import Any, Awaitable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, TypeVar, Union
 
 import aiohttp
 import discord
@@ -55,6 +56,84 @@ if PIL is not None:
     logging.getLogger("PIL").setLevel(logging.ERROR)
 
 _DEBUG_REROLL = os.getenv("TFBOT_DEBUG_REROLL", "").strip().lower() in {"1", "true", "yes", "on"}
+_BULK_REROLL_OPTIMIZED = os.getenv("TFBOT_BULK_REROLL_OPTIMIZED", "1").strip().lower() not in {"0", "false", "no", "off"}
+_BULK_COMMAND_GUARDS_ENABLED = os.getenv("TFBOT_BULK_COMMAND_GUARDS", "1").strip().lower() not in {"0", "false", "no", "off"}
+_MASS_TRANSITION_PREFETCH_ENABLED = os.getenv("TFBOT_MASS_TRANSITION_PREFETCH", "1").strip().lower() not in {"0", "false", "no", "off"}
+_DEVICE_DYNAMIC_TRANSFER_ENABLED = os.getenv("TFBOT_DEVICE_DYNAMIC_TRANSFER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+_CLONE_SNAPSHOT_ENFORCED = os.getenv("TFBOT_CLONE_SNAPSHOT_ENFORCED", "1").strip().lower() not in {"0", "false", "no", "off"}
+_CLONEALL_ENABLED = os.getenv("TFBOT_CLONEALL_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+_SEND_TIMING_QUEUE: Deque[float] = deque(maxlen=200)
+_SEND_TIMING_COUNT = 0
+_T_SEND = TypeVar("_T_SEND")
+
+
+def _send_pctl(values: Deque[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+    return ordered[idx]
+
+
+async def _timed_send(label: str, awaitable: Awaitable[_T_SEND]) -> _T_SEND:
+    global _SEND_TIMING_COUNT
+    started = time.perf_counter()
+    result = await awaitable
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    _SEND_TIMING_QUEUE.append(elapsed_ms)
+    _SEND_TIMING_COUNT += 1
+    if _SEND_TIMING_COUNT % 25 == 0:
+        logger.info(
+            "panel-send n=%d upload p50=%.0fms p95=%.0fms",
+            _SEND_TIMING_COUNT,
+            _send_pctl(_SEND_TIMING_QUEUE, 0.5),
+            _send_pctl(_SEND_TIMING_QUEUE, 0.95),
+        )
+    if elapsed_ms >= 3000:
+        logger.warning("panel-send slow label=%s upload=%.0fms", label, elapsed_ms)
+    return result
+
+
+async def _timed_send_ms(label: str, awaitable: Awaitable[_T_SEND]) -> tuple[_T_SEND, float]:
+    started = time.perf_counter()
+    result = await _timed_send(label, awaitable)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return result, elapsed_ms
+
+
+def _log_transition_send_metrics(
+    *,
+    label: str,
+    render_ms: float,
+    upload_ms: float,
+    total_ms: float,
+    payload_bytes: Optional[int],
+) -> None:
+    logger.info(
+        "transition-send label=%s bytes=%s render=%.0fms upload=%.0fms total=%.0fms",
+        label,
+        payload_bytes if payload_bytes is not None else "unknown",
+        render_ms,
+        upload_ms,
+        total_ms,
+    )
+    log_animation_perf_event(
+        "transition_send",
+        label=label,
+        bytes=payload_bytes if payload_bytes is not None else "unknown",
+        render_ms=f"{render_ms:.0f}",
+        upload_ms=f"{upload_ms:.0f}",
+        total_ms=f"{total_ms:.0f}",
+        format=_TRANSITION_PRIMARY_FORMAT,
+        fallback_format=_TRANSITION_FALLBACK_FORMAT,
+        webp_quality=str(_TRANSITION_WEBP_QUALITY),
+        webp_method=str(_TRANSITION_WEBP_METHOD),
+        webp_target_bytes=str(_TRANSITION_WEBP_TARGET_BYTES),
+        gif_colors=str(_TRANSITION_GIF_COLORS),
+        gif_dither=_TRANSITION_GIF_DITHER,
+        gif_shared_palette="1" if _TRANSITION_GIF_SHARED_PALETTE else "0",
+        gif_target_bytes=str(_TRANSITION_GIF_TARGET_BYTES),
+    )
 
 
 def _truncate_log_value(value: object, *, limit: int = 64) -> str:
@@ -391,6 +470,7 @@ except ModuleNotFoundError:
         raise RuntimeError("tf_characters.py does not define a TF_CHARACTERS list.")
     _DEFAULT_CHARACTER_DATA = data
 from ai_rewriter import AI_REWRITE_ENABLED, rewrite_message_for_character
+from tfbot.clone_display import clone_copied_source_display_name
 from tfbot.models import (
     OutfitAsset,
     ReplyContext,
@@ -462,10 +542,17 @@ from tfbot.panels import (
     set_selected_background,
     set_selected_outfit_name,
     set_selected_pose_outfit,
+    seed_vn_selection_from_scopes,
     strip_urls,
     toggle_accessory_state,
     vn_outfit_selection,
     persist_outfit_selections,
+)
+from tfbot.panel_executor import run_panel_render_gif, run_panel_render_vn, shutdown_panel_executor
+from tfbot.panel_transition_cache import (
+    build_bg_transition_cache_key,
+    get_cached_bg_transition_file,
+    put_cached_bg_transition_file,
 )
 from tfbot.roleplay import RoleplayCog, add_roleplay_cog
 from tfbot.interactions import InteractionContextAdapter
@@ -481,11 +568,29 @@ from tfbot.utils import (
     path_from_env,
     utc_now,
 )
-from tfbot.submissions import setup_submission_features
+from tfbot.submissions import set_submission_channel_allowlist, setup_submission_features
 from tfbot.session_error_log import (
     install as install_session_error_log,
     register_bot_hooks,
     shutdown as shutdown_session_error_log,
+)
+from tfbot.animation_perf_log import (
+    install as install_animation_perf_log,
+    shutdown as shutdown_animation_perf_log,
+    log_event as log_animation_perf_event,
+)
+from tfbot.transition_constants import (
+    GIF_COLORS as _TRANSITION_GIF_COLORS,
+    GIF_DITHER_MODE as _TRANSITION_GIF_DITHER,
+    GIF_SHARED_PALETTE as _TRANSITION_GIF_SHARED_PALETTE,
+    GIF_TARGET_BYTES as _TRANSITION_GIF_TARGET_BYTES,
+    REROLL_USE_STATIC_TRANSITION,
+    SWAP_USE_STATIC_TRANSITION,
+    TRANSITION_FALLBACK_FORMAT as _TRANSITION_FALLBACK_FORMAT,
+    TRANSITION_PRIMARY_FORMAT as _TRANSITION_PRIMARY_FORMAT,
+    WEBP_METHOD as _TRANSITION_WEBP_METHOD,
+    WEBP_QUALITY as _TRANSITION_WEBP_QUALITY,
+    WEBP_TARGET_BYTES as _TRANSITION_WEBP_TARGET_BYTES,
 )
 from tfbot import bot_moderation as bot_mod
 
@@ -514,6 +619,7 @@ else:
 _log_level_name = get_setting("TFBOT_LOG_LEVEL", "INFO", TEST_MODE).upper() or "INFO"
 logging.getLogger().setLevel(getattr(logging, _log_level_name, logging.INFO))
 install_session_error_log(BASE_DIR)
+install_animation_perf_log(BASE_DIR)
 
 BOT_MODE = get_setting("TFBOT_MODE", "classic", TEST_MODE).lower()
 TF_CHANNEL_ID = get_channel_id("TFBOT_CHANNEL_ID", 0, TEST_MODE)
@@ -521,6 +627,10 @@ GACHA_CHANNEL_ID = get_channel_id("TFBOT_GACHA_CHANNEL_ID", 0, TEST_MODE)
 GACHA_ENABLED = GACHA_CHANNEL_ID > 0
 CLASSIC_ENABLED = BOT_MODE != "gacha" and TF_CHANNEL_ID > 0
 SUBMISSION_CHANNEL_ID = get_channel_id("TFBOT_SUBMISSION_CHANNEL_ID", 0, TEST_MODE)
+SUBMISSION_SECONDARY_CHANNEL_ID = get_channel_id("TFBOT_SUBMISSION_SECONDARY_CHANNEL_ID", 0, TEST_MODE)
+SUBMISSION_CHANNEL_IDS = frozenset(
+    cid for cid in (SUBMISSION_CHANNEL_ID, SUBMISSION_SECONDARY_CHANNEL_ID) if cid > 0
+)
 SUBMISSION_COMMANDS: set[str] = {"submit", "mirror", "synch"}
 
 if BOT_MODE == "gacha" and not GACHA_ENABLED:
@@ -700,6 +810,31 @@ def _format_duration_label_from_minutes(minutes: int) -> str:
     return " ".join(parts)
 
 
+def _coerce_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_iso_utc(value: object) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except Exception:
+        return None
+    return _coerce_utc(parsed)
+
+
+def _humanize_timedelta(delta: timedelta) -> str:
+    seconds = max(int(delta.total_seconds()), 0)
+    minutes = max(1, math.ceil(seconds / 60))
+    return _format_duration_label_from_minutes(minutes)
+
+
 def _random_duration_from_options(options: Sequence[int]) -> Tuple[str, timedelta]:
     minutes = random.choice(options)
     return _format_duration_label_from_minutes(minutes), timedelta(minutes=minutes)
@@ -722,11 +857,11 @@ MAGIC_EMOJI_CACHE: Dict[int, str] = {}
 def _parse_special_form_names(raw: str) -> tuple[str, ...]:
     tokens = [token.strip() for token in re.split(r"[;,]", raw or "") if token.strip()]
     if not tokens:
-        return ("ball", "narrator")
+        return ("narrator",)
     return tuple(tokens)
 
 
-SPECIAL_REROLL_FORMS = _parse_special_form_names(get_setting("TFBOT_SPECIAL_FORMS", "Ball,Narrator", TEST_MODE))
+SPECIAL_REROLL_FORMS = _parse_special_form_names(get_setting("TFBOT_SPECIAL_FORMS", "Narrator", TEST_MODE))
 ADMIN_ONLY_RANDOM_FORMS = ("syn", "circe")
 CHARACTER_AUTOCOMPLETE_LIMIT = 25
 OUTFIT_AUTOCOMPLETE_LIMIT = 25
@@ -842,22 +977,60 @@ DEVICE_MIN_SECONDS = 5 * 60
 DEVICE_MAX_SECONDS = 4 * 60 * 60
 DEVICE_RECHARGE_SECONDS = 30 * 60
 DEVICE_BATTERY_MAX = 100.0
+DEVICE_TRANSFER_BASE_CHANCE = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_BASE_CHANCE", 0.06)))
+DEVICE_TRANSFER_PER_USE_BONUS = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_PER_USE_BONUS", 0.035)))
+DEVICE_TRANSFER_IDLE_BONUS_PER_MIN = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_IDLE_BONUS_PER_MIN", 0.005)))
+DEVICE_TRANSFER_MAX_CHANCE = max(0.05, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_MAX_CHANCE", 0.8)))
+DEVICE_TRANSFER_COOLDOWN_SECONDS = max(0, int_from_env("TFBOT_DEVICE_TRANSFER_COOLDOWN_SECONDS", 120))
 
 # Overlay state (swap/clone visual overrides)
 overlay_records: Dict[TransformKey, Dict[str, object]] = {}
 overlay_group_members: Dict[str, set[TransformKey]] = {}
 overlay_group_tasks: Dict[str, asyncio.Task] = {}
 last_active_tf: Dict[TransformKey, datetime] = {}
+_bulk_command_guard_lock = asyncio.Lock()
+_bulk_reroll_running_guilds: set[int] = set()
+_bulk_swap_running_guilds: set[int] = set()
+_reroll_animation_pending: set[TransformKey] = set()
 
 # Device state
 device_holder_by_guild: Dict[int, int] = {}
 device_rotation_tasks: Dict[int, asyncio.Task] = {}
 device_battery_by_guild: Dict[int, float] = {}
 device_battery_updated_at: Dict[int, datetime] = {}
+device_commands_since_transfer: Dict[int, int] = {}
+device_last_command_at: Dict[int, datetime] = {}
+device_assigned_at: Dict[int, datetime] = {}
+device_last_transfer_at: Dict[int, datetime] = {}
 
 
 def _sync_panel_device_holders() -> None:
     set_device_holder_user_ids_by_guild(device_holder_by_guild)
+
+
+def _bulk_family_state(family: str) -> set[int]:
+    if family == "swap":
+        return _bulk_swap_running_guilds
+    return _bulk_reroll_running_guilds
+
+
+async def _try_begin_bulk_family_run(guild_id: int, *, family: str) -> bool:
+    if not _BULK_COMMAND_GUARDS_ENABLED:
+        return True
+    running_set = _bulk_family_state(family)
+    async with _bulk_command_guard_lock:
+        if guild_id in running_set:
+            return False
+        running_set.add(guild_id)
+        return True
+
+
+async def _end_bulk_family_run(guild_id: int, *, family: str) -> None:
+    if not _BULK_COMMAND_GUARDS_ENABLED:
+        return
+    running_set = _bulk_family_state(family)
+    async with _bulk_command_guard_lock:
+        running_set.discard(guild_id)
 
 
 def _serialize_overlay_state() -> Dict[str, object]:
@@ -880,11 +1053,22 @@ def _serialize_overlay_state() -> Dict[str, object]:
         }
         for guild_id in set(device_holder_by_guild.keys()) | set(device_battery_by_guild.keys())
     ]
+    telemetry_payload = [
+        {
+            "guild_id": guild_id,
+            "commands_since_transfer": int(device_commands_since_transfer.get(guild_id, 0)),
+            "last_command_at": device_last_command_at.get(guild_id, utc_now()).isoformat() if guild_id in device_last_command_at else None,
+            "assigned_at": device_assigned_at.get(guild_id, utc_now()).isoformat() if guild_id in device_assigned_at else None,
+            "last_transfer_at": device_last_transfer_at.get(guild_id, utc_now()).isoformat() if guild_id in device_last_transfer_at else None,
+        }
+        for guild_id in set(device_holder_by_guild.keys()) | set(device_commands_since_transfer.keys())
+    ]
     return {
         "overlay_records": records_payload,
         "last_active_tf": active_payload,
         "device_holders": device_payload,
         "device_battery": battery_payload,
+        "device_telemetry": telemetry_payload,
     }
 
 
@@ -902,12 +1086,26 @@ def _rebuild_overlay_groups() -> None:
 
 
 def _load_overlay_state() -> None:
+    prev_overlay_records = dict(overlay_records)
+    prev_overlay_group_members = {gid: set(members) for gid, members in overlay_group_members.items()}
+    prev_last_active_tf = dict(last_active_tf)
+    prev_device_holder_by_guild = dict(device_holder_by_guild)
+    prev_device_battery_by_guild = dict(device_battery_by_guild)
+    prev_device_battery_updated_at = dict(device_battery_updated_at)
+    prev_device_commands_since_transfer = dict(device_commands_since_transfer)
+    prev_device_last_command_at = dict(device_last_command_at)
+    prev_device_assigned_at = dict(device_assigned_at)
+    prev_device_last_transfer_at = dict(device_last_transfer_at)
     overlay_records.clear()
     overlay_group_members.clear()
     last_active_tf.clear()
     device_holder_by_guild.clear()
     device_battery_by_guild.clear()
     device_battery_updated_at.clear()
+    device_commands_since_transfer.clear()
+    device_last_command_at.clear()
+    device_assigned_at.clear()
+    device_last_transfer_at.clear()
     if not OVERLAY_STATE_FILE.exists():
         _sync_panel_device_holders()
         return
@@ -915,6 +1113,18 @@ def _load_overlay_state() -> None:
         payload = json.loads(OVERLAY_STATE_FILE.read_text(encoding="utf-8"))
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to parse overlay state %s: %s", OVERLAY_STATE_FILE, exc)
+        overlay_records.update(prev_overlay_records)
+        overlay_group_members.update(prev_overlay_group_members)
+        last_active_tf.update(prev_last_active_tf)
+        device_holder_by_guild.update(prev_device_holder_by_guild)
+        device_battery_by_guild.update(prev_device_battery_by_guild)
+        device_battery_updated_at.update(prev_device_battery_updated_at)
+        device_commands_since_transfer.update(prev_device_commands_since_transfer)
+        device_last_command_at.update(prev_device_last_command_at)
+        device_assigned_at.update(prev_device_assigned_at)
+        device_last_transfer_at.update(prev_device_last_transfer_at)
+        _rebuild_overlay_groups()
+        _sync_panel_device_holders()
         return
     for row in payload.get("overlay_records", []):
         try:
@@ -928,7 +1138,9 @@ def _load_overlay_state() -> None:
     for row in payload.get("last_active_tf", []):
         try:
             key = (int(row["guild_id"]), int(row["user_id"]))
-            at = datetime.fromisoformat(str(row["at"]))
+            at = _parse_iso_utc(row.get("at"))
+            if at is None:
+                continue
         except Exception:
             continue
         last_active_tf[key] = at
@@ -941,9 +1153,36 @@ def _load_overlay_state() -> None:
         try:
             gid = int(row["guild_id"])
             device_battery_by_guild[gid] = max(0.0, min(float(row.get("battery", DEVICE_BATTERY_MAX)), DEVICE_BATTERY_MAX))
-            device_battery_updated_at[gid] = datetime.fromisoformat(str(row.get("updated_at")))
+            updated = _parse_iso_utc(row.get("updated_at"))
+            device_battery_updated_at[gid] = updated or utc_now()
         except Exception:
             continue
+    for row in payload.get("device_telemetry", []):
+        try:
+            gid = int(row["guild_id"])
+            device_commands_since_transfer[gid] = max(0, int(row.get("commands_since_transfer", 0)))
+            last_cmd_raw = row.get("last_command_at")
+            assigned_raw = row.get("assigned_at")
+            transfer_raw = row.get("last_transfer_at")
+            if last_cmd_raw:
+                parsed_last = _parse_iso_utc(last_cmd_raw)
+                if parsed_last is not None:
+                    device_last_command_at[gid] = parsed_last
+            if assigned_raw:
+                parsed_assigned = _parse_iso_utc(assigned_raw)
+                if parsed_assigned is not None:
+                    device_assigned_at[gid] = parsed_assigned
+            if transfer_raw:
+                parsed_transfer = _parse_iso_utc(transfer_raw)
+                if parsed_transfer is not None:
+                    device_last_transfer_at[gid] = parsed_transfer
+        except Exception:
+            continue
+    now = utc_now()
+    for gid in device_holder_by_guild:
+        device_assigned_at.setdefault(gid, now)
+        device_last_transfer_at.setdefault(gid, now)
+        device_commands_since_transfer.setdefault(gid, 0)
     _rebuild_overlay_groups()
     _sync_panel_device_holders()
 
@@ -1019,7 +1258,7 @@ def has_device_privilege(member: discord.Member, guild_id: int) -> bool:
 
 def _device_cost_for_command(command_name: str) -> float:
     name = (command_name or "").strip().lower()
-    if name in {"swapall", "swapallnonadmin", "rerollall", "rerollnonadmin"}:
+    if name in {"swapall", "swapallnonadmin", "rerollall", "rerollnonadmin", "cloneall"}:
         return 90.0
     if name in {"reroll", "clone", "genderswap", "ageswap"}:
         return 45.0
@@ -1079,6 +1318,77 @@ def _log_device_command_use(member: discord.Member, command_name: str, guild_id:
         pass
 
 
+def _device_transfer_probability(guild_id: int) -> float:
+    commands_used = max(0, int(device_commands_since_transfer.get(guild_id, 0)))
+    idle_minutes = 0.0
+    now = utc_now()
+    last_used = device_last_command_at.get(guild_id)
+    if last_used is None:
+        last_used = device_assigned_at.get(guild_id)
+    last_used = _coerce_utc(last_used)
+    if last_used is not None:
+        idle_minutes = max((now - last_used).total_seconds() / 60.0, 0.0)
+    chance = (
+        DEVICE_TRANSFER_BASE_CHANCE
+        + (commands_used * DEVICE_TRANSFER_PER_USE_BONUS)
+        + (idle_minutes * DEVICE_TRANSFER_IDLE_BONUS_PER_MIN)
+    )
+    return max(0.0, min(chance, DEVICE_TRANSFER_MAX_CHANCE))
+
+
+def _device_transfer_on_cooldown(guild_id: int) -> bool:
+    if DEVICE_TRANSFER_COOLDOWN_SECONDS <= 0:
+        return False
+    last_transfer = device_last_transfer_at.get(guild_id)
+    if last_transfer is None:
+        return False
+    last_transfer = _coerce_utc(last_transfer)
+    if last_transfer is None:
+        return False
+    return (utc_now() - last_transfer).total_seconds() < DEVICE_TRANSFER_COOLDOWN_SECONDS
+
+
+def _device_note_success(member: discord.Member, guild_id: int, command_name: str) -> None:
+    if not has_device_privilege(member, guild_id):
+        return
+    now = utc_now()
+    device_commands_since_transfer[guild_id] = max(0, int(device_commands_since_transfer.get(guild_id, 0))) + 1
+    device_last_command_at[guild_id] = now
+    logger.info(
+        "device-telemetry guild=%s holder=%s command=%s commands_since_transfer=%s",
+        guild_id,
+        member.id,
+        command_name,
+        device_commands_since_transfer[guild_id],
+    )
+    _persist_overlay_state()
+
+
+def _maybe_schedule_device_transfer(guild_id: int, *, trigger: str) -> None:
+    if not _DEVICE_DYNAMIC_TRANSFER_ENABLED:
+        return
+    if _device_transfer_on_cooldown(guild_id):
+        return
+    chance = _device_transfer_probability(guild_id)
+    roll = random.random()
+    logger.info(
+        "device-transfer-check guild=%s trigger=%s chance=%.3f roll=%.3f",
+        guild_id,
+        trigger,
+        chance,
+        roll,
+    )
+    if roll > chance:
+        return
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+    try:
+        bot.loop.create_task(_rotate_device_once(guild))
+    except Exception:
+        pass
+
+
 def _device_record_success(
     member: discord.Member,
     state: Optional[TransformationState],
@@ -1091,68 +1401,152 @@ def _device_record_success(
     cost = _device_cost_for_command(command_name)
     device_battery_by_guild[guild_id] = max(0.0, current - cost)
     device_battery_updated_at[guild_id] = utc_now()
+    _device_note_success(member, guild_id, command_name)
     _persist_overlay_state()
     _log_device_command_use(member, command_name, guild_id)
+    _maybe_schedule_device_transfer(guild_id, trigger="command_use")
 
 
 def has_fun_privilege(member: discord.Member, state: Optional[TransformationState], guild_id: int) -> bool:
     return (
         is_admin(member)
         or is_bot_mod(member)
-        or _has_special_reroll_access(state)
+        or _state_has_effective_special_access(member, state, guild_id)
         or has_device_privilege(member, guild_id)
     )
 
 
-def _pick_device_eligible_user(guild: discord.Guild) -> Optional[int]:
+def _can_use_dstatus(member: discord.Member, guild_id: int) -> bool:
+    if is_admin(member) or is_bot_mod(member):
+        return True
+    return device_holder_by_guild.get(guild_id) == member.id
+
+
+def _state_is_clone_overlay(guild_id: int, user_id: int) -> bool:
+    record = overlay_records.get(state_key(guild_id, user_id))
+    if not isinstance(record, Mapping):
+        return False
+    return str(record.get("overlay_type") or "").strip().lower() == "clone"
+
+
+def _state_has_effective_special_access(
+    member: discord.Member,
+    state: Optional[TransformationState],
+    guild_id: int,
+) -> bool:
+    if state is None:
+        return False
+    if _state_is_clone_overlay(guild_id, member.id):
+        return False
+    return _has_special_reroll_access(state) or _state_has_privileged_access(state)
+
+
+def _pick_device_eligible_user(guild: discord.Guild, *, exclude_user_id: Optional[int] = None) -> Optional[int]:
     now = utc_now()
     candidates: List[int] = []
     for (g_id, user_id), seen_at in last_active_tf.items():
         if g_id != guild.id:
             continue
-        if (now - seen_at).total_seconds() > ACTIVE_WINDOW_SECONDS:
+        if exclude_user_id is not None and user_id == exclude_user_id:
             continue
-        member = guild.get_member(user_id)
-        if member is None or member.bot:
-            continue
-        if is_admin(member) or is_bot_mod(member):
-            continue
-        if bot_mod.is_banned(guild.id, user_id) or bot_mod.is_timed_out(guild.id, user_id):
-            continue
-        if find_active_transformation(user_id, guild.id) is None:
-            continue
-        candidates.append(user_id)
+        if _is_device_eligible_user(guild, user_id, seen_at=seen_at, now=now):
+            candidates.append(user_id)
     if not candidates:
         return None
     return random.choice(candidates)
 
 
-async def _announce_device_transfer(guild: discord.Guild, old_holder: Optional[int], new_holder: int) -> None:
-    channel = bot.get_channel(TF_CHANNEL_ID) if TF_CHANNEL_ID > 0 else None
-    if not isinstance(channel, discord.TextChannel):
-        return
-    old_name = "nobody" if old_holder is None else f"<@{old_holder}>"
-    msg = f"The Device crackles with static... it leaves {old_name} and lands with <@{new_holder}>."
-    try:
-        await channel.send(msg, allowed_mentions=discord.AllowedMentions(users=True))
-    except discord.HTTPException as exc:
-        logger.error("Device transfer announcement failed in guild %s: %s", guild.id, exc)
+def _is_device_eligible_user(
+    guild: discord.Guild,
+    user_id: int,
+    *,
+    seen_at: Optional[datetime] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    if now is None:
+        now = utc_now()
+    if seen_at is None:
+        seen_at = last_active_tf.get(state_key(guild.id, user_id))
+    seen_at = _coerce_utc(seen_at)
+    if seen_at is None:
+        return False
+    if (now - seen_at).total_seconds() > ACTIVE_WINDOW_SECONDS:
+        return False
+    member = guild.get_member(user_id)
+    if member is None or member.bot:
+        return False
+    if is_admin(member) or is_bot_mod(member):
+        return False
+    if bot_mod.is_banned(guild.id, user_id) or bot_mod.is_timed_out(guild.id, user_id):
+        return False
+    if find_active_transformation(user_id, guild.id) is None:
+        return False
+    return True
 
 
-async def _rotate_device_once(guild: discord.Guild, force_announce: bool = False) -> None:
-    old_holder = device_holder_by_guild.get(guild.id)
-    new_holder = _pick_device_eligible_user(guild)
-    if new_holder is None:
-        return
-    if old_holder == new_holder and not force_announce:
-        return
+def _device_member_label(guild: discord.Guild, user_id: Optional[int]) -> str:
+    if user_id is None:
+        return "nobody"
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member.display_name
+    return f"user {user_id}"
+
+
+async def _commit_device_transfer(guild: discord.Guild, old_holder: Optional[int], new_holder: int) -> None:
     device_holder_by_guild[guild.id] = new_holder
+    now = utc_now()
+    device_assigned_at[guild.id] = now
+    device_last_transfer_at[guild.id] = now
+    device_commands_since_transfer[guild.id] = 0
     _sync_panel_device_holders()
     _sync_device_battery(guild.id)
     _persist_overlay_state()
     logger.error("device_transfer: guild=%s old=%s new=%s", guild.id, old_holder, new_holder)
     await send_history_message("Device Transfer", f"Guild: {guild.id}\nOld: {old_holder}\nNew: {new_holder}")
     await _announce_device_transfer(guild, old_holder, new_holder)
+
+
+async def _announce_device_transfer(guild: discord.Guild, old_holder: Optional[int], new_holder: int) -> None:
+    channel = guild.get_channel(TF_CHANNEL_ID) if TF_CHANNEL_ID > 0 else None
+    if not isinstance(channel, discord.TextChannel):
+        return
+    old_name = _device_member_label(guild, old_holder)
+    new_name = _device_member_label(guild, new_holder)
+    msg = f"The Device crackles with static... it leaves {old_name} and lands with {new_name}."
+    try:
+        await channel.send(msg, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as exc:
+        logger.error("Device transfer announcement failed in guild %s: %s", guild.id, exc)
+
+
+async def _rotate_device_once(guild: discord.Guild, force_announce: bool = False) -> None:
+    old_holder = device_holder_by_guild.get(guild.id)
+    if old_holder is not None and not force_announce and _DEVICE_DYNAMIC_TRANSFER_ENABLED:
+        if _device_transfer_on_cooldown(guild.id):
+            return
+        chance = _device_transfer_probability(guild.id)
+        roll = random.random()
+        logger.info(
+            "device-transfer-loop-check guild=%s chance=%.3f roll=%.3f commands_since_transfer=%s",
+            guild.id,
+            chance,
+            roll,
+            device_commands_since_transfer.get(guild.id, 0),
+        )
+        if roll > chance:
+            return
+    new_holder = _pick_device_eligible_user(
+        guild,
+        exclude_user_id=old_holder if (old_holder is not None and not force_announce) else None,
+    )
+    if new_holder is None:
+        new_holder = _pick_device_eligible_user(guild)
+    if new_holder is None:
+        return
+    if old_holder == new_holder:
+        return
+    await _commit_device_transfer(guild, old_holder, new_holder)
 
 
 def _recharge_device_battery(guild_id: int) -> None:
@@ -1168,7 +1562,10 @@ async def _device_rotation_loop(guild_id: int) -> None:
             guild = bot.get_guild(guild_id)
             if guild is None:
                 continue
-            await _rotate_device_once(guild)
+            try:
+                await _rotate_device_once(guild)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("Device rotation tick failed for guild %s", guild_id)
     except asyncio.CancelledError:
         return
     except Exception:  # pylint: disable=broad-except
@@ -1185,6 +1582,15 @@ def _ensure_device_rotation_task(guild_id: int) -> None:
 def _device_status_text(guild: discord.Guild) -> str:
     holder_id = device_holder_by_guild.get(guild.id)
     battery = _sync_device_battery(guild.id)
+    command_count = max(0, int(device_commands_since_transfer.get(guild.id, 0)))
+    chance_now = _device_transfer_probability(guild.id) if _DEVICE_DYNAMIC_TRANSFER_ENABLED else 0.0
+    last_cmd = device_last_command_at.get(guild.id)
+    if last_cmd is None:
+        last_cmd = device_assigned_at.get(guild.id)
+    last_cmd = _coerce_utc(last_cmd)
+    idle_text = "no recent command"
+    if last_cmd is not None:
+        idle_text = _humanize_timedelta(utc_now() - last_cmd)
     if not holder_id:
         holder_text = "Nobody"
     else:
@@ -1200,6 +1606,7 @@ def _device_status_text(guild: discord.Guild) -> str:
     return (
         f"Device holder: {holder_text}\n"
         f"Battery: {battery:.0f}% ({eta_text})\n"
+        f"Transfer pressure: {chance_now*100:.0f}% (uses since transfer: {command_count}, idle: {idle_text})\n"
         "Costs: low 10% (`say`,`swap`) | medium 20% (`revert`) | high 45% (`reroll`,`clone`,`genderswap`,`ageswap`) | all-target 90%"
     )
 
@@ -1359,6 +1766,15 @@ async def _outfit_autocomplete(
     state = find_active_transformation(actor.id, guild.id)
     if state is None or not state.character_name:
         return []
+    guild_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
+    selection_scope = _selection_scope_for_channel(guild_channel)
+    state_selection_scope = _selection_scope_for_state(selection_scope, state)
+    selected_pose, selected_outfit = get_selected_pose_outfit(
+        state.character_name,
+        scope=state_selection_scope,
+    )
+    selected_pose_norm = (selected_pose or "").strip().lower()
+    selected_outfit_norm = (selected_outfit or "").strip().lower()
     pose_outfits = list_pose_outfits(state.character_name)
     if not pose_outfits:
         return []
@@ -1378,7 +1794,13 @@ async def _outfit_autocomplete(
             if normalized_query and normalized_query not in match_source:
                 continue
             label_pose = pose_token or "auto"
-            label = f"{label_pose} - {option_label}"
+            is_current = (
+                selected_outfit_norm
+                and option_label.lower() == selected_outfit_norm
+                and (not selected_pose_norm or label_pose.lower() == selected_pose_norm)
+            )
+            suffix = " (current)" if is_current else ""
+            label = f"{label_pose} - {option_label}{suffix}"
             choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
             if len(choices) >= OUTFIT_AUTOCOMPLETE_LIMIT:
                 return choices
@@ -1402,7 +1824,8 @@ async def _accessory_autocomplete(
         return []
     guild_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
     selection_scope = _selection_scope_for_channel(guild_channel)
-    accessory_states = get_accessory_states(state.character_name, scope=selection_scope)
+    state_selection_scope = _selection_scope_for_state(selection_scope, state)
+    accessory_states = get_accessory_states(state.character_name, scope=state_selection_scope)
     normalized_query = (current or "").strip().lower()
     choices: list[app_commands.Choice[str]] = []
     
@@ -2307,12 +2730,17 @@ class TFBot(commands.Bot):
     async def setup_hook(self) -> None:
         await setup_bot_extensions()
 
+    async def close(self) -> None:
+        shutdown_panel_executor(wait=True)
+        await super().close()
+
 
 bot = TFBot(command_prefix=get_setting("TFBOT_PREFIX", "!", TEST_MODE), intents=intents, case_insensitive=True)
 register_bot_hooks(bot)
 ROLEPLAY_COG: Optional[RoleplayCog] = None
 GAME_BOARD_MANAGER: Optional["GameBoardManager"] = None
 _SYNCED_APP_COMMAND_GUILDS: set[int] = set()
+set_submission_channel_allowlist(*SUBMISSION_CHANNEL_IDS)
 SUBMISSION_MANAGER = setup_submission_features(bot)
 
 
@@ -2405,6 +2833,38 @@ def _selection_scope_for_channel(channel: Optional[discord.abc.GuildChannel]) ->
         return f"guild:{guild_id}"
     
     return None
+
+
+def _selection_scope_for_state(
+    base_scope: Optional[str],
+    state: Optional[TransformationState],
+) -> Optional[str]:
+    if state is None:
+        return base_scope
+    if not _state_is_clone_overlay(state.guild_id, state.user_id):
+        return base_scope
+    base = (base_scope or "").strip().lower()
+    clone_scope = f"clone:{state.guild_id}:{state.user_id}"
+    return f"{base}|{clone_scope}" if base else clone_scope
+
+
+def _seed_clone_target_outfit_selection(
+    channel: Optional[discord.abc.GuildChannel],
+    *,
+    source_state: TransformationState,
+    target_state: TransformationState,
+    persist: bool = True,
+) -> bool:
+    """Snapshot source's effective VN selection into the clone target's scoped key."""
+    channel_scope = _selection_scope_for_channel(channel)
+    source_scope = _selection_scope_for_state(channel_scope, source_state)
+    target_scope = _selection_scope_for_state(channel_scope, target_state)
+    return seed_vn_selection_from_scopes(
+        target_state.character_name,
+        from_scope=source_scope,
+        to_scope=target_scope,
+        persist=persist,
+    )
 
 
 class GuardedHelpCommand(commands.DefaultHelpCommand):
@@ -2553,7 +3013,7 @@ async def _announce_swap_cascade(
         lines.append(f"- {member_name}: {transition.before_form} -> {transition.after_form}")
     summary = "\n".join(lines) if lines else "No participants."
     description = f"{reason}\n{summary}"
-    await send_history_message("Swap Chain Reset", description)
+    _enqueue_history_message("Swap Chain Reset", description)
     if channel:
         try:
             await channel.send(
@@ -2580,6 +3040,29 @@ async def _unswap_and_announce(
         return False
     await _announce_swap_cascade(guild_id, transitions, reason=reason, channel=channel)
     return True
+
+
+async def _revert_overlay_or_swap_for_user(
+    guild_id: int,
+    user_id: int,
+    *,
+    reason: str,
+    channel: Optional[discord.abc.Messageable] = None,
+) -> bool:
+    """Revert overlay effects and swap chains for one target user."""
+    overlay_changed = await _revert_overlay_for_user(
+        guild_id,
+        user_id,
+        reason=reason,
+        channel=channel,
+    )
+    swap_changed = await _unswap_and_announce(
+        guild_id,
+        user_id,
+        reason=reason,
+        channel=channel,
+    )
+    return overlay_changed or swap_changed
 
 
 async def _revert_overlay_group(
@@ -2611,13 +3094,29 @@ async def _revert_overlay_group(
     if reverted > 0:
         persist_states()
         _persist_overlay_state()
-        await send_history_message("Overlay Reverted", f"{reason}\nGroup: {group_id}\nMembers: {reverted}")
+        _enqueue_history_message("Overlay Reverted", f"{reason}\nGroup: {group_id}\nMembers: {reverted}")
         if channel is not None:
             try:
-                await channel.send(f"Overlay group reverted ({reverted}): {reason}", allowed_mentions=discord.AllowedMentions.none())
+                await channel.send(
+                    f"{reverted} transformed user(s) have been reverted back to their original form.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             except discord.HTTPException:
                 pass
     return reverted
+
+
+def _detach_overlay_member_from_group(key: TransformKey, group_id: str) -> None:
+    """Remove one member from overlay_group_members; cancel expiry task if the group is now empty."""
+    if not group_id:
+        return
+    members = overlay_group_members.get(group_id)
+    if not members or key not in members:
+        return
+    members.discard(key)
+    if not members:
+        overlay_group_members.pop(group_id, None)
+        _cancel_overlay_group_task(group_id)
 
 
 async def _revert_overlay_for_user(
@@ -2627,30 +3126,32 @@ async def _revert_overlay_for_user(
     reason: str,
     channel: Optional[discord.abc.Messageable] = None,
 ) -> bool:
+    """Peel this user's overlay only. Other members of the same swapall/cloneall group are unchanged."""
     key = state_key(guild_id, user_id)
     record = overlay_records.get(key)
     if not record:
         return False
     group_id = str(record.get("group_id") or "").strip()
-    if group_id:
-        reverted = await _revert_overlay_group(guild_id, group_id, reason=reason, channel=channel)
-        return reverted > 0
-
     state = active_transformations.get(key)
     if state is None:
         overlay_records.pop(key, None)
+        _detach_overlay_member_from_group(key, group_id)
         _persist_overlay_state()
         return False
     base = record.get("base_visual")
     if isinstance(base, Mapping):
         _restore_base_visual_fields(state, base)
     overlay_records.pop(key, None)
+    _detach_overlay_member_from_group(key, group_id)
     persist_states()
     _persist_overlay_state()
-    await send_history_message("Overlay Reverted", f"{reason}\nUser: {user_id}")
+    _enqueue_history_message("Overlay Reverted", f"{reason}\nUser: {user_id}")
     if channel is not None:
         try:
-            await channel.send(f"Overlay reverted for <@{user_id}>: {reason}", allowed_mentions=discord.AllowedMentions(users=False))
+            await channel.send(
+                "A transformed user has been reverted back to their original form.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except discord.HTTPException:
             pass
     return True
@@ -2874,6 +3375,7 @@ async def relay_transformed_message(
         return False
 
     selection_scope = _selection_scope_for_channel(message.channel)
+    state_selection_scope = _selection_scope_for_state(selection_scope, state)
 
     cleaned_content = message.content.strip()
     original_content = cleaned_content
@@ -2929,7 +3431,7 @@ async def relay_transformed_message(
             cleaned_content = apply_mention_placeholders(mention_ready_text, mention_lookup)
 
     description = cleaned_content if cleaned_content else "*no message content*"
-    formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else None
+    formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else []
     custom_emoji_images: Dict[str, "Image.Image"] = {}
 
     files: list[discord.File] = []
@@ -2945,7 +3447,8 @@ async def relay_transformed_message(
                 reply_context.text[:120],
             )
         character_display_name = _resolve_character_display_name(message.guild, message.author.id, state)
-        vn_file = render_vn_panel(
+        vn_file = await run_panel_render_vn(
+            render_vn_panel,
             state=state,
             message_content=cleaned_content,
             character_display_name=character_display_name,
@@ -2954,7 +3457,7 @@ async def relay_transformed_message(
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
             reply_context=reply_context,
-            selection_scope=selection_scope,
+            selection_scope=state_selection_scope,
             gacha_star_count=gacha_stars,
             gacha_outfit_override=gacha_outfit,
             gacha_pose_override=gacha_pose,
@@ -2968,7 +3471,9 @@ async def relay_transformed_message(
             logger.debug("VN panel rendering unavailable; using classic embed.")
 
     if not files:
-        embed, avatar_file = await build_legacy_embed(state, description)
+        embed, avatar_file = await build_legacy_embed(
+            state, description, selection_scope=state_selection_scope
+        )
         if avatar_file:
             files.append(avatar_file)
         payload["embed"] = embed
@@ -3011,7 +3516,7 @@ async def relay_transformed_message(
 
     sent_message: Optional[discord.Message] = None
     try:
-        sent_message = await message.channel.send(**send_kwargs)
+        sent_message = await _timed_send("relay_panel_send", message.channel.send(**send_kwargs))
     except discord.HTTPException as exc:
         logger.warning("Failed to relay TF message %s: %s", message.id, exc)
         return False
@@ -3062,7 +3567,6 @@ async def prefix_help_game_command(ctx: commands.Context, *, command: Optional[s
     author_state = find_active_transformation(author.id, guild.id)
 
     is_device_holder = has_device_privilege(author, guild.id)
-    is_special = _has_special_reroll_access(author_state)
     is_admin_mod = is_admin(author) or is_bot_mod(author)
 
     bot_name = getattr(bot.user, "name", None) or TFBOT_NAME or "the bot"
@@ -3084,45 +3588,33 @@ async def prefix_help_game_command(ctx: commands.Context, *, command: Optional[s
         "",
         "**Player commands:**",
         "• `!reroll <target>` — Spend your reroll on someone else. (You cannot reroll yourself.)",
-        "• `!genderswap` — Swap your current form’s gender (if available).",
-        "• `!genderswap <target>` — (Device/Special/Admin) Swap someone else’s current form’s gender.",
-        "• `!ageswap` — Swap your current form’s age (if available).",
-        "• `!ageswap <target>` — (Device/Special/Admin) Swap someone else’s current form’s age.",
-        "• `!dstatus` — Show current Device holder and battery (no pings).",
+        "• `!genderswap [target]` — Change gender form (admins/mods/special forms unlimited; others only while holding the Device, battery applies).",
+        "• `!ageswap [target]` — Change age form (same access as genderswap).",
+        "• `!outfit <name>` — Change current outfit.",
+        "• `!accessories <set|none>` — Toggle accessory presets.",
+        "• `!dstatus` — Show Device status (Device holder/admin/mod only).",
         "• `!helpdevice` — Explain Device mechanics.",
+        "",
+        "**Device command set (if you hold the Device):**",
+        "• `!say <character> <text>` — Send a forced in-character line.",
+        "• `!swap <a> <b>` — Swap two transformed targets.",
+        "• `!swapall [minutes]` — Randomly swap active transformed users.",
+        "• `!swapallnonadmin [minutes]` — Swap active non-admin transformed users.",
+        "• `!clone <source> [target]` or `!clone <source> to <target>` — Apply a clone effect.",
+        "• `!cloneall <source>` — Clone all transformed users from one source (fixed 60m).",
+        "• `!revert [target]` — Break clone effects and active swap chains.",
     ]
 
-    # Privileged fun commands (Device holder, specials like Mirra/Narrator, or admin/mod)
-    if is_device_holder or is_special or is_admin_mod:
-        lines.extend(
-            [
-                "",
-                "**Privileged fun commands:**",
-                "• `!swap <a> <b>` — (Device/Special/Admin) Swap two transformed users.",
-                "• `!swapall [minutes]` — (Device/Special/Admin) Randomly swap active transformed users.",
-                "• `!swapallnonadmin [minutes]` — (Device/Special/Admin) Swap active non-admin users.",
-                "• `!clone <source> [target] [minutes]` — (Device/Special/Admin) Clone visuals onto a target.",
-                "• `!revert [target]` — (Device/Special/Admin) Revert active swap/clone overlays.",
-            ]
-        )
-
-    # Ability hint section (Device battery rules vs special-form note)
     if is_device_holder:
         lines.extend(
             [
                 "",
-                "**Device holder:** you can use the privileged fun commands above.",
+                "**You currently hold the Device.**",
                 "Battery costs: low 10% (`swap`,`say`) | medium 20% (`revert`) | high 45% (`reroll`,`clone`,`genderswap`,`ageswap`) | all-target 90% (`swapall*`). Recharge `0→100` in 30 minutes.",
             ]
         )
-    elif is_special:
-        lines.extend(
-            [
-                "",
-                "**Special (Mirra/Narrator):** you can use the privileged fun commands above.",
-                "(Device battery limits apply only to the actual Device holder.)",
-            ]
-        )
+    elif is_admin_mod:
+        lines.extend(["", "Use `!helpadmin` for moderation and admin tools."])
 
     text = "\n".join(lines)
     if len(text) > 2000:
@@ -3175,6 +3667,14 @@ async def send_history_message(title: str, description: str) -> None:
     except discord.HTTPException as exc:
         logger.warning("Failed to send history message: %s", exc)
     schedule_history_refresh()
+
+
+def _enqueue_history_message(title: str, description: str) -> None:
+    """Queue history logging without blocking the command response path."""
+    try:
+        bot.loop.create_task(send_history_message(title, description))
+    except Exception:
+        logger.debug("Failed to queue history message '%s'", title, exc_info=True)
 
 
 async def _resolve_archive_channel(preferred_guild: Optional[discord.Guild]) -> Optional[discord.abc.Messageable]:
@@ -3372,50 +3872,71 @@ async def _send_reroll_transition_panel(
     selection_scope: Optional[str] = None,
 ) -> bool:
     try:
+        transition_started = time.perf_counter()
         if ctx.author.id == target_member.id:
             message_text = f"<@{ctx.author.id}> rerolled themself into {current_state.character_name}"
         else:
             message_text = (
                 f"<@{ctx.author.id}> rerolled <@{target_member.id}> into {current_state.character_name}"
             )
+        transition_file: Optional[discord.File] = None
+        png_kwargs = dict(
+            left_state=previous_state,
+            right_state=current_state,
+            background_user_id=target_member.id,
+            center_symbol_name="tf.png",
+            filename=f"reroll_{target_member.id}.png",
+            left_selection_scope=selection_scope,
+            right_selection_scope=selection_scope,
+            fit_avatar_width=False,
+        )
         if use_device_animation:
-            transition_file = render_device_reroll_transition_panel_gif(
+            transition_file = await run_panel_render_gif(
+                render_device_reroll_transition_panel_gif,
                 previous_state=previous_state,
                 current_state=current_state,
                 background_user_id=target_member.id,
-                filename=f"reroll_{target_member.id}.gif",
+                filename=f"reroll_{target_member.id}.webp",
                 previous_selection_scope=selection_scope,
                 current_selection_scope=selection_scope,
                 fit_avatar_width=False,
             )
+            if transition_file is None:
+                transition_file = await run_panel_render_gif(render_tf_split_panel, **png_kwargs)
+        elif REROLL_USE_STATIC_TRANSITION:
+            transition_file = await run_panel_render_gif(render_tf_split_panel, **png_kwargs)
         else:
-            transition_file = render_tf_split_panel_gif(
+            transition_file = await run_panel_render_gif(
+                render_tf_split_panel_gif,
                 left_state=previous_state,
                 right_state=current_state,
                 background_user_id=target_member.id,
                 center_symbol_name=None,
-                filename=f"reroll_{target_member.id}.gif",
+                filename=f"reroll_{target_member.id}.webp",
                 left_selection_scope=selection_scope,
                 right_selection_scope=selection_scope,
                 fit_avatar_width=False,
             )
-        if transition_file is None:
-            transition_file = render_tf_split_panel(
-                left_state=previous_state,
-                right_state=current_state,
-                background_user_id=target_member.id,
-                center_symbol_name="tf.png",
-                filename=f"reroll_{target_member.id}.png",
-                left_selection_scope=selection_scope,
-                right_selection_scope=selection_scope,
-                fit_avatar_width=False,
-            )
+            if transition_file is None:
+                transition_file = await run_panel_render_gif(render_tf_split_panel, **png_kwargs)
         if transition_file is None:
             return False
-        await ctx.send(
-            content=message_text,
-            file=transition_file,
-            allowed_mentions=discord.AllowedMentions.none(),
+        render_ms = (time.perf_counter() - transition_started) * 1000.0
+        _, upload_ms = await _timed_send_ms(
+            "reroll_transition_send",
+            ctx.send(
+                content=message_text,
+                file=transition_file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
+        )
+        total_ms = (time.perf_counter() - transition_started) * 1000.0
+        _log_transition_send_metrics(
+            label="reroll_transition_send",
+            render_ms=render_ms,
+            upload_ms=upload_ms,
+            total_ms=total_ms,
+            payload_bytes=_discord_file_size_bytes(transition_file),
         )
         await _delete_vn_message_with_retry(
             getattr(ctx, "message", None),
@@ -3442,36 +3963,62 @@ async def _send_single_body_change_transition_panel(
     use_device_particles: bool = False,
 ) -> bool:
     try:
+        transition_started = time.perf_counter()
         guild_channel = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
         selection_scope = _selection_scope_for_channel(guild_channel)
-        transition_file = render_device_reroll_transition_panel_gif(
+        previous_selection_scope = _selection_scope_for_state(selection_scope, previous_state)
+        current_selection_scope = _selection_scope_for_state(selection_scope, current_state)
+        body_change_panel_size = (800, 250)
+        transition_file = await run_panel_render_gif(
+            render_device_reroll_transition_panel_gif,
             previous_state=previous_state,
             current_state=current_state,
             background_user_id=target_member.id,
-            filename=f"body_change_{target_member.id}.gif",
-            previous_selection_scope=selection_scope,
-            current_selection_scope=selection_scope,
-            panel_size=(300, 250),
+            filename=f"body_change_{target_member.id}.webp",
+            previous_selection_scope=previous_selection_scope,
+            current_selection_scope=current_selection_scope,
+            panel_size=body_change_panel_size,
             fit_avatar_width=False,
             include_particles=use_device_particles,
+            animation_fps=10,
+            max_frames=12,
+            effect_ms=750,
+            webp_target_bytes_override=20000,
+            gif_target_bytes_override=20000,
+            transition_label="body_change_transition",
         )
         if transition_file is None:
-            transition_file = render_tf_split_panel(
+            transition_file = await run_panel_render_gif(
+                render_tf_split_panel,
                 left_state=previous_state,
                 right_state=current_state,
                 background_user_id=target_member.id,
                 center_symbol_name=None,
                 filename=f"body_change_{target_member.id}.png",
-                panel_size=(300, 250),
+                panel_size=body_change_panel_size,
                 fit_avatar_width=False,
+                left_selection_scope=previous_selection_scope,
+                right_selection_scope=current_selection_scope,
             )
         if transition_file is None:
             return False
-        await ctx.reply(
-            content=message_text,
-            file=transition_file,
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        render_ms = (time.perf_counter() - transition_started) * 1000.0
+        _, upload_ms = await _timed_send_ms(
+            "body_change_transition_send",
+            ctx.reply(
+                content=message_text,
+                file=transition_file,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
+        )
+        total_ms = (time.perf_counter() - transition_started) * 1000.0
+        _log_transition_send_metrics(
+            label="body_change_transition_send",
+            render_ms=render_ms,
+            upload_ms=upload_ms,
+            total_ms=total_ms,
+            payload_bytes=_discord_file_size_bytes(transition_file),
         )
         return True
     except discord.HTTPException as exc:
@@ -3479,6 +4026,14 @@ async def _send_single_body_change_transition_panel(
             "Failed to send body-change transition panel in channel %s: %s",
             getattr(getattr(ctx, "channel", None), "id", "unknown"),
             exc,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "Body-change transition render failed in channel %s: %s",
+            getattr(getattr(ctx, "channel", None), "id", "unknown"),
+            exc,
+            exc_info=True,
         )
         return False
 
@@ -3493,39 +4048,60 @@ async def _send_clone_transition_panel(
     target_member: discord.Member,
     message_text: str,
     use_device_particles: bool = False,
+    after_target_compose_scope: Optional[str] = None,
 ) -> bool:
     try:
+        transition_started = time.perf_counter()
         guild_channel = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
         selection_scope = _selection_scope_for_channel(guild_channel)
-        transition_file = render_clone_transition_panel_gif(
+        source_selection_scope = _selection_scope_for_state(selection_scope, source_state)
+        before_target_selection_scope = _selection_scope_for_state(selection_scope, before_target_state)
+        after_target_selection_scope = after_target_compose_scope if after_target_compose_scope is not None else _selection_scope_for_state(
+            selection_scope, target_state
+        )
+        transition_file = await run_panel_render_gif(
+            render_clone_transition_panel_gif,
             source_state=source_state,
             before_target_state=before_target_state,
             after_target_state=target_state,
             source_background_user_id=source_member.id,
             target_background_user_id=target_member.id,
-            filename=f"clone_{source_member.id}_{target_member.id}.gif",
-            source_selection_scope=selection_scope,
-            before_target_selection_scope=selection_scope,
-            after_target_selection_scope=selection_scope,
+            filename=f"clone_{source_member.id}_{target_member.id}.webp",
+            source_selection_scope=source_selection_scope,
+            before_target_selection_scope=before_target_selection_scope,
+            after_target_selection_scope=after_target_selection_scope,
             include_particles=use_device_particles,
         )
         if transition_file is None:
-            transition_file = render_swap_transition_panel(
+            transition_file = await run_panel_render_gif(
+                render_swap_transition_panel,
                 left_state=source_state,
                 right_state=target_state,
                 left_background_user_id=source_member.id,
                 right_background_user_id=target_member.id,
-                left_selection_scope=selection_scope,
-                right_selection_scope=selection_scope,
+                left_selection_scope=source_selection_scope,
+                right_selection_scope=after_target_selection_scope,
                 filename=f"clone_{source_member.id}_{target_member.id}.png",
             )
         if transition_file is None:
             return False
-        await ctx.reply(
-            content=message_text,
-            file=transition_file,
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        render_ms = (time.perf_counter() - transition_started) * 1000.0
+        _, upload_ms = await _timed_send_ms(
+            "clone_transition_send",
+            ctx.reply(
+                content=message_text,
+                file=transition_file,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
+        )
+        total_ms = (time.perf_counter() - transition_started) * 1000.0
+        _log_transition_send_metrics(
+            label="clone_transition_send",
+            render_ms=render_ms,
+            upload_ms=upload_ms,
+            total_ms=total_ms,
+            payload_bytes=_discord_file_size_bytes(transition_file),
         )
         return True
     except discord.HTTPException as exc:
@@ -3542,16 +4118,33 @@ async def _send_mass_swap_transition_panel(
     *,
     message_text: str,
     filename: str,
+    pre_render_task: Optional["asyncio.Task[Optional[discord.File]]"] = None,
 ) -> bool:
     try:
-        transition_file = render_mass_swap_transition_panel_gif(filename=filename)
+        transition_started = time.perf_counter()
+        if pre_render_task is not None:
+            transition_file = await pre_render_task
+        else:
+            transition_file = await run_panel_render_gif(render_mass_swap_transition_panel_gif, filename=filename)
         if transition_file is None:
             return False
-        await ctx.reply(
-            content=message_text,
-            file=transition_file,
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        render_ms = (time.perf_counter() - transition_started) * 1000.0
+        _, upload_ms = await _timed_send_ms(
+            "mass_swap_transition_send",
+            ctx.reply(
+                content=message_text,
+                file=transition_file,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
+        )
+        total_ms = (time.perf_counter() - transition_started) * 1000.0
+        _log_transition_send_metrics(
+            label="mass_swap_transition_send",
+            render_ms=render_ms,
+            upload_ms=upload_ms,
+            total_ms=total_ms,
+            payload_bytes=_discord_file_size_bytes(transition_file),
         )
         return True
     except discord.HTTPException as exc:
@@ -3568,16 +4161,33 @@ async def _send_mass_reroll_transition_panel(
     *,
     message_text: str,
     filename: str,
+    pre_render_task: Optional["asyncio.Task[Optional[discord.File]]"] = None,
 ) -> bool:
     try:
-        transition_file = render_mass_reroll_transition_panel_gif(filename=filename)
+        transition_started = time.perf_counter()
+        if pre_render_task is not None:
+            transition_file = await pre_render_task
+        else:
+            transition_file = await run_panel_render_gif(render_mass_reroll_transition_panel_gif, filename=filename)
         if transition_file is None:
             return False
-        await ctx.reply(
-            content=message_text,
-            file=transition_file,
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        render_ms = (time.perf_counter() - transition_started) * 1000.0
+        _, upload_ms = await _timed_send_ms(
+            "mass_reroll_transition_send",
+            ctx.reply(
+                content=message_text,
+                file=transition_file,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
+        )
+        total_ms = (time.perf_counter() - transition_started) * 1000.0
+        _log_transition_send_metrics(
+            label="mass_reroll_transition_send",
+            render_ms=render_ms,
+            upload_ms=upload_ms,
+            total_ms=total_ms,
+            payload_bytes=_discord_file_size_bytes(transition_file),
         )
         return True
     except discord.HTTPException as exc:
@@ -3587,6 +4197,21 @@ async def _send_mass_reroll_transition_panel(
             exc,
         )
         return False
+
+
+def _prefetch_mass_transition(kind: str, *, filename: str) -> Optional["asyncio.Task[Optional[discord.File]]"]:
+    if not _MASS_TRANSITION_PREFETCH_ENABLED:
+        return None
+    render_fn = render_mass_reroll_transition_panel_gif if kind == "reroll" else render_mass_swap_transition_panel_gif
+    try:
+        return asyncio.create_task(run_panel_render_gif(render_fn, filename=filename))
+    except RuntimeError:
+        return None
+
+
+def _cancel_prefetch_task(task: Optional["asyncio.Task[Optional[discord.File]]"]) -> None:
+    if task is not None and not task.done():
+        task.cancel()
 
 
 def _swap_transition_message(
@@ -3616,7 +4241,26 @@ def _render_swap_transition_file(
     use_device_animation: bool = False,
     filename: str,
 ) -> Optional[discord.File]:
-    gif_filename = f"{Path(filename).stem}.gif"
+    clone_involved = any(
+        state is not None and _state_is_clone_overlay(state.guild_id, state.user_id)
+        for state in (before_left_state, before_right_state, left_state, right_state)
+    )
+    left_before_scope = _selection_scope_for_state(selection_scope, before_left_state)
+    right_before_scope = _selection_scope_for_state(selection_scope, before_right_state)
+    left_after_scope = _selection_scope_for_state(selection_scope, left_state)
+    right_after_scope = _selection_scope_for_state(selection_scope, right_state)
+    if not use_device_animation and (clone_involved or SWAP_USE_STATIC_TRANSITION):
+        # Clone swaps: fast static panel. Optional SWAP_USE_STATIC_TRANSITION matches reroll static path.
+        return render_swap_transition_panel(
+            left_state=left_state,
+            right_state=right_state,
+            left_background_user_id=left_member.id,
+            right_background_user_id=right_member.id,
+            left_selection_scope=left_after_scope,
+            right_selection_scope=right_after_scope,
+            filename=filename,
+        )
+    transition_filename = f"{Path(filename).stem}.webp"
     if use_device_animation:
         transition_file = render_device_swap_transition_panel_gif(
             before_left_state=before_left_state,
@@ -3625,11 +4269,11 @@ def _render_swap_transition_file(
             after_right_state=right_state,
             left_background_user_id=left_member.id,
             right_background_user_id=right_member.id,
-            left_before_selection_scope=selection_scope,
-            right_before_selection_scope=selection_scope,
-            left_after_selection_scope=selection_scope,
-            right_after_selection_scope=selection_scope,
-            filename=gif_filename,
+            left_before_selection_scope=left_before_scope,
+            right_before_selection_scope=right_before_scope,
+            left_after_selection_scope=left_after_scope,
+            right_after_selection_scope=right_after_scope,
+            filename=transition_filename,
         )
     else:
         transition_file = render_swap_transition_panel_gif(
@@ -3639,11 +4283,11 @@ def _render_swap_transition_file(
             after_right_state=right_state,
             left_background_user_id=left_member.id,
             right_background_user_id=right_member.id,
-            left_before_selection_scope=selection_scope,
-            right_before_selection_scope=selection_scope,
-            left_after_selection_scope=selection_scope,
-            right_after_selection_scope=selection_scope,
-            filename=gif_filename,
+            left_before_selection_scope=left_before_scope,
+            right_before_selection_scope=right_before_scope,
+            left_after_selection_scope=left_after_scope,
+            right_after_selection_scope=right_after_scope,
+            filename=transition_filename,
         )
     if transition_file is not None:
         return transition_file
@@ -3652,8 +4296,8 @@ def _render_swap_transition_file(
         right_state=right_state,
         left_background_user_id=left_member.id,
         right_background_user_id=right_member.id,
-        left_selection_scope=selection_scope,
-        right_selection_scope=selection_scope,
+        left_selection_scope=left_after_scope,
+        right_selection_scope=right_after_scope,
         filename=filename,
     )
 
@@ -3673,6 +4317,82 @@ def _render_background_transition_file(
         filename=filename,
         selection_scope=selection_scope,
     )
+
+
+def _discord_file_bytes(file_obj: discord.File) -> Optional[bytes]:
+    fp = getattr(file_obj, "fp", None)
+    if fp is None:
+        return None
+    if hasattr(fp, "getvalue"):
+        try:
+            data = fp.getvalue()
+            if isinstance(data, (bytes, bytearray)):
+                return bytes(data)
+        except Exception:
+            return None
+    try:
+        pos = fp.tell() if hasattr(fp, "tell") else None
+        if hasattr(fp, "seek"):
+            fp.seek(0)
+        data = fp.read()
+        if pos is not None and hasattr(fp, "seek"):
+            fp.seek(pos)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+    except Exception:
+        return None
+    return None
+
+
+def _discord_file_size_bytes(file_obj: Optional[discord.File]) -> Optional[int]:
+    if file_obj is None:
+        return None
+    payload = _discord_file_bytes(file_obj)
+    if payload is None:
+        return None
+    return len(payload)
+
+
+async def _render_background_transition_file_cached(
+    *,
+    state: Optional[TransformationState],
+    old_background_path: Optional[Path],
+    new_background_path: Optional[Path],
+    filename: str,
+    selection_scope: Optional[str] = None,
+) -> Optional[discord.File]:
+    cache_stem = Path(filename).stem or "bg_transition"
+    preferred_filename = f"{cache_stem}.webp"
+    fallback_filename = f"{cache_stem}.gif"
+    cache_key = build_bg_transition_cache_key(
+        state_user_id=getattr(state, "user_id", None),
+        state_character_name=getattr(state, "character_name", "") or "",
+        state_avatar_path=getattr(state, "character_avatar_path", "") or "",
+        state_folder=getattr(state, "character_folder", "") or "",
+        old_background_path=old_background_path,
+        new_background_path=new_background_path,
+        selection_scope=selection_scope,
+    )
+    cached = get_cached_bg_transition_file(cache_key, preferred_filename)
+    if cached is None:
+        cached = get_cached_bg_transition_file(cache_key, fallback_filename)
+    if cached is not None:
+        return cached
+    rendered = await run_panel_render_gif(
+        _render_background_transition_file,
+        state=state,
+        old_background_path=old_background_path,
+        new_background_path=new_background_path,
+        filename=preferred_filename,
+        selection_scope=selection_scope,
+        label="bg_transition_render",
+    )
+    if rendered is None:
+        return None
+    payload = _discord_file_bytes(rendered)
+    if payload:
+        put_cached_bg_transition_file(cache_key, rendered.filename or preferred_filename, payload)
+    return rendered
 
 
 def _render_appearance_transition_file(
@@ -3739,12 +4459,14 @@ def _resolve_character_display_name(
     source_user_id = clone_record.get("source_user_id")
     if not isinstance(source_user_id, int):
         return base_name
-    source_state = find_active_transformation(source_user_id, guild.id)
-    if source_state is None:
-        return base_name
-    source_name = _base_character_display_name(guild, source_user_id, source_state)
+    source_name = clone_copied_source_display_name(clone_record)
     if not source_name:
-        return base_name
+        source_state = find_active_transformation(source_user_id, guild.id)
+        if source_state is None:
+            return base_name
+        source_name = _base_character_display_name(guild, source_user_id, source_state)
+        if not source_name:
+            return base_name
     short_base_name = (base_name or "").strip().split()[0] if (base_name or "").strip() else base_name
     short_source_name = (source_name or "").strip().split()[0] if (source_name or "").strip() else source_name
     return f"{short_base_name} (Clone of {short_source_name})"
@@ -3807,7 +4529,7 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
             character
             for character in available_characters
             if not _is_admin_only_random_name(character.name)
-            # Toggleable restriction: Only admins can get Ball/Narrator (if enabled)
+            # Toggleable restriction: Only admins can get special-form rerolls (if enabled)
             and (not SPECIAL_CHARACTERS_ADMIN_ONLY or not _is_special_reroll_name(character.folder or character.name))
         ]
     character: Optional[TFCharacter] = None
@@ -3815,13 +4537,13 @@ async def handle_transformation(message: discord.Message) -> Optional[Transforma
     inanimate_form = None
     if INANIMATE_FORMS and random.random() <= INANIMATE_TF_CHANCE:
         available_inanimate = list(INANIMATE_FORMS)
-        # Toggleable restriction: Only admins can get Ball/Narrator inanimate forms (if enabled)
+        # Toggleable restriction: Only admins can get special-form inanimate rerolls (if enabled)
         if SPECIAL_CHARACTERS_ADMIN_ONLY and not (is_admin(member) or is_bot_mod(member)):
             available_inanimate = [
                 form for form in available_inanimate
                 if not _is_special_reroll_name(str(form.get("name", "")))
             ]
-        # Toggleable restriction: When disabled, only allow Ball/Narrator inanimate forms
+        # Toggleable restriction: When disabled, only allow configured special-form inanimate rerolls
         if not INANIMATE_ENABLED:
             available_inanimate = [
                 form for form in available_inanimate
@@ -4465,6 +5187,8 @@ async def on_ready():
         monitored_channels.append(f"Archive: {TF_ARCHIVE_CHANNEL_ID}")
     if SUBMISSION_CHANNEL_ID > 0:
         monitored_channels.append(f"Submission: {SUBMISSION_CHANNEL_ID}")
+    if SUBMISSION_SECONDARY_CHANNEL_ID > 0:
+        monitored_channels.append(f"Submission (secondary): {SUBMISSION_SECONDARY_CHANNEL_ID}")
     if CHARACTER_INFO_FORUM_CHANNEL_ID > 0:
         monitored_channels.append(f"Character Info Forum: {CHARACTER_INFO_FORUM_CHANNEL_ID}")
     if ROLEPLAY_FORUM_POST_ID > 0:
@@ -4514,7 +5238,7 @@ async def on_member_remove(member: discord.Member) -> None:
 async def secret_reset_command(ctx: commands.Context):
     author = ctx.author
     if not isinstance(author, discord.Member):
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        await _reroll_reply("This command can only be used inside a server.")
         return None
     if not (is_admin(author) or is_bot_mod(author)):
         await ctx.reply("You must be an admin or moderator to run this command.", mention_author=False)
@@ -4655,6 +5379,14 @@ async def freecharacter_command(ctx: commands.Context, *, character_or_user: str
 
     await ensure_state_restored()
 
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        character_or_user,
+        1,
+        usage="Use `!freecharacter <character_name>` or `!freecharacter <user_id>` with one token only (quote multi-word names).",
+    ):
+        return
+
     token = (character_or_user or "").strip()
     if not token:
         await ctx.reply(
@@ -4769,6 +5501,13 @@ async def prefix_untimeout_command(ctx: commands.Context, *, target: str = "") -
     if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
         await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
         return
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        target,
+        1,
+        usage="Use `!untimeout <@user or character or name>` with one target only (quote multi-word names).",
+    ):
+        return
     target = (target or "").strip()
     if not target:
         await ctx.reply("Usage: `!untimeout @user or character name or user name`", mention_author=False)
@@ -4794,6 +5533,13 @@ async def prefix_ban_command(ctx: commands.Context, *, target: str = "") -> None
         return
     if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
         await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        return
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        target,
+        1,
+        usage="Use `!ban <@user or character or name>` with one target only (quote multi-word names).",
+    ):
         return
     target = (target or "").strip()
     if not target:
@@ -4865,8 +5611,16 @@ async def prefix_helpadmin_command(ctx: commands.Context) -> None:
         "• `!resetinfo confirm` — Delete and recreate every character info forum post.",
         "• `!refreshinfo` — Refresh character info forum posts.",
         "",
+        "**Privileged VN control (also available to Device/Special where applicable):**",
+        "• `!say <character> <text>` — Force an in-character line in VN.",
+        "• `!swap <a> <b>` / `!swapall [minutes]` / `!swapallnonadmin [minutes]` — Swap controls.",
+        "• `!clone <source> [target]` / `!clone <source> to <target>` — Clone control (fixed 60m).",
+        "• `!cloneall <source>` — Clone all transformed users from one source (fixed 60m).",
+        "• `!revert [target]` — Revert clone effects and direct swap chains.",
+        "",
         "**Device admin tool (VN only):**",
-        "• `!dspawn` / `/dspawn` — Force immediate Device reassignment.",
+        "• `!dspawn [target]` / `/dspawn [target]` — Force Device reassignment (or assign specific eligible target).",
+        "• `!dstatus` / `/dstatus` — View Device status (admins/mods/device holder).",
         "• `!drecharge` / `/drecharge` — Recharge the Device battery to 100%.",
     ]
     text = "\n".join(lines)
@@ -4878,61 +5632,93 @@ async def prefix_helpadmin_command(ctx: commands.Context) -> None:
 
 @bot.command(name="dspawn")
 @commands.guild_only()
-async def prefix_dspawn_command(ctx: commands.Context) -> None:
+async def prefix_dspawn_command(ctx: commands.Context, *, target: str = "") -> None:
     if not ctx.guild:
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        await ctx.reply("This command can only be used inside a server.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False)
+        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
-        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        return
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        target,
+        1,
+        usage="Use `!dspawn` with no arguments, or `!dspawn <target>` with one target only (quote multi-word names).",
+    ):
         return
     old_holder = device_holder_by_guild.get(ctx.guild.id)
-    await _rotate_device_once(ctx.guild, force_announce=True)
-    new_holder = device_holder_by_guild.get(ctx.guild.id)
-    if new_holder is None:
-        await ctx.reply("No eligible transformed non-admin users are active right now.", mention_author=False)
-        return
-    await ctx.reply(f"Device reassigned: <@{old_holder}> -> <@{new_holder}>", mention_author=False)
+    token = (target or "").strip()
+    if token:
+        state = _find_state_by_token(ctx.guild, token)
+        if state is None:
+            await ctx.reply(f"I couldn't lock onto `{token}` for Device handoff.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+        new_holder = int(state.user_id)
+        if not _is_device_eligible_user(ctx.guild, new_holder):
+            await ctx.reply("That target is not currently eligible to hold the Device.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+        if old_holder == new_holder:
+            holder_name = _device_member_label(ctx.guild, new_holder)
+            await ctx.reply(f"The Device is already with {holder_name}.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+        await _commit_device_transfer(ctx.guild, old_holder, new_holder)
+    else:
+        await _rotate_device_once(ctx.guild, force_announce=True)
+        new_holder = device_holder_by_guild.get(ctx.guild.id)
+        if new_holder is None:
+            await ctx.reply("No eligible transformed non-admin users are active right now.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+        if old_holder == new_holder:
+            holder_name = _device_member_label(ctx.guild, new_holder)
+            await ctx.reply(f"The Device remains with {holder_name}.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+    old_name = _device_member_label(ctx.guild, old_holder)
+    new_name = _device_member_label(ctx.guild, device_holder_by_guild.get(ctx.guild.id))
+    await ctx.reply(f"Device reassigned: {old_name} -> {new_name}", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.command(name="drecharge")
 @commands.guild_only()
 async def prefix_drecharge_command(ctx: commands.Context) -> None:
     if not ctx.guild:
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        await ctx.reply("This command can only be used inside a server.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False)
+        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     if not (is_admin(ctx.author) or is_bot_mod(ctx.author)):
-        await ctx.reply("Only admins or moderators can use this command.", mention_author=False)
+        await ctx.reply("Only admins or moderators can use this command.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     _recharge_device_battery(ctx.guild.id)
-    await ctx.reply("Device battery recharged to 100%.", mention_author=False)
+    await ctx.reply("Device battery recharged to 100%.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.command(name="dstatus")
 @commands.guild_only()
 async def prefix_dstatus_command(ctx: commands.Context) -> None:
     if not ctx.guild:
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        await ctx.reply("This command can only be used inside a server.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False)
+        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
-    await ctx.reply(_device_status_text(ctx.guild)[:2000], mention_author=False)
+    if not isinstance(ctx.author, discord.Member) or not _can_use_dstatus(ctx.author, ctx.guild.id):
+        await _delete_vn_message_with_retry(ctx.message, context="dstatus unauthorized")
+        return
+    await ctx.reply(_device_status_text(ctx.guild)[:2000], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.command(name="helpdevice")
 @commands.guild_only()
 async def prefix_helpdevice_command(ctx: commands.Context) -> None:
     if not ctx.guild:
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        await ctx.reply("This command can only be used inside a server.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(ctx.channel):
-        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False)
+        await ctx.reply("The Device isn't available in gameboard mode.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
     text = (
         "**The Device**\n"
@@ -4940,7 +5726,7 @@ async def prefix_helpdevice_command(ctx: commands.Context) -> None:
         "Holder gains fun-command privilege (reroll/swap/clone family), but no moderation/system powers.\n\n"
         f"{_device_status_text(ctx.guild)}"
     )
-    await ctx.reply(text[:2000], mention_author=False)
+    await ctx.reply(text[:2000], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.command(name="resetinfo")
@@ -5140,17 +5926,25 @@ async def _execute_bulk_reroll_for_channel(
     eligible_count = len(eligible_members)
     success_count = 0
     failed_count = 0
+    mutated_count = 0
+    batched_history_rows: list[str] = []
     t0 = time.monotonic()
+    interaction_ctx: Any = None
+    if interaction is not None:
+        interaction_ctx = InteractionContextAdapter(interaction, bot=bot)
     try:
         for member in eligible_members:
             if interaction is not None:
-                ctx_loop = InteractionContextAdapter(interaction, bot=bot)
+                ctx_loop = interaction_ctx
             else:
                 ctx_loop = prefix_ctx  # type: ignore[assignment]
             ctx_loop._slash_target_member = member
             ctx_loop._slash_target_folder = None
             ctx_loop._slash_force_folder = None
             ctx_loop._suppress_reroll_messages = True
+            ctx_loop._bulk_reroll_mode = _BULK_REROLL_OPTIMIZED
+            ctx_loop._bulk_reroll_applied = False
+            ctx_loop._bulk_reroll_history_rows = batched_history_rows
             try:
                 await reroll_command(ctx_loop, args="")
             except Exception:
@@ -5162,14 +5956,41 @@ async def _execute_bulk_reroll_for_channel(
                 )
                 failed_count += 1
             else:
-                success_count += 1
+                if bool(getattr(ctx_loop, "_bulk_reroll_applied", False)):
+                    success_count += 1
+                    mutated_count += 1
+                else:
+                    failed_count += 1
     finally:
+        if _BULK_REROLL_OPTIMIZED and mutated_count > 0:
+            persist_states()
+            schedule_history_refresh()
+            actor = None
+            if interaction is not None:
+                actor = interaction.user
+            elif prefix_ctx is not None:
+                actor = prefix_ctx.author
+            actor_name = getattr(actor, "display_name", "Unknown")
+            mode_label = "non-admin" if filter_non_admin_mod else "all-members"
+            details = (
+                f"Triggered by: **{actor_name}**\n"
+                f"Mode: **{mode_label}**\n"
+                f"Eligible: **{eligible_count}**\n"
+                f"Applied: **{success_count}**\n"
+                f"Failed: **{failed_count}**"
+            )
+            if batched_history_rows:
+                details += "\n\n" + "\n".join(batched_history_rows[:12])
+            await send_history_message("TF Bulk Rerolled", details)
         if prefix_ctx is not None:
             for attr in (
                 "_suppress_reroll_messages",
                 "_slash_target_member",
                 "_slash_target_folder",
                 "_slash_force_folder",
+                "_bulk_reroll_mode",
+                "_bulk_reroll_applied",
+                "_bulk_reroll_history_rows",
             ):
                 if hasattr(prefix_ctx, attr):
                     try:
@@ -5190,6 +6011,10 @@ async def _execute_bulk_reroll_for_channel(
 
 async def reroll_command(ctx: commands.Context, *, args: str = ""):
     await ensure_state_restored()
+    bulk_mode = bool(getattr(ctx, "_bulk_reroll_mode", False))
+    suppress_messages = bool(getattr(ctx, "_suppress_reroll_messages", False))
+    reroll_speech_gate_key: Optional[TransformKey] = None
+    setattr(ctx, "_bulk_reroll_applied", False)
     guild_channel = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
     selection_scope = _selection_scope_for_channel(guild_channel)
     author = ctx.author
@@ -5231,44 +6056,65 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
 
     guild = ctx.guild
     if guild is None:
-        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        await _reroll_reply("This command can only be used inside a server.")
         return None
     now = utc_now()
     author_state = find_active_transformation(author.id, guild.id)
     author_has_fun_power = has_fun_privilege(author, author_state, guild.id)
-    author_is_admin = author_has_fun_power or roleplay_dm_override
-    author_has_special_power = _has_special_reroll_access(author_state)
-    battery_block = _device_precheck_message(author, author_state, guild.id, "reroll")
-    if battery_block:
-        await ctx.reply(battery_block, mention_author=False)
-        return None
-    author_special_label = author_state.character_name if author_state else ""
-    can_force_reroll = author_is_admin or author_has_special_power
-    
-    # Check cooldown EARLY - before any other processing
-    # If on cooldown, return immediately without processing anything
-    if not (author_is_admin or author_has_special_power):
+    author_has_special_power = _state_has_effective_special_access(author, author_state, guild.id)
+    author_staff_mod = is_admin(author) or is_bot_mod(author)
+    author_bypass_reroll_cooldown = author_staff_mod or roleplay_dm_override or author_has_special_power
+    author_can_reroll_elite = author_has_fun_power or roleplay_dm_override or author_has_special_power
+    device_only_actor = _is_device_only_actor(author, author_state, guild.id)
+
+    async def _reroll_reply(text: str) -> None:
+        await ctx.reply(
+            text,
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _reroll_cooldown_gate() -> bool:
+        """Return True if author is on the 24h other-reroll cooldown (and reply was sent)."""
         last_reroll_at = get_last_reroll_timestamp(guild.id, author.id)
-        if last_reroll_at is not None:
-            cooldown_end = last_reroll_at + timedelta(hours=24)
-            if cooldown_end > now:
-                remaining = cooldown_end - now
-                remaining_seconds = max(int(remaining.total_seconds()), 0)
-                hours, remainder = divmod(remaining_seconds, 3600)
-                minutes = remainder // 60
-                if hours and minutes:
-                    when_text = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
-                elif hours:
-                    when_text = f"{hours} hour{'s' if hours != 1 else ''}"
-                elif minutes:
-                    when_text = f"{minutes} minute{'s' if minutes != 1 else ''}"
-                else:
-                    when_text = "less than a minute"
-                await ctx.reply(
-                    f"You've already used your reroll. You can reroll again in {when_text}.",
-                    mention_author=False,
-                )
-                return  # Exit immediately - don't process anything
+        if last_reroll_at is None:
+            return False
+        cooldown_end = last_reroll_at + timedelta(hours=24)
+        if cooldown_end <= now:
+            return False
+        remaining = cooldown_end - now
+        remaining_seconds = max(int(remaining.total_seconds()), 0)
+        hours, remainder = divmod(remaining_seconds, 3600)
+        minutes = remainder // 60
+        if hours and minutes:
+            when_text = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+        elif hours:
+            when_text = f"{hours} hour{'s' if hours != 1 else ''}"
+        elif minutes:
+            when_text = f"{minutes} minute{'s' if minutes != 1 else ''}"
+        else:
+            when_text = "less than a minute"
+        await ctx.reply(
+            f"You've already used your reroll. You can reroll again in {when_text}.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+
+    if not bulk_mode:
+        if not device_only_actor:
+            battery_block = _device_precheck_message(author, author_state, guild.id, "reroll")
+            if battery_block:
+                await _reroll_reply(battery_block)
+                return None
+    author_special_label = author_state.character_name if author_state else ""
+    can_force_reroll = author_can_reroll_elite
+
+    # Cooldown before parsing: staff/special/DM skip; device-only defers (other-target may pay battery or use free slot)
+    if not bulk_mode:
+        if not author_bypass_reroll_cooldown and not device_only_actor:
+            if await _reroll_cooldown_gate():
+                return None
     
     target_member: Optional[discord.Member] = None
     target_is_admin = False
@@ -5277,7 +6123,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     forced_character: Optional[TFCharacter] = None
     forced_inanimate: Optional[Dict[str, object]] = None
 
-    tokens = [token for token in args.split() if token.strip()]
+    tokens = _split_command_tokens(args)
     # VN reroll filter: tokens starting with '-' are variable or pack filters, not target/forced
     filter_value: Optional[str] = None
     for t in tokens:
@@ -5335,7 +6181,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             if mention_id is not None:
                 _, member_lookup = await fetch_member(guild.id, mention_id)
                 if member_lookup is None:
-                    await ctx.reply("I couldn't find that member.", mention_author=False)
+                    await _reroll_reply("That summon target isn't in this server right now.")
                     return None
                 target_member = member_lookup
                 target_is_admin = is_admin(member_lookup) or is_bot_mod(member_lookup)
@@ -5363,18 +6209,65 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     active_transformations[placeholder_key] = placeholder
                     state = placeholder
                 else:
-                    _reroll_diag_log(
-                        "target_resolve_failed",
-                        guild_id=getattr(guild, "id", None),
-                        author_id=getattr(author, "id", None),
-                        target_token=first,
-                        interaction_id=_ctx_interaction_id(ctx),
-                    )
-                    await ctx.reply(
-                        f"I couldn't find an active transformation matching `{first}`.",
-                        mention_author=False,
-                    )
-                    return None
+                    # Fallback for unquoted multi-word targets. If combining remaining
+                    # tokens resolves to a valid active target, consume them as target.
+                    if non_filter_tokens:
+                        combined_target = " ".join([first] + non_filter_tokens).strip()
+                        combined_state = _find_state_by_token(guild, combined_target)
+                        if combined_state is None:
+                            combined_member = discord.utils.find(
+                                lambda m: m.name.lower() == combined_target.lower()
+                                or m.display_name.lower() == combined_target.lower(),
+                                guild.members,
+                            )
+                            if combined_member is not None:
+                                target_member = combined_member
+                                target_is_admin = is_admin(combined_member) or is_bot_mod(combined_member)
+                                placeholder = _build_placeholder_state(combined_member, guild)
+                                placeholder_key = state_key(guild.id, combined_member.id)
+                                placeholder_state = placeholder
+                                active_transformations[placeholder_key] = placeholder
+                                state = placeholder
+                                non_filter_tokens.clear()
+                        else:
+                            state = combined_state
+                            non_filter_tokens.clear()
+                    if state is None:
+                        _reroll_diag_log(
+                            "target_resolve_failed",
+                            guild_id=getattr(guild, "id", None),
+                            author_id=getattr(author, "id", None),
+                            target_token=first,
+                            interaction_id=_ctx_interaction_id(ctx),
+                        )
+                        variant_matches = _variant_family_candidates_for_token(guild, first)
+                        if len(variant_matches) == 1:
+                            active_variant = variant_matches[0].character_name
+                            await ctx.reply(
+                                f"Cannot reroll to `{first}` right now because variant `{active_variant}` is in use. Try `!reroll {active_variant}`.",
+                                mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        elif len(variant_matches) > 1:
+                            variant_labels = ", ".join(f"`{s.character_name}`" for s in variant_matches[:4])
+                            extra = "" if len(variant_matches) <= 4 else ", ..."
+                            await ctx.reply(
+                                f"`{first}` has multiple active variants right now: {variant_labels}{extra}. Use the exact active character name in your reroll command.",
+                                mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        else:
+                            if not author_can_reroll_elite:
+                                await _reroll_reply(
+                                    "Cannot locate that character or user right now. It may be a typo, or the target may not be currently assigned."
+                                )
+                            else:
+                                await ctx.reply(
+                                    f"Cannot locate `{first}` right now. Check spelling, or confirm the target is currently assigned.",
+                                    mention_author=False,
+                                    allowed_mentions=discord.AllowedMentions.none(),
+                                )
+                        return None
             if state is not None and target_member is None:
                 _, member_lookup = await fetch_member(state.guild_id, state.user_id)
                 target_member = member_lookup
@@ -5390,8 +6283,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 args=args,
             )
             await ctx.reply(
-                "Too many arguments. Provide at most a target and optional forced folder.",
+                "Too many runes in that command. Use only a target plus an optional forced form.",
                 mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return None
 
@@ -5402,9 +6296,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 target_is_admin = is_admin(author) or is_bot_mod(author)
                 state = author_state
                 if state is None:
-                    await ctx.reply("You are not currently transformed.", mention_author=False)
+                    await _reroll_reply("You are not currently transformed.")
                     return None
-            elif not author_is_admin:
+            elif not author_can_reroll_elite:
                 _reroll_diag_log(
                     "missing_target_nonadmin",
                     guild_id=getattr(guild, "id", None),
@@ -5414,6 +6308,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 await ctx.reply(
                     "Specify someone to reroll, e.g. `/reroll who_member:<member>` or mention the user.",
                     mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return None
             else:
@@ -5421,7 +6316,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 target_is_admin = is_admin(author) or is_bot_mod(author)
                 state = author_state
                 if state is None:
-                    await ctx.reply("You are not currently transformed.", mention_author=False)
+                    await _reroll_reply("You are not currently transformed.")
                     return None
 
         if forced_token is None:
@@ -5448,8 +6343,9 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 target_selected=target_selected,
             )
             await ctx.reply(
-                "Unable to locate a transformation to reroll. Make sure the target is currently transformed.",
+                "That target is not currently assigned. They may need a fresh transformation first.",
                 mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return None
         if target_member is None:
@@ -5464,6 +6360,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 await ctx.reply(
                     f"The person who had **{char_name}** left the server. I've freed **{char_name}** – they're available for others to roll or reroll into now. **{char_name}** is not assigned to anyone right now.",
                     mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return None
             target_is_admin = is_admin(target_member) or is_bot_mod(target_member)
@@ -5475,20 +6372,52 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
             return None
 
+        if (
+            target_selected
+            and target_member is not None
+            and target_member.id != author.id
+            and not author_can_reroll_elite
+        ):
+            await _reroll_reply(
+                "Users cannot target reroll. Ask an admin, moderator, Device holder, or eligible special form user."
+            )
+            return None
+
+        if not bulk_mode and device_only_actor:
+            cost = _device_cost_for_command("reroll")
+            battery = _sync_device_battery(guild.id)
+            is_self_or_filter = (target_member.id == author.id) or bool(filter_value)
+            if is_self_or_filter:
+                battery_block = _device_precheck_message(author, author_state, guild.id, "reroll")
+                if battery_block:
+                    await _reroll_reply(battery_block)
+                    return None
+            else:
+                if battery + 1e-9 >= cost:
+                    battery_block = _device_precheck_message(author, author_state, guild.id, "reroll")
+                    if battery_block:
+                        await _reroll_reply(battery_block)
+                        return None
+                    setattr(ctx, "_reroll_device_other_paid_battery", True)
+                else:
+                    setattr(ctx, "_reroll_device_other_paid_battery", False)
+                    if await _reroll_cooldown_gate():
+                        return None
+
         # Admin protection: Non-admins can't reroll admins (if enabled)
         if ADMIN_PROTECTION_ENABLED:
-            if target_is_admin and not author_is_admin:
+            if target_is_admin and not author_staff_mod:
                 await ctx.reply(
                     "Only admins or moderators can reroll other admins.",
                     mention_author=False,
                 )
                 return None
 
-        # Admin protection: Ball/Narrator perks can't be used on admins (if enabled)
+        # Admin protection: Special-form perks can't be used on admins (if enabled)
         if ADMIN_PROTECTION_ENABLED:
             if (
                 author_has_special_power
-                and not author_is_admin
+                and not author_staff_mod
                 and target_is_admin
             ):
                 await ctx.reply(
@@ -5497,7 +6426,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 )
                 return None
 
-        if target_member.id == author.id and not (author_is_admin or author_has_special_power) and not filter_value:
+        if target_member.id == author.id and not author_can_reroll_elite and not filter_value:
             await ctx.reply(
                 "You can't use your own reroll. Ask another player, admin, or moderator.",
                 mention_author=False,
@@ -5523,21 +6452,21 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     can_force_reroll=can_force_reroll,
                 )
                 await ctx.reply(
-                    f"Unknown target `{forced_token}`. Provide a valid first name.",
+                    f"Cannot locate `{forced_token}`. Check spelling and use a valid character name.",
                     mention_author=False,
                 )
                 return None
-            # Toggleable restriction: Only admins or Ball/Narrator characters can force Ball/Narrator (if enabled)
+            # Toggleable restriction: Only admins or special-form users can force special-form rerolls (if enabled)
             if SPECIAL_CHARACTERS_ADMIN_ONLY:
                 if forced_character is not None and _is_special_reroll_name(forced_character.folder or forced_character.name):
-                    if not author_is_admin and not author_has_special_power:
+                    if not author_staff_mod and not author_has_special_power:
                         await ctx.reply(
                             f"Only admins, moderators, or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
                             mention_author=False,
                         )
                         return None
                 if forced_inanimate is not None and _is_special_reroll_name(str(forced_inanimate.get("name", ""))):
-                    if not author_is_admin and not author_has_special_power:
+                    if not author_staff_mod and not author_has_special_power:
                         await ctx.reply(
                             f"Only admins, moderators, or {SPECIAL_FORM_SUBJECT} can force someone into {SPECIAL_FORM_TARGET}.",
                             mention_author=False,
@@ -5546,7 +6475,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             if (
                 forced_character is not None
                 and _is_admin_only_random_name(forced_character.folder or forced_character.name)
-                and not author_is_admin
+                and not author_staff_mod
                 and not target_is_admin
             ):
                 await ctx.reply(
@@ -5554,12 +6483,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     mention_author=False,
                 )
                 return None
-            # Admin protection: Ball/Narrator perks can't force into Ball/Narrator (if enabled)
+            # Admin protection: Special-form perks can't force into protected targets (if enabled)
             if ADMIN_PROTECTION_ENABLED:
                 if (
                     forced_character is not None
                     and author_has_special_power
-                    and not author_is_admin
+                    and not author_staff_mod
                     and _is_special_reroll_name(forced_character.folder or forced_character.name)
                 ):
                     await ctx.reply(
@@ -5570,7 +6499,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 if (
                     forced_inanimate is not None
                     and author_has_special_power
-                    and not author_is_admin
+                    and not author_staff_mod
                     and _is_special_reroll_name(str(forced_inanimate.get("name", "")))
                 ):
                     await ctx.reply(
@@ -5587,6 +6516,10 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 mention_author=False,
             )
             return None
+
+        if not suppress_messages:
+            reroll_speech_gate_key = key
+            _reroll_animation_pending.add(reroll_speech_gate_key)
 
         previous_state = replace(state)
 
@@ -5709,12 +6642,12 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     character
                     for character in available_characters
                     if not _is_admin_only_random_name(character.name)
-                    # Toggleable restriction: Only admins can reroll into Ball/Narrator (if enabled)
+                    # Toggleable restriction: Only admins can reroll into configured special forms (if enabled)
                     and (not SPECIAL_CHARACTERS_ADMIN_ONLY or not _is_special_reroll_name(character.folder or character.name))
                 ]
-            # Admin protection: Ball/Narrator perks can't reroll into Ball/Narrator (if enabled)
+            # Admin protection: Special-form perks can't reroll into protected forms (if enabled)
             if ADMIN_PROTECTION_ENABLED:
-                if author_has_special_power and not author_is_admin:
+                if author_has_special_power and not author_staff_mod:
                     available_characters = [
                         character
                         for character in available_characters
@@ -5739,6 +6672,42 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             new_responses = tuple()
             new_is_inanimate = False
 
+        if forced_mode:
+            current_identity = set(_ident(state.character_name))
+            candidate_identity = set(_ident(new_name))
+            if current_identity and candidate_identity and (current_identity & candidate_identity):
+                _reroll_diag_log(
+                    "self_family_forced_blocked",
+                    guild_id=getattr(guild, "id", None),
+                    author_id=getattr(author, "id", None),
+                    target_member_id=getattr(target_member, "id", None),
+                    interaction_id=_ctx_interaction_id(ctx),
+                    current_name=state.character_name,
+                    candidate_name=new_name,
+                    forced_token=forced_token,
+                )
+                if target_member.id == author.id:
+                    forced_dup_msg = (
+                        "You can't pick your current form as the reroll destination. "
+                        "Choose a different character (`to_character` / token)."
+                    )
+                    await ctx.reply(
+                        forced_dup_msg,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    forced_dup_msg = (
+                        f"<@{target_member.id}> is already that character (`{new_name}`). "
+                        "Pick a different destination form (`to_character` / token)."
+                    )
+                    await ctx.reply(
+                        forced_dup_msg,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions(users=[target_member]),
+                    )
+                return None
+
         if new_name == state.character_name:
             _reroll_diag_log(
                 "already_transformed_emitted",
@@ -5753,10 +6722,26 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 forced_character_name=getattr(forced_character, "name", None),
                 forced_inanimate_name=getattr(forced_inanimate, "name", None) if forced_inanimate else None,
             )
-            await ctx.reply(
-                f"They are already transformed into {new_name}.",
-                mention_author=False,
-            )
+            cur = state.character_name or "that form"
+            if target_member.id == author.id:
+                unchanged_msg = (
+                    f"Reroll didn't change your form — you're still **{cur}**. Try again or specify another form."
+                )
+                await ctx.reply(
+                    unchanged_msg,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                unchanged_msg = (
+                    f"Reroll didn't change <@{target_member.id}>'s form — still **{cur}**. "
+                    "Try again or specify another form."
+                )
+                await ctx.reply(
+                    unchanged_msg,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(users=[target_member]),
+                )
             return None
         if identity_occupancy_conflict(guild.id, exclude_user_id=target_member.id, candidate_name=new_name):
             _reroll_diag_log(
@@ -5783,15 +6768,25 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     persist_states()
                     schedule_history_refresh()
                 else:
+                    blocking_variant = holder_state.character_name or "another form"
+                    if blocking_variant.strip().lower() != new_name.strip().lower():
+                        conflict_text = (
+                            f"Cannot reroll to `{new_name}` because variant `{blocking_variant}` is in use. "
+                            f"Try `!reroll {blocking_variant}`."
+                        )
+                    else:
+                        conflict_text = f"`{new_name}` is already active on another player."
                     await ctx.reply(
-                        f"{new_name} is already in use by another transformation.",
+                        conflict_text,
                         mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return None
             else:
                 await ctx.reply(
-                    f"{new_name} is already in use by another transformation.",
+                    f"`{new_name}` is already active on another player.",
                     mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return None
 
@@ -5821,13 +6816,23 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             _schedule_revert(state, guaranteed_duration.total_seconds())
         )
 
-        persist_states()
+        if not bulk_mode:
+            persist_states()
 
         if not new_is_inanimate:
             increment_tf_stats(guild.id, target_member.id, new_name)
-        if not (author_is_admin or author_has_special_power):
-            record_reroll_timestamp(guild.id, author.id, now)
-        _device_record_success(author, author_state, guild.id, "reroll")
+        if not bulk_mode:
+            paid = getattr(ctx, "_reroll_device_other_paid_battery", None)
+            should_record_ts = (paid is False) or (
+                paid is None
+                and not (author_has_fun_power or roleplay_dm_override or author_has_special_power)
+            )
+            if should_record_ts:
+                record_reroll_timestamp(guild.id, author.id, now)
+        if not bulk_mode:
+            if getattr(ctx, "_reroll_device_other_paid_battery", None) is not False:
+                _device_record_success(author, author_state, guild.id, "reroll")
+        setattr(ctx, "_bulk_reroll_applied", True)
 
         history_details = (
             f"Triggered by: **{author.display_name}**\n"
@@ -5837,10 +6842,17 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         )
         if forced_mode:
             history_details += "\nReason: Forced reroll override."
-        await send_history_message(
-            "TF Rerolled",
-            history_details,
-        )
+        if bulk_mode:
+            history_rows = getattr(ctx, "_bulk_reroll_history_rows", None)
+            if isinstance(history_rows, list):
+                history_rows.append(
+                    f"- **{target_member.display_name}**: `{previous_character}` -> `{new_name}`"
+                )
+        else:
+            _enqueue_history_message(
+                "TF Rerolled",
+                history_details,
+            )
 
         original_name = member_profile_name(target_member)
         if forced_mode:
@@ -5850,7 +6862,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             response_text = _format_character_message(
                 custom_template,
                 original_name,
-                target_member.mention,
+                target_member.display_name,
                 state.duration_label,
                 new_name,
             )
@@ -5858,24 +6870,22 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             base_message = _format_character_message(
                 new_message,
                 original_name,
-                target_member.mention,
+                target_member.display_name,
                 state.duration_label,
                 new_name,
             )
-            if author_is_admin:
+            if author_has_fun_power or roleplay_dm_override:
                 response_text = base_message
             elif author_has_special_power:
                 perk_name = author_special_label or "their perk"
                 response_text = (
-                    f"{author.display_name} channels {perk_name} on {target_member.mention}! {base_message}"
+                    f"{author.display_name} channels {perk_name} on {target_member.display_name}! {base_message}"
                 )
             else:
                 response_text = (
-                    f"{author.display_name} cashes in their reroll on {target_member.mention}! {base_message}"
+                    f"{author.display_name} cashes in their reroll on {target_member.display_name}! {base_message}"
                 )
         # Suppress messages if this is a bulk reroll (from rerollall)
-        suppress_messages = getattr(ctx, "_suppress_reroll_messages", False)
-        
         if not suppress_messages:
             sent_transition = await _send_reroll_transition_panel(
                 ctx,
@@ -5894,7 +6904,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 try:
                     await ctx.channel.send(
                         f"{emoji_prefix} {response_text}",
-                        allowed_mentions=discord.AllowedMentions(users=[target_member]),
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except discord.HTTPException as exc:
                     logger.warning("Failed to announce reroll in channel %s: %s", ctx.channel.id, exc)
@@ -5920,6 +6930,8 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 await GAME_BOARD_MANAGER._save_game_state(game_state)
                 await GAME_BOARD_MANAGER._log_action(game_state, f"{target_member.display_name} character rerolled to {new_name}")
     finally:
+        if reroll_speech_gate_key is not None:
+            _reroll_animation_pending.discard(reroll_speech_gate_key)
         cleanup_placeholder()
 
 
@@ -5994,31 +7006,42 @@ async def slash_rerollall_command(interaction: discord.Interaction) -> None:
     if battery_block:
         await interaction.followup.send(battery_block, ephemeral=True)
         return
+    if not await _try_begin_bulk_family_run(interaction.guild.id, family="reroll"):
+        await interaction.followup.send("A bulk reroll is already running in this server. Please wait.", ephemeral=True)
+        return
     if interaction.guild is None or interaction.channel is None:
+        await _end_bulk_family_run(interaction.guild.id, family="reroll")
         await interaction.followup.send("Use this command in a server channel.", ephemeral=True)
         return
-    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
-        guild=interaction.guild,
-        channel=interaction.channel,
-        prefix_ctx=None,
-        interaction=interaction,
-        filter_non_admin_mod=False,
-    )
-    summary = _format_bulk_reroll_summary(
-        filter_non_admin_mod=False,
-        eligible_count=eligible_count,
-        success_count=success_count,
-        failed_count=failed_count,
-    )
-    ctx = InteractionContextAdapter(interaction, bot=bot)
-    sent_transition = await _send_mass_reroll_transition_panel(
-        ctx,
-        message_text=summary,
-        filename=f"mass_reroll_{interaction.guild.id}.gif",
-    )
-    if not sent_transition:
-        await interaction.followup.send(summary, ephemeral=False)
-    _device_record_success(interaction.user, actor_state, interaction.guild.id, "rerollall")
+    transition_name = f"mass_reroll_{interaction.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("reroll", filename=transition_name)
+    try:
+        eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            prefix_ctx=None,
+            interaction=interaction,
+            filter_non_admin_mod=False,
+        )
+        summary = _format_bulk_reroll_summary(
+            filter_non_admin_mod=False,
+            eligible_count=eligible_count,
+            success_count=success_count,
+            failed_count=failed_count,
+        )
+        ctx = InteractionContextAdapter(interaction, bot=bot)
+        sent_transition = await _send_mass_reroll_transition_panel(
+            ctx,
+            message_text=summary,
+            filename=transition_name,
+            pre_render_task=transition_task,
+        )
+        if not sent_transition:
+            await interaction.followup.send(summary, ephemeral=False)
+        _device_record_success(interaction.user, actor_state, interaction.guild.id, "rerollall")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(interaction.guild.id, family="reroll")
 
 
 @bot.tree.command(name="rerollnonadmin", description="Reroll everyone that's not admin (admin or moderator only).")
@@ -6038,31 +7061,42 @@ async def slash_rerollnonadmin_command(interaction: discord.Interaction) -> None
     if battery_block:
         await interaction.followup.send(battery_block, ephemeral=True)
         return
+    if not await _try_begin_bulk_family_run(interaction.guild.id, family="reroll"):
+        await interaction.followup.send("A bulk reroll is already running in this server. Please wait.", ephemeral=True)
+        return
     if interaction.guild is None or interaction.channel is None:
+        await _end_bulk_family_run(interaction.guild.id, family="reroll")
         await interaction.followup.send("Use this command in a server channel.", ephemeral=True)
         return
-    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
-        guild=interaction.guild,
-        channel=interaction.channel,
-        prefix_ctx=None,
-        interaction=interaction,
-        filter_non_admin_mod=True,
-    )
-    summary = _format_bulk_reroll_summary(
-        filter_non_admin_mod=True,
-        eligible_count=eligible_count,
-        success_count=success_count,
-        failed_count=failed_count,
-    )
-    ctx = InteractionContextAdapter(interaction, bot=bot)
-    sent_transition = await _send_mass_reroll_transition_panel(
-        ctx,
-        message_text=summary,
-        filename=f"mass_reroll_{interaction.guild.id}.gif",
-    )
-    if not sent_transition:
-        await interaction.followup.send(summary, ephemeral=False)
-    _device_record_success(interaction.user, actor_state, interaction.guild.id, "rerollnonadmin")
+    transition_name = f"mass_reroll_{interaction.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("reroll", filename=transition_name)
+    try:
+        eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            prefix_ctx=None,
+            interaction=interaction,
+            filter_non_admin_mod=True,
+        )
+        summary = _format_bulk_reroll_summary(
+            filter_non_admin_mod=True,
+            eligible_count=eligible_count,
+            success_count=success_count,
+            failed_count=failed_count,
+        )
+        ctx = InteractionContextAdapter(interaction, bot=bot)
+        sent_transition = await _send_mass_reroll_transition_panel(
+            ctx,
+            message_text=summary,
+            filename=transition_name,
+            pre_render_task=transition_task,
+        )
+        if not sent_transition:
+            await interaction.followup.send(summary, ephemeral=False)
+        _device_record_success(interaction.user, actor_state, interaction.guild.id, "rerollnonadmin")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(interaction.guild.id, family="reroll")
 
 
 @bot.tree.command(name="timeout", description="Time out a user from VN bot usage (admin/mod only).")
@@ -6492,8 +7526,16 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
     await _delete_vn_message_with_retry(ctx.message, context="background")
     selection_scope = _selection_scope_for_channel(getattr(ctx, "channel", None))
 
-    async def send_channel_feedback(content: str, **kwargs) -> None:
+    async def send_channel_feedback(
+        content: str,
+        *,
+        metrics_label: Optional[str] = None,
+        render_ms: Optional[float] = None,
+        started_at: Optional[float] = None,
+        **kwargs,
+    ) -> None:
         kwargs.setdefault("mention_author", False)
+        kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
         reference = None
         try:
             reference = ctx.message.to_reference(fail_if_not_exists=False)
@@ -6501,7 +7543,15 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
             reference = None
         if reference is not None:
             kwargs.setdefault("reference", reference)
-        await ctx.send(content, **kwargs)
+        _, upload_ms = await _timed_send_ms("background_feedback_send", ctx.send(content, **kwargs))
+        if metrics_label and render_ms is not None and started_at is not None:
+            _log_transition_send_metrics(
+                label=metrics_label,
+                render_ms=render_ms,
+                upload_ms=upload_ms,
+                total_ms=(time.perf_counter() - started_at) * 1000.0,
+                payload_bytes=_discord_file_size_bytes(kwargs.get("file")),
+            )
 
     await ensure_state_restored()
 
@@ -6665,15 +7715,22 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
                 message_text = f"<@{ctx.author.id}> moved {narrator_label} to `{display}`."
                 transition_file = None
                 if narrator_state is not None and not narrator_state.is_inanimate:
-                    transition_file = _render_background_transition_file(
+                    transition_started = time.perf_counter()
+                    transition_file = await _render_background_transition_file_cached(
                         state=narrator_state,
                         old_background_path=old_background_path,
                         new_background_path=selected_path,
-                        filename=f"bg_{dm_user_id}.gif",
+                        filename=f"bg_{dm_user_id}.webp",
                         selection_scope=selection_scope,
                     )
                 if transition_file is not None:
-                    await send_channel_feedback(message_text, file=transition_file)
+                    await send_channel_feedback(
+                        message_text,
+                        file=transition_file,
+                        metrics_label="background_transition_send",
+                        render_ms=(time.perf_counter() - transition_started) * 1000.0,
+                        started_at=transition_started,
+                    )
                 else:
                     await send_channel_feedback(message_text)
                 return
@@ -6691,15 +7748,22 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
         schedule_history_refresh()
         target_label = _background_target_label(ctx.guild, target_state)
         message_text = f"<@{ctx.author.id}> moved {target_label} to `{display}`."
-        transition_file = _render_background_transition_file(
+        transition_started = time.perf_counter()
+        transition_file = await _render_background_transition_file_cached(
             state=target_state,
             old_background_path=old_background_path,
             new_background_path=selected_path,
-            filename=f"bg_{target_state.user_id}.gif",
+            filename=f"bg_{target_state.user_id}.webp",
             selection_scope=selection_scope,
         )
         if transition_file is not None:
-            await send_channel_feedback(message_text, file=transition_file)
+            await send_channel_feedback(
+                message_text,
+                file=transition_file,
+                metrics_label="background_transition_send",
+                render_ms=(time.perf_counter() - transition_started) * 1000.0,
+                started_at=transition_started,
+            )
         else:
             await send_channel_feedback(message_text)
         return
@@ -6728,7 +7792,8 @@ async def slash_bg_command(
     interaction: discord.Interaction,
     selection: Optional[str] = None,
 ) -> None:
-    await interaction.response.defer(thinking=True)
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
     ctx = InteractionContextAdapter(interaction, bot=bot)
     await background_command(ctx, selection=selection or "")
     if not ctx.responded:
@@ -6810,6 +7875,8 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
             await ctx.send(message)
         return
 
+    state_selection_scope = _selection_scope_for_state(selection_scope, state)
+
     pose_outfits = list_pose_outfits(state.character_name)
     if not pose_outfits:
         message = f"No outfits are available for {state.character_name}."
@@ -6860,13 +7927,17 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
     else:
         normalized_pose = None
 
-    before_avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
+    before_avatar_image = compose_state_avatar_image(state, selection_scope=state_selection_scope)
+    prior_pose, prior_outfit = get_selected_pose_outfit(
+        state.character_name,
+        scope=state_selection_scope,
+    )
 
     if not set_selected_pose_outfit(
         state.character_name,
         parsed_pose if normalized_pose else None,
         parsed_outfit,
-        scope=selection_scope,
+        scope=state_selection_scope,
     ):
         pose_lines = []
         for pose, options in pose_outfits.items():
@@ -6883,29 +7954,50 @@ async def outfit_command(ctx: commands.Context, *, outfit_name: str = ""):
 
     selected_pose, selected_outfit = get_selected_pose_outfit(
         state.character_name,
-        scope=selection_scope,
+        scope=state_selection_scope,
     )
-    pose_label = selected_pose or "auto"
+    if (
+        (prior_pose or "").strip().lower() == (selected_pose or "").strip().lower()
+        and (prior_outfit or "").strip().lower() == (selected_outfit or "").strip().lower()
+    ):
+        if ctx.guild:
+            await ctx.reply("No visual change detected. That outfit is already active.", mention_author=False)
+        else:
+            await ctx.send("No visual change detected. That outfit is already active.")
+        return
     outfit_label = selected_outfit or parsed_outfit
     if target_state is not None and ctx.guild and actor_member is not None:
         confirmation = (
-            f"<@{ctx.author.id}> changed {_background_target_label(ctx.guild, target_state)}'s outfit "
+            f"{ctx.author.display_name} changed {_background_target_label(ctx.guild, target_state)}'s outfit "
             f"to `{outfit_label}`."
         )
     else:
         confirmation = (
-            f"<@{ctx.author.id}> changed their outfit to `{outfit_label}`."
+            f"{ctx.author.display_name} changed their outfit to `{outfit_label}`."
         )
     schedule_history_refresh()
     if ctx.guild:
-        transition_file = _render_appearance_transition_file(
+        transition_started = time.perf_counter()
+        transition_file = await run_panel_render_gif(
+            _render_appearance_transition_file,
             state=state,
             before_avatar_image=before_avatar_image,
-            filename=f"outfit_{state.user_id}.gif",
-            selection_scope=selection_scope,
+            filename=f"outfit_{state.user_id}.webp",
+            selection_scope=state_selection_scope,
         )
         if transition_file is not None:
-            await ctx.reply(confirmation, mention_author=False, file=transition_file)
+            render_ms = (time.perf_counter() - transition_started) * 1000.0
+            _, upload_ms = await _timed_send_ms(
+                "outfit_transition_send",
+                ctx.reply(confirmation, mention_author=False, file=transition_file),
+            )
+            _log_transition_send_metrics(
+                label="outfit_transition_send",
+                render_ms=render_ms,
+                upload_ms=upload_ms,
+                total_ms=(time.perf_counter() - transition_started) * 1000.0,
+                payload_bytes=_discord_file_size_bytes(transition_file),
+            )
         else:
             await ctx.reply(confirmation, mention_author=False)
     else:
@@ -7005,8 +8097,9 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
             await ctx.send(message)
         return
 
-    accessory_states = get_accessory_states(state.character_name, scope=selection_scope)
-    before_avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
+    state_selection_scope = _selection_scope_for_state(selection_scope, state)
+    accessory_states = get_accessory_states(state.character_name, scope=state_selection_scope)
+    before_avatar_image = compose_state_avatar_image(state, selection_scope=state_selection_scope)
 
     # Handle "clearall" command - completely erase accessory data, not just set to "off"
     normalized_accessory_name = (accessory_name or "").strip().lower()
@@ -7035,7 +8128,7 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
         # Clear from default scope
         default_store_key = base_key
         # Clear from current scope if different
-        current_store_key = _selection_store_key(directory, selection_scope)
+        current_store_key = _selection_store_key(directory, state_selection_scope)
         # Also check for RP scope if it exists
         rp_store_key = f"rp:{base_key}"
         
@@ -7100,14 +8193,27 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
         )
         if ctx.guild:
             if _should_render_targeted_appearance_transition(actor_member, target_state):
-                transition_file = _render_appearance_transition_file(
+                transition_started = time.perf_counter()
+                transition_file = await run_panel_render_gif(
+                    _render_appearance_transition_file,
                     state=state,
                     before_avatar_image=before_avatar_image,
-                    filename=f"accessories_{state.user_id}.gif",
-                    selection_scope=selection_scope,
+                    filename=f"accessories_{state.user_id}.webp",
+                    selection_scope=state_selection_scope,
                 )
                 if transition_file is not None:
-                    await ctx.reply(confirmation, mention_author=False, file=transition_file)
+                    render_ms = (time.perf_counter() - transition_started) * 1000.0
+                    _, upload_ms = await _timed_send_ms(
+                        "accessories_clear_transition_send",
+                        ctx.reply(confirmation, mention_author=False, file=transition_file),
+                    )
+                    _log_transition_send_metrics(
+                        label="accessories_clear_transition_send",
+                        render_ms=render_ms,
+                        upload_ms=upload_ms,
+                        total_ms=(time.perf_counter() - transition_started) * 1000.0,
+                        payload_bytes=_discord_file_size_bytes(transition_file),
+                    )
                 else:
                     await ctx.reply(confirmation, mention_author=False)
             else:
@@ -7123,7 +8229,7 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
             display = label or key
             lines.append(f"- {display}: {status}")
         message = (
-            f"Accessories for {state.character_name} (scope `{selection_scope or 'default'}`):\n"
+            f"Accessories for {state.character_name} (scope `{state_selection_scope or 'default'}`):\n"
             + "\n".join(lines)
         )
         if ctx.guild:
@@ -7148,7 +8254,7 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
     new_state = toggle_accessory_state(
         state.character_name,
         resolved_key,
-        scope=selection_scope,
+        scope=state_selection_scope,
     )
     if new_state is None:
         message = "Unable to update that accessory. Please try again."
@@ -7165,15 +8271,32 @@ async def accessories_command(ctx: commands.Context, *, accessory_name: str = ""
         "Future VN panels will use this state."
     )
     if ctx.guild:
+        after_avatar_image = compose_state_avatar_image(state, selection_scope=state_selection_scope)
+        if list(before_avatar_image.getdata()) == list(after_avatar_image.getdata()):
+            await ctx.reply("No visual change detected. That accessory toggle does not alter the current sprite.", mention_author=False)
+            return
         if _should_render_targeted_appearance_transition(actor_member, target_state):
-            transition_file = _render_appearance_transition_file(
+            transition_started = time.perf_counter()
+            transition_file = await run_panel_render_gif(
+                _render_appearance_transition_file,
                 state=state,
                 before_avatar_image=before_avatar_image,
-                filename=f"accessories_{state.user_id}.gif",
-                selection_scope=selection_scope,
+                filename=f"accessories_{state.user_id}.webp",
+                selection_scope=state_selection_scope,
             )
             if transition_file is not None:
-                await ctx.reply(confirmation, mention_author=False, file=transition_file)
+                render_ms = (time.perf_counter() - transition_started) * 1000.0
+                _, upload_ms = await _timed_send_ms(
+                    "accessories_toggle_transition_send",
+                    ctx.reply(confirmation, mention_author=False, file=transition_file),
+                )
+                _log_transition_send_metrics(
+                    label="accessories_toggle_transition_send",
+                    render_ms=render_ms,
+                    upload_ms=upload_ms,
+                    total_ms=(time.perf_counter() - transition_started) * 1000.0,
+                    payload_bytes=_discord_file_size_bytes(transition_file),
+                )
             else:
                 await ctx.reply(confirmation, mention_author=False)
         else:
@@ -7227,13 +8350,23 @@ async def _handle_slash_say(
 
     guild_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
     selection_scope = _selection_scope_for_channel(guild_channel)
+    actor_state = find_active_transformation(actor.id, guild.id)
 
     if enforce_permissions:
-        can_use_command = (is_admin(actor) or is_bot_mod(actor)) or _actor_has_narrator_power(actor)
+        can_use_command = (
+            is_admin(actor)
+            or is_bot_mod(actor)
+            or _actor_has_narrator_power(actor)
+            or has_device_privilege(actor, guild.id)
+        )
         if not can_use_command and ROLEPLAY_COG is not None and guild_channel and ROLEPLAY_COG.is_roleplay_post(guild_channel):
             can_use_command = ROLEPLAY_COG.has_control(actor)
         if not can_use_command:
             await interaction.response.send_message(_privileged_requirement_message("use this command"), ephemeral=True)
+            return
+        battery_block = _device_precheck_message(actor, actor_state, guild.id, "say")
+        if battery_block:
+            await interaction.response.send_message(battery_block, ephemeral=True)
             return
 
     directory_lookup = {name.lower(): name for name in _list_character_directory_names()}
@@ -7322,9 +8455,11 @@ async def _handle_slash_say(
     files: list[discord.File] = []
     payload: dict = {}
     character_display_name = _resolve_character_display_name(guild, actor.id, target_state)
+    state_selection_scope = _selection_scope_for_state(selection_scope, target_state)
 
     if MESSAGE_STYLE == "vn" and not target_state.is_inanimate:
-        vn_file = render_vn_panel(
+        vn_file = await run_panel_render_vn(
+            render_vn_panel,
             state=target_state,
             message_content=cleaned_content,
             character_display_name=character_display_name,
@@ -7333,14 +8468,16 @@ async def _handle_slash_say(
             formatted_segments=formatted_segments,
             custom_emoji_images=custom_emoji_images,
             reply_context=reply_context,
-            selection_scope=selection_scope,
+            selection_scope=state_selection_scope,
         )
         if vn_file:
             files.append(vn_file)
 
     description = cleaned_content if cleaned_content else "*no message content*"
     if not files:
-        embed, avatar_file = await build_legacy_embed(target_state, description)
+        embed, avatar_file = await build_legacy_embed(
+            target_state, description, selection_scope=state_selection_scope
+        )
         if avatar_file:
             files.append(avatar_file)
         payload["embed"] = embed
@@ -7360,6 +8497,8 @@ async def _handle_slash_say(
 
     if sent_message and cleaned_content:
         _register_relay_message(sent_message.id, target_state.character_name, cleaned_content)
+    if enforce_permissions:
+        _device_record_success(actor, actor_state, guild.id, "say")
 
 
 @bot.tree.command(name="say", description="Have a character deliver a line in the TF channel.")
@@ -7396,8 +8535,8 @@ async def slash_narrator_shortcut(
     await _handle_slash_say(interaction, "narrator", text, enforce_permissions=False)
 
 
-@bot.tree.command(name="b", description=f"RP {TFBOT_NAME}'s Ball shortcut (RP forum DM/owner only).")
-@app_commands.describe(text=f"What {TFBOT_NAME}'s Ball should say.")
+@bot.tree.command(name="b", description=f"Legacy RP shortcut for {TFBOT_NAME} special voice (RP forum DM/owner only).")
+@app_commands.describe(text=f"What {TFBOT_NAME}'s special voice should say.")
 @app_commands.guild_only()
 @guard_slash_command_channel
 async def slash_ball_shortcut(
@@ -7581,12 +8720,12 @@ async def on_message(message: discord.Message):
     )
 
     ctx = await bot.get_context(message)
-    submit_channel_id = SUBMISSION_CHANNEL_ID if SUBMISSION_CHANNEL_ID > 0 else None
+    ch_id = getattr(message.channel, "id", None)
     command_allowed_extra = bool(
-        submit_channel_id
+        SUBMISSION_CHANNEL_IDS
         and ctx.command
         and ctx.command.qualified_name in SUBMISSION_COMMANDS
-        and getattr(message.channel, "id", None) == submit_channel_id
+        and ch_id in SUBMISSION_CHANNEL_IDS
     )
 
     if ctx.command:
@@ -7807,6 +8946,12 @@ async def on_message(message: discord.Message):
         key = state_key(message.guild.id, message.author.id)
         state = active_transformations.get(key)
         if state:
+            if key in _reroll_animation_pending:
+                await _delete_vn_message_with_retry(
+                    message,
+                    context="reroll animation pending relay gate",
+                )
+                return None
             reply_reference: Optional[discord.MessageReference] = (
                 message.to_reference(fail_if_not_exists=False) if message.reference else None
             )
@@ -7856,6 +9001,38 @@ async def on_message(message: discord.Message):
 # ============================================================================
 
 # Helper functions for 3.5 token-based matching system
+def _split_command_tokens(raw: str) -> list[str]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        return [token for token in shlex.split(text) if token.strip()]
+    except ValueError:
+        return [token for token in text.split() if token.strip()]
+
+
+async def _reply_if_excess_prefix_tail_tokens(
+    ctx: commands.Context,
+    tail: str,
+    max_tokens: int,
+    *,
+    usage: str,
+) -> bool:
+    """Reply and return True if tail has more than max_tokens (shlex-aligned). Caller should return."""
+    if max_tokens < 0:
+        return False
+    from tfbot.prefix_tail import count_prefix_tail_tokens
+
+    if count_prefix_tail_tokens(tail) <= max_tokens:
+        return False
+    await ctx.reply(
+        f"Too many arguments. {usage}",
+        mention_author=False,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    return True
+
+
 def _token_variants(token: str) -> set[str]:
     normalized_token = (token or "").strip().lower()
     if not normalized_token:
@@ -7875,6 +9052,11 @@ def _token_variants(token: str) -> set[str]:
         _add(normalized_token.replace("-", " "))
         _add(normalized_token.replace("-", ""))
         _add(normalized_token.split("-", 1)[0])
+    alnum_only = re.sub(r"[^a-z0-9 ]+", "", normalized_token).strip()
+    if alnum_only and alnum_only != normalized_token:
+        _add(alnum_only)
+        _add(alnum_only.replace(" ", ""))
+        _add(alnum_only.split(" ", 1)[0])
     return variants
 
 
@@ -7913,6 +9095,74 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
     return False
 
 
+def _variant_family_candidates_for_token(guild: discord.Guild, token: str) -> List[TransformationState]:
+    """Find active states that look like variant forms of a base token."""
+    base_variants = {v for v in _token_variants(token) if len(v) >= 4}
+    if not base_variants:
+        return []
+    matches: List[TransformationState] = []
+    seen_users: set[int] = set()
+    for state in active_transformations.values():
+        if state.guild_id != guild.id:
+            continue
+        state_tokens = {(state.character_name or "").strip().lower()}
+        folder_token = _state_folder_token(state)
+        if folder_token:
+            state_tokens.add(folder_token.lower())
+        candidate_hit = False
+        for candidate in state_tokens:
+            if not candidate:
+                continue
+            for base in base_variants:
+                if candidate == base or not candidate.startswith(base):
+                    continue
+                suffix = candidate[len(base):]
+                if suffix and re.fullmatch(r"[a-z0-9_\\-]+", suffix):
+                    candidate_hit = True
+                    break
+            if candidate_hit:
+                break
+        if candidate_hit and state.user_id not in seen_users:
+            seen_users.add(state.user_id)
+            matches.append(state)
+    matches.sort(key=lambda s: ((s.character_name or "").lower(), int(s.user_id)))
+    return matches
+
+
+def _find_clone_source_state_by_token(
+    guild: discord.Guild,
+    normalized: str,
+    token_variants: set[str],
+) -> Optional[TransformationState]:
+    """Match token to frozen clone-source snapshot labels; return that source user's state if unambiguous."""
+    if not token_variants:
+        return None
+    matched_source_ids: set[int] = set()
+    for (g_id, _target_uid), record in overlay_records.items():
+        if g_id != guild.id:
+            continue
+        if str(record.get("overlay_type") or "").strip().lower() != "clone":
+            continue
+        sid = record.get("source_user_id")
+        if not isinstance(sid, int):
+            continue
+        label = clone_copied_source_display_name(record)
+        if not (label or "").strip():
+            continue
+        visible_normalized = label.strip().lower()
+        visible_first = visible_normalized.split(" ", 1)[0]
+        if (
+            _name_matches_token(label, normalized)
+            or visible_normalized in token_variants
+            or visible_first in token_variants
+        ):
+            matched_source_ids.add(sid)
+    if len(matched_source_ids) != 1:
+        return None
+    uid = next(iter(matched_source_ids))
+    return find_active_transformation(uid, guild.id)
+
+
 def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[TransformationState]:
     """Resolve command targets consistently: mention/user first, then visible identity, then person, then body."""
     normalized = (token or "").strip()
@@ -7924,6 +9174,10 @@ def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[Transform
         if state:
             return state
     token_variants = _token_variants(normalized)
+
+    clone_source_state = _find_clone_source_state_by_token(guild, normalized, token_variants)
+    if clone_source_state is not None:
+        return clone_source_state
 
     # Visible VN identity first. This is what users intuitively mean when they
     # target a swapped name like "riley".
@@ -7985,6 +9239,9 @@ def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[Transform
         character_entry = CHARACTER_BY_NAME.get(state.character_name.strip().lower())
         if character_entry and _character_matches_token(character_entry, normalized):
             return state
+    variant_family_matches = _variant_family_candidates_for_token(guild, normalized)
+    if len(variant_family_matches) == 1:
+        return variant_family_matches[0]
     return None
 
 
@@ -8209,7 +9466,7 @@ async def _handle_pillow_command(ctx: commands.Context, target: str) -> None:
 
     author_state = find_active_transformation(author.id, guild.id)
     author_is_admin = is_admin(author) or is_bot_mod(author)
-    author_has_special = _has_special_reroll_access(author_state) or _state_has_privileged_access(author_state)
+    author_has_special = _state_has_effective_special_access(author, author_state, guild.id)
     if not (author_is_admin or author_has_special):
         logger.info(
             "Undopillow blocked: insufficient privileges user=%s admin=%s special=%s",
@@ -8317,7 +9574,7 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
 
     author_state = find_active_transformation(author.id, guild.id)
     author_is_admin = is_admin(author) or is_bot_mod(author)
-    author_has_special = _has_special_reroll_access(author_state) or _state_has_privileged_access(author_state)
+    author_has_special = _state_has_effective_special_access(author, author_state, guild.id)
     if not (author_is_admin or author_has_special):
         await ctx.reply(
             "Only admins, moderators, or privileged forms can use this command.",
@@ -8416,6 +9673,13 @@ async def _handle_undopillow_command(ctx: commands.Context, target: str) -> None
 @commands.guild_only()
 @guard_prefix_command_channel
 async def pillow_command(ctx: commands.Context, *, target: str = ""):
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        target,
+        1,
+        usage="Use `!pillow` with no arguments (self) or one target only (quote multi-word names).",
+    ):
+        return
     await _handle_pillow_command(ctx, target)
 
 
@@ -8445,6 +9709,13 @@ async def slash_pillow_command(
 @commands.guild_only()
 @guard_prefix_command_channel
 async def undopillow_command(ctx: commands.Context, *, target: str = ""):
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        target,
+        1,
+        usage="Use `!undopillow` with no arguments (self) or one target only (quote multi-word names).",
+    ):
+        return
     await _handle_undopillow_command(ctx, target)
 
 
@@ -8639,30 +9910,41 @@ async def prefix_rerollall_command(ctx: commands.Context) -> None:
     if battery_block:
         await ctx.reply(battery_block, mention_author=False)
         return
+    if not await _try_begin_bulk_family_run(ctx.guild.id, family="reroll"):
+        await ctx.reply("A bulk reroll is already running in this server. Please wait.", mention_author=False)
+        return
     if ctx.channel is None:
+        await _end_bulk_family_run(ctx.guild.id, family="reroll")
         await ctx.reply("Use this command in a server channel.", mention_author=False)
         return
-    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
-        guild=ctx.guild,
-        channel=ctx.channel,
-        prefix_ctx=ctx,
-        interaction=None,
-        filter_non_admin_mod=False,
-    )
-    summary = _format_bulk_reroll_summary(
-        filter_non_admin_mod=False,
-        eligible_count=eligible_count,
-        success_count=success_count,
-        failed_count=failed_count,
-    )
-    sent_transition = await _send_mass_reroll_transition_panel(
-        ctx,
-        message_text=summary,
-        filename=f"mass_reroll_{ctx.guild.id}.gif",
-    )
-    if not sent_transition:
-        await ctx.reply(summary, mention_author=False)
-    _device_record_success(ctx.author, author_state, ctx.guild.id, "rerollall")
+    transition_name = f"mass_reroll_{ctx.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("reroll", filename=transition_name)
+    try:
+        eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+            guild=ctx.guild,
+            channel=ctx.channel,
+            prefix_ctx=ctx,
+            interaction=None,
+            filter_non_admin_mod=False,
+        )
+        summary = _format_bulk_reroll_summary(
+            filter_non_admin_mod=False,
+            eligible_count=eligible_count,
+            success_count=success_count,
+            failed_count=failed_count,
+        )
+        sent_transition = await _send_mass_reroll_transition_panel(
+            ctx,
+            message_text=summary,
+            filename=transition_name,
+            pre_render_task=transition_task,
+        )
+        if not sent_transition:
+            await ctx.reply(summary, mention_author=False)
+        _device_record_success(ctx.author, author_state, ctx.guild.id, "rerollall")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(ctx.guild.id, family="reroll")
 
 
 @bot.command(name="rerollnonadmin")
@@ -8681,30 +9963,41 @@ async def prefix_rerollnonadmin_command(ctx: commands.Context) -> None:
     if battery_block:
         await ctx.reply(battery_block, mention_author=False)
         return
+    if not await _try_begin_bulk_family_run(ctx.guild.id, family="reroll"):
+        await ctx.reply("A bulk reroll is already running in this server. Please wait.", mention_author=False)
+        return
     if ctx.channel is None:
+        await _end_bulk_family_run(ctx.guild.id, family="reroll")
         await ctx.reply("Use this command in a server channel.", mention_author=False)
         return
-    eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
-        guild=ctx.guild,
-        channel=ctx.channel,
-        prefix_ctx=ctx,
-        interaction=None,
-        filter_non_admin_mod=True,
-    )
-    summary = _format_bulk_reroll_summary(
-        filter_non_admin_mod=True,
-        eligible_count=eligible_count,
-        success_count=success_count,
-        failed_count=failed_count,
-    )
-    sent_transition = await _send_mass_reroll_transition_panel(
-        ctx,
-        message_text=summary,
-        filename=f"mass_reroll_{ctx.guild.id}.gif",
-    )
-    if not sent_transition:
-        await ctx.reply(summary, mention_author=False)
-    _device_record_success(ctx.author, author_state, ctx.guild.id, "rerollnonadmin")
+    transition_name = f"mass_reroll_{ctx.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("reroll", filename=transition_name)
+    try:
+        eligible_count, success_count, failed_count = await _execute_bulk_reroll_for_channel(
+            guild=ctx.guild,
+            channel=ctx.channel,
+            prefix_ctx=ctx,
+            interaction=None,
+            filter_non_admin_mod=True,
+        )
+        summary = _format_bulk_reroll_summary(
+            filter_non_admin_mod=True,
+            eligible_count=eligible_count,
+            success_count=success_count,
+            failed_count=failed_count,
+        )
+        sent_transition = await _send_mass_reroll_transition_panel(
+            ctx,
+            message_text=summary,
+            filename=transition_name,
+            pre_render_task=transition_task,
+        )
+        if not sent_transition:
+            await ctx.reply(summary, mention_author=False)
+        _device_record_success(ctx.author, author_state, ctx.guild.id, "rerollnonadmin")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(ctx.guild.id, family="reroll")
 
 
 # Game Board Commands
@@ -9002,7 +10295,7 @@ async def _do_genderswap_vn(ctx: Union[commands.Context, Any], guild: discord.Gu
     state.inanimate_responses = tuple()
     persist_states()
     schedule_history_refresh()
-    message_text = f"**{old_name}** has swapped gender; they have become **{target_char.name}**."
+    message_text = f"{old_name} swapped gender and became {target_char.name}."
     sent_transition = await _send_single_body_change_transition_panel(
         ctx,
         previous_state=previous_state,
@@ -9115,7 +10408,7 @@ async def _do_ageswap_vn(ctx: Union[commands.Context, Any], guild: discord.Guild
     state.inanimate_responses = tuple()
     persist_states()
     schedule_history_refresh()
-    message_text = f"**{old_name}** has swapped age; they have become **{target_char.name}**."
+    message_text = f"{old_name} swapped age and became {target_char.name}."
     sent_transition = await _send_single_body_change_transition_panel(
         ctx,
         previous_state=previous_state,
@@ -9152,8 +10445,11 @@ async def prefix_genderswap_command(ctx: commands.Context, *, args: str = "") ->
         return
     target_member = target_resolved if target_resolved is not None else author
     author_state = find_active_transformation(author.id, guild.id)
-    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
-        await ctx.reply("Only admins or moderators can genderswap someone else.", mention_author=False)
+    if not has_fun_privilege(author, author_state, guild.id):
+        await ctx.reply(
+            "You need admin, moderator, Device holder, or eligible special form access to use this command.",
+            mention_author=False,
+        )
         return
     battery_block = _device_precheck_message(author, author_state, guild.id, "genderswap")
     if battery_block:
@@ -9183,8 +10479,11 @@ async def prefix_ageswap_command(ctx: commands.Context, *, args: str = "") -> No
         return
     target_member = target_resolved if target_resolved is not None else author
     author_state = find_active_transformation(author.id, guild.id)
-    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
-        await ctx.reply("Only admins or moderators can ageswap someone else.", mention_author=False)
+    if not has_fun_privilege(author, author_state, guild.id):
+        await ctx.reply(
+            "You need admin, moderator, Device holder, or eligible special form access to use this command.",
+            mention_author=False,
+        )
         return
     battery_block = _device_precheck_message(author, author_state, guild.id, "ageswap")
     if battery_block:
@@ -9252,6 +10551,7 @@ def _register_overlay_record(
     group_id: str,
     source_user_id: Optional[int],
     base_visual: Mapping[str, object],
+    cloned_visual_snapshot: Optional[Mapping[str, object]] = None,
     expires_at: Optional[datetime],
 ) -> None:
     overlay_records[key] = {
@@ -9259,6 +10559,7 @@ def _register_overlay_record(
         "group_id": group_id,
         "source_user_id": source_user_id,
         "base_visual": dict(base_visual),
+        "cloned_visual_snapshot": dict(cloned_visual_snapshot) if cloned_visual_snapshot else None,
         "expires_at": expires_at.isoformat() if expires_at else None,
     }
     overlay_group_members.setdefault(group_id, set()).add(key)
@@ -9296,7 +10597,6 @@ async def _apply_swapall_group(
         visible_identity_by_key[key] = state.identity_display_name or state.character_name
 
     participants_applied = 0
-    participant_count = len(eligible)
     for idx, (recipient_key, recipient_state) in enumerate(eligible):
         donor_key, _ = eligible[idx - 1]
         donor_base = base_visual_by_key[donor_key]
@@ -9345,32 +10645,39 @@ async def prefix_swapall_command(ctx: commands.Context, minutes: Optional[str] =
     if not has_fun_privilege(ctx.author, author_state, ctx.guild.id):
         await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
         return
-    battery_block = _device_precheck_message(ctx.author, author_state, ctx.guild.id, "swap")
-    if battery_block:
-        await ctx.reply(battery_block, mention_author=False)
-        return
     battery_block = _device_precheck_message(ctx.author, author_state, ctx.guild.id, "swapall")
     if battery_block:
         await ctx.reply(battery_block, mention_author=False)
         return
-    parsed_minutes = _parse_optional_minutes(minutes or "")
-    keys = _eligible_mass_swap_keys(ctx.guild, include_admin_mod=True)
-    if len(keys) < 2:
-        await ctx.reply("Need at least two active transformed users to run swapall.", mention_author=False)
+    if not await _try_begin_bulk_family_run(ctx.guild.id, family="swap"):
+        await ctx.reply("A bulk swap is already running in this server. Please wait.", mention_author=False)
         return
-    participants, skipped = await _apply_swapall_group(ctx.guild, keys, minutes=parsed_minutes or SWAPALL_DEFAULT_MINUTES)
-    message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
-    sent_transition = await _send_mass_swap_transition_panel(
-        ctx,
-        message_text=message_text,
-        filename=f"mass_swap_{ctx.guild.id}.gif",
-    )
-    if not sent_transition:
-        await ctx.reply(
-            f"{ctx.author.display_name} scrambles the room with a mass body-swap! Rotated {participants} participant(s), conflicts {skipped}.",
-            mention_author=False,
+    parsed_minutes = _parse_optional_minutes(minutes or "")
+    transition_name = f"mass_swap_{ctx.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("swap", filename=transition_name)
+    try:
+        keys = _eligible_mass_swap_keys(ctx.guild, include_admin_mod=True)
+        if len(keys) < 2:
+            _cancel_prefetch_task(transition_task)
+            await ctx.reply("Need at least two active transformed users to run swapall.", mention_author=False)
+            return
+        participants, skipped = await _apply_swapall_group(ctx.guild, keys, minutes=parsed_minutes or SWAPALL_DEFAULT_MINUTES)
+        message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
+        sent_transition = await _send_mass_swap_transition_panel(
+            ctx,
+            message_text=message_text,
+            filename=transition_name,
+            pre_render_task=transition_task,
         )
-    _device_record_success(ctx.author, author_state, ctx.guild.id, "swapall")
+        if not sent_transition:
+            await ctx.reply(
+                f"{ctx.author.display_name} scrambles the room with a mass body-swap! Rotated {participants} participant(s), conflicts {skipped}.",
+                mention_author=False,
+            )
+        _device_record_success(ctx.author, author_state, ctx.guild.id, "swapall")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(ctx.guild.id, family="swap")
 
 
 @bot.command(name="swapallnonadmin")
@@ -9389,24 +10696,35 @@ async def prefix_swapallnonadmin_command(ctx: commands.Context, minutes: Optiona
     if battery_block:
         await ctx.reply(battery_block, mention_author=False)
         return
-    parsed_minutes = _parse_optional_minutes(minutes or "")
-    keys = _eligible_mass_swap_keys(ctx.guild, include_admin_mod=False)
-    if len(keys) < 2:
-        await ctx.reply("Need at least two active non-admin transformed users to run swapall.", mention_author=False)
+    if not await _try_begin_bulk_family_run(ctx.guild.id, family="swap"):
+        await ctx.reply("A bulk swap is already running in this server. Please wait.", mention_author=False)
         return
-    participants, skipped = await _apply_swapall_group(ctx.guild, keys, minutes=parsed_minutes or SWAPALL_DEFAULT_MINUTES)
-    message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
-    sent_transition = await _send_mass_swap_transition_panel(
-        ctx,
-        message_text=message_text,
-        filename=f"mass_swap_{ctx.guild.id}.gif",
-    )
-    if not sent_transition:
-        await ctx.reply(
-            f"{ctx.author.display_name} triggers a non-admin mass swap! Rotated {participants} participant(s), conflicts {skipped}.",
-            mention_author=False,
+    parsed_minutes = _parse_optional_minutes(minutes or "")
+    transition_name = f"mass_swap_{ctx.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("swap", filename=transition_name)
+    try:
+        keys = _eligible_mass_swap_keys(ctx.guild, include_admin_mod=False)
+        if len(keys) < 2:
+            _cancel_prefetch_task(transition_task)
+            await ctx.reply("Need at least two active non-admin transformed users to run swapall.", mention_author=False)
+            return
+        participants, skipped = await _apply_swapall_group(ctx.guild, keys, minutes=parsed_minutes or SWAPALL_DEFAULT_MINUTES)
+        message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
+        sent_transition = await _send_mass_swap_transition_panel(
+            ctx,
+            message_text=message_text,
+            filename=transition_name,
+            pre_render_task=transition_task,
         )
-    _device_record_success(ctx.author, author_state, ctx.guild.id, "swapallnonadmin")
+        if not sent_transition:
+            await ctx.reply(
+                f"{ctx.author.display_name} triggers a non-admin mass swap! Rotated {participants} participant(s), conflicts {skipped}.",
+                mention_author=False,
+            )
+        _device_record_success(ctx.author, author_state, ctx.guild.id, "swapallnonadmin")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(ctx.guild.id, family="swap")
 
 
 @bot.command(name="swapallpreview")
@@ -9422,7 +10740,7 @@ async def prefix_swapallpreview_command(ctx: commands.Context) -> None:
     sent_transition = await _send_mass_swap_transition_panel(
         ctx,
         message_text="Preview: a wave of body-swapping chaos tears through the room.",
-        filename=f"mass_swap_preview_{ctx.guild.id}.gif",
+        filename=f"mass_swap_preview_{ctx.guild.id}.webp",
     )
     if not sent_transition:
         await ctx.reply("Couldn't render the mass swap preview.", mention_author=False)
@@ -9441,10 +10759,89 @@ async def prefix_rerollallpreview_command(ctx: commands.Context) -> None:
     sent_transition = await _send_mass_reroll_transition_panel(
         ctx,
         message_text="Preview: the area erupts in unstable reroll energy.",
-        filename=f"mass_reroll_preview_{ctx.guild.id}.gif",
+        filename=f"mass_reroll_preview_{ctx.guild.id}.webp",
     )
     if not sent_transition:
         await ctx.reply("Couldn't render the mass reroll preview.", mention_author=False)
+
+
+def _parse_clone_prefix_args(args: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    tokens = _split_command_tokens(args)
+    if not tokens:
+        return None, None, "Usage: `!clone <source> [target]`"
+    if tokens and tokens[0].strip().lower() == "user":
+        tokens = tokens[1:]
+        if not tokens:
+            return None, None, "Usage: `!clone user <source> [target]`"
+    if not tokens:
+        return None, None, "Usage: `!clone <source> [target]`"
+    if "->" in tokens:
+        idx = tokens.index("->")
+        source = " ".join(tokens[:idx]).strip()
+        target = " ".join(tokens[idx + 1 :]).strip()
+        if not source or not target:
+            return None, None, "Use `!clone <source> -> <target>`."
+        return source, target, None
+    if "to" in tokens:
+        idx = tokens.index("to")
+        source = " ".join(tokens[:idx]).strip()
+        target = " ".join(tokens[idx + 1 :]).strip()
+        if not source or not target:
+            return None, None, "Use `!clone <source> to <target>`."
+        return source, target, None
+    if len(tokens) > 2:
+        return None, None, "Use `!clone <source> [target]` or `!clone <source> to <target>`."
+    source = tokens[0].strip()
+    target = tokens[1].strip() if len(tokens) == 2 else ""
+    return source, target, None
+
+
+def _short_display_label(value: str) -> str:
+    label = (value or "").strip()
+    if not label:
+        return "Unknown"
+    first = label.split()[0].strip()
+    return first or label
+
+
+def _clone_label_for_state(guild: discord.Guild, target_state: TransformationState, source_state: TransformationState) -> str:
+    source_name = (source_state.character_name or "").strip() or (source_state.identity_display_name or "")
+    target_name = (target_state.character_name or "").strip() or (target_state.identity_display_name or "")
+    return f"{_short_display_label(target_name)} (Clone of {_short_display_label(source_name)})"
+
+
+def _clone_visual_noop(target_state: TransformationState, snapshot: Mapping[str, object]) -> bool:
+    source_name = str(snapshot.get("character_name") or "").strip()
+    source_folder = str(snapshot.get("character_folder") or "").strip()
+    source_avatar = str(snapshot.get("character_avatar_path") or "").strip()
+    source_message = str(snapshot.get("character_message") or "").strip()
+    source_inanimate = bool(snapshot.get("is_inanimate", False))
+    source_responses_raw = snapshot.get("inanimate_responses") or ()
+    source_responses = tuple(str(item) for item in source_responses_raw) if isinstance(source_responses_raw, (list, tuple)) else tuple()
+    current_folder = str(target_state.character_folder or "").strip()
+    return (
+        target_state.character_name.strip() == source_name
+        and current_folder == source_folder
+        and target_state.character_avatar_path.strip() == source_avatar
+        and target_state.character_message.strip() == source_message
+        and bool(target_state.is_inanimate) == source_inanimate
+        and tuple(target_state.inanimate_responses or ()) == source_responses
+    )
+
+
+def _apply_clone_visual_snapshot(target_state: TransformationState, snapshot: Mapping[str, object]) -> None:
+    target_state.character_name = str(snapshot.get("character_name") or target_state.character_name)
+    target_state.character_folder = str(snapshot.get("character_folder") or "") or None
+    target_state.character_avatar_path = str(snapshot.get("character_avatar_path") or target_state.character_avatar_path)
+    target_state.character_message = str(snapshot.get("character_message") or target_state.character_message)
+    target_state.is_inanimate = bool(snapshot.get("is_inanimate", target_state.is_inanimate))
+    clone_responses = snapshot.get("inanimate_responses", ())
+    if isinstance(clone_responses, list):
+        target_state.inanimate_responses = tuple(str(item) for item in clone_responses)
+    elif isinstance(clone_responses, tuple):
+        target_state.inanimate_responses = clone_responses
+    target_state.avatar_applied = False
+    target_state.form_owner_user_id = target_state.user_id
 
 
 @bot.command(name="clone")
@@ -9463,42 +10860,72 @@ async def prefix_clone_command(ctx: commands.Context, *, args: str = "") -> None
     if battery_block:
         await ctx.reply(battery_block, mention_author=False)
         return
-    tokens = [t for t in args.split() if t.strip()]
-    if not tokens:
-        await ctx.reply("Usage: `!clone <source> [target] [minutes]`", mention_author=False)
+    source_token, target_token, parse_error = _parse_clone_prefix_args(args)
+    if parse_error:
+        await ctx.reply(parse_error, mention_author=False)
         return
-    source_token = tokens[0]
-    target_token = tokens[1] if len(tokens) >= 2 else ""
-    minutes = _parse_optional_minutes(tokens[2]) if len(tokens) >= 3 else None
     source_state = _find_state_by_token(ctx.guild, source_token)
     if source_state is None:
-        await ctx.reply(f"I couldn't find an active transformation matching `{source_token}`.", mention_author=False)
+        await ctx.reply(
+            f"I couldn't lock onto `{source_token}`. Try @mention, username, folder, or character token.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
     target_state = _find_state_by_token(ctx.guild, target_token) if target_token else find_active_transformation(ctx.author.id, ctx.guild.id)
     if target_state is None:
-        await ctx.reply(f"I couldn't find an active transformation matching `{target_token or ctx.author.display_name}`.", mention_author=False)
+        await ctx.reply(
+            f"I couldn't lock onto `{target_token or ctx.author.display_name}` as the clone target.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
     target_key = state_key(target_state.guild_id, target_state.user_id)
     if _has_overlay(target_key):
-        await ctx.reply("Target already has an active overlay. Revert first.", mention_author=False)
+        await ctx.reply("That target is already under a swap/clone illusion. Revert it first.", mention_author=False)
         return
     source_key = state_key(source_state.guild_id, source_state.user_id)
     if _has_overlay(source_key):
-        await ctx.reply("Cannot clone from a swapped/cloned overlay source. Revert source first.", mention_author=False)
+        await ctx.reply("That source is already under an overlay illusion. Revert the source first.", mention_author=False)
         return
     before_target_state = replace(target_state)
-    expires_at = utc_now() + timedelta(minutes=minutes) if minutes else None
+    expires_at = utc_now() + timedelta(minutes=60)
     group_id = _new_overlay_group_id("clone")
+    clone_snapshot = _snapshot_base_visual_fields(source_state)
+    if _clone_visual_noop(target_state, clone_snapshot):
+        await ctx.reply("No visual change detected. That clone target already matches the source form.", mention_author=False)
+        return
     _register_overlay_record(
         target_key,
         overlay_type="clone",
         group_id=group_id,
         source_user_id=source_state.user_id,
         base_visual=_snapshot_base_visual_fields(target_state),
+        cloned_visual_snapshot=clone_snapshot,
         expires_at=expires_at,
     )
-    _apply_visual_from_state(target_state, source_state)
-    target_state.identity_display_name = before_target_state.identity_display_name or before_target_state.character_name
+    if _CLONE_SNAPSHOT_ENFORCED:
+        _apply_clone_visual_snapshot(target_state, clone_snapshot)
+    else:
+        _apply_visual_from_state(target_state, source_state)
+    target_state.identity_display_name = _clone_label_for_state(ctx.guild, before_target_state, source_state)
+    guild_ch = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
+    channel_scope = _selection_scope_for_channel(guild_ch)
+    source_selection_scope = _selection_scope_for_state(channel_scope, source_state)
+    after_clone_scope = _selection_scope_for_state(channel_scope, target_state)
+    seed_ok = _seed_clone_target_outfit_selection(
+        guild_ch,
+        source_state=source_state,
+        target_state=target_state,
+        persist=True,
+    )
+    after_transition_scope = after_clone_scope if seed_ok else source_selection_scope
+    if not seed_ok:
+        logger.warning(
+            "Clone outfit seed failed for target user_id=%s character=%s; clone transition uses source selection scope",
+            target_state.user_id,
+            target_state.character_name,
+        )
     persist_states()
     _persist_overlay_state()
     _schedule_overlay_group_expiry(ctx.guild.id, group_id, expires_at)
@@ -9510,7 +10937,7 @@ async def prefix_clone_command(ctx: commands.Context, *, args: str = "") -> None
         _, target_member = await fetch_member(target_state.guild_id, target_state.user_id)
     source_label = source_member.display_name if source_member is not None else str(source_state.user_id)
     target_label = target_member.display_name if target_member is not None else str(target_state.user_id)
-    message_text = f"{target_label} becomes a clone of {source_label}."
+    message_text = f"{target_label} is rewritten into {source_label}'s form."
     sent_transition = False
     if source_member is not None and target_member is not None:
         sent_transition = await _send_clone_transition_panel(
@@ -9522,6 +10949,7 @@ async def prefix_clone_command(ctx: commands.Context, *, args: str = "") -> None
             target_member=target_member,
             message_text=message_text,
             use_device_particles=_is_device_only_actor(ctx.author, author_state, ctx.guild.id),
+            after_target_compose_scope=after_transition_scope,
         )
     if not sent_transition:
         await ctx.reply(
@@ -9529,6 +10957,127 @@ async def prefix_clone_command(ctx: commands.Context, *, args: str = "") -> None
             mention_author=False,
         )
     _device_record_success(ctx.author, author_state, ctx.guild.id, "clone")
+
+
+async def _apply_cloneall_group(
+    guild: discord.Guild,
+    *,
+    source_state: TransformationState,
+    channel: Optional[discord.abc.GuildChannel] = None,
+) -> Tuple[int, int]:
+    snapshot = _snapshot_base_visual_fields(source_state)
+    group_id = _new_overlay_group_id("cloneall")
+    expires_at = utc_now() + timedelta(minutes=60)
+    applied = 0
+    skipped = 0
+    for key, target_state in list(active_transformations.items()):
+        if key[0] != guild.id:
+            continue
+        if target_state.user_id == source_state.user_id:
+            continue
+        if _has_overlay(key):
+            skipped += 1
+            continue
+        if _clone_visual_noop(target_state, snapshot):
+            skipped += 1
+            continue
+        pre_clone_target = replace(target_state)
+        _register_overlay_record(
+            key,
+            overlay_type="clone",
+            group_id=group_id,
+            source_user_id=source_state.user_id,
+            base_visual=_snapshot_base_visual_fields(target_state),
+            cloned_visual_snapshot=snapshot,
+            expires_at=expires_at,
+        )
+        if _CLONE_SNAPSHOT_ENFORCED:
+            _apply_clone_visual_snapshot(target_state, snapshot)
+        else:
+            _apply_visual_from_state(target_state, source_state)
+        target_state.identity_display_name = _clone_label_for_state(guild, pre_clone_target, source_state)
+        _seed_clone_target_outfit_selection(
+            channel,
+            source_state=source_state,
+            target_state=target_state,
+            persist=False,
+        )
+        applied += 1
+    if applied > 0:
+        persist_outfit_selections()
+        compose_game_avatar.cache_clear()
+        persist_states()
+        _persist_overlay_state()
+        _schedule_overlay_group_expiry(guild.id, group_id, expires_at)
+    return applied, skipped
+
+
+@bot.command(name="cloneall")
+@commands.guild_only()
+@guard_prefix_command_channel
+async def prefix_cloneall_command(ctx: commands.Context, *, source: str = "") -> None:
+    await ensure_state_restored()
+    if not _CLONEALL_ENABLED:
+        await ctx.reply("`cloneall` is disabled in this build.", mention_author=False)
+        return
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
+    actor_state = find_active_transformation(ctx.author.id, ctx.guild.id)
+    if not has_fun_privilege(ctx.author, actor_state, ctx.guild.id):
+        await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
+        return
+    battery_block = _device_precheck_message(ctx.author, actor_state, ctx.guild.id, "cloneall")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
+        return
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        source,
+        1,
+        usage="Use `!cloneall <source>` with one source only (quote multi-word names). Do not add extra text after it.",
+    ):
+        return
+    source_token = (source or "").strip()
+    if not source_token:
+        await ctx.reply("Usage: `!cloneall <source>`", mention_author=False)
+        return
+    source_state = _find_state_by_token(ctx.guild, source_token)
+    if source_state is None:
+        await ctx.reply(
+            f"I couldn't lock onto `{source_token}` as the clone source.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    if not await _try_begin_bulk_family_run(ctx.guild.id, family="swap"):
+        await ctx.reply("A bulk transformation command is already running in this server. Please wait.", mention_author=False)
+        return
+    transition_name = f"mass_cloneall_{ctx.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("reroll", filename=transition_name)
+    try:
+        applied, skipped = await _apply_cloneall_group(
+            ctx.guild,
+            source_state=source_state,
+            channel=ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None,
+        )
+        if applied <= 0:
+            _cancel_prefetch_task(transition_task)
+            await ctx.reply("No transformed users were eligible for cloneall.", mention_author=False)
+            return
+        message_text = f"A resonance pulse spreads {source_state.character_name}'s form across the active roster ({applied} affected, {skipped} skipped)."
+        sent_transition = await _send_mass_reroll_transition_panel(
+            ctx,
+            message_text=message_text,
+            filename=transition_name,
+            pre_render_task=transition_task,
+        )
+        if not sent_transition:
+            await ctx.reply(message_text, mention_author=False)
+        _device_record_success(ctx.author, actor_state, ctx.guild.id, "cloneall")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(ctx.guild.id, family="swap")
 
 
 @bot.command(name="revert")
@@ -9547,29 +11096,57 @@ async def prefix_revert_overlay_command(ctx: commands.Context, *, target: str = 
     if battery_block:
         await ctx.reply(battery_block, mention_author=False)
         return
+    if await _reply_if_excess_prefix_tail_tokens(
+        ctx,
+        target,
+        1,
+        usage="Use `!revert` with no arguments (everyone), or `!revert <target>` with one target only (quote multi-word names).",
+    ):
+        return
     token = target.strip()
     if not token:
         group_ids = {str(rec.get("group_id")) for (g, _), rec in overlay_records.items() if g == ctx.guild.id and rec.get("group_id")}
         total = 0
         for group_id in sorted(group_ids):
             total += await _revert_overlay_group(ctx.guild.id, group_id, reason=f"Manual revert by {ctx.author.display_name}", channel=ctx.channel)
-        await ctx.reply(f"Reverted overlays for {total} participant(s).", mention_author=False)
+        swap_resets = 0
+        guild_user_ids = [
+            state.user_id
+            for (guild_id, _), state in list(active_transformations.items())
+            if guild_id == ctx.guild.id
+        ]
+        for user_id in guild_user_ids:
+            if await _unswap_and_announce(
+                ctx.guild.id,
+                user_id,
+                reason=f"Manual revert by {ctx.author.display_name}",
+                channel=ctx.channel,
+            ):
+                swap_resets += 1
+        await ctx.reply(
+            f"The illusion collapses. Overlay reverts: {total}. Swap-chain resets: {swap_resets}.",
+            mention_author=False,
+        )
         _device_record_success(ctx.author, author_state, ctx.guild.id, "revert")
         return
     st = _find_state_by_token(ctx.guild, token)
     if st is None:
-        await ctx.reply(f"I couldn't find an active transformation matching `{token}`.", mention_author=False)
+        await ctx.reply(
+            f"I couldn't lock onto `{token}` to undo an overlay.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
-    changed = await _revert_overlay_for_user(
+    changed = await _revert_overlay_or_swap_for_user(
         ctx.guild.id,
         st.user_id,
         reason=f"Manual revert by {ctx.author.display_name}",
         channel=ctx.channel,
     )
     if not changed:
-        await ctx.reply("No overlay found for that target.", mention_author=False)
+        await ctx.reply("That target has no active swap chain or clone effect to break.", mention_author=False)
         return
-    await ctx.reply("Overlay reverted.", mention_author=False)
+    await ctx.reply("Target has been reverted back to their original form.", mention_author=False)
     _device_record_success(ctx.author, author_state, ctx.guild.id, "revert")
 
 
@@ -9592,25 +11169,36 @@ async def slash_swapall_command(interaction: discord.Interaction, minutes: Optio
     if battery_block:
         await interaction.followup.send(battery_block, ephemeral=True)
         return
-    keys = _eligible_mass_swap_keys(interaction.guild, include_admin_mod=True)
-    if len(keys) < 2:
-        await interaction.followup.send("Need at least two active transformed users to run swapall.", ephemeral=True)
+    if not await _try_begin_bulk_family_run(interaction.guild.id, family="swap"):
+        await interaction.followup.send("A bulk swap is already running in this server. Please wait.", ephemeral=True)
         return
-    use_minutes = minutes if minutes and minutes > 0 else SWAPALL_DEFAULT_MINUTES
-    participants, skipped = await _apply_swapall_group(interaction.guild, keys, minutes=use_minutes)
-    ctx = InteractionContextAdapter(interaction, bot=bot)
-    message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
-    sent_transition = await _send_mass_swap_transition_panel(
-        ctx,
-        message_text=message_text,
-        filename=f"mass_swap_{interaction.guild.id}.gif",
-    )
-    if not sent_transition:
-        await interaction.followup.send(
-            f"{interaction.user.display_name} scrambles the room with a mass body-swap! Rotated {participants} participant(s), conflicts {skipped}.",
-            ephemeral=False,
+    transition_name = f"mass_swap_{interaction.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("swap", filename=transition_name)
+    try:
+        keys = _eligible_mass_swap_keys(interaction.guild, include_admin_mod=True)
+        if len(keys) < 2:
+            _cancel_prefetch_task(transition_task)
+            await interaction.followup.send("Need at least two active transformed users to run swapall.", ephemeral=True)
+            return
+        use_minutes = minutes if minutes and minutes > 0 else SWAPALL_DEFAULT_MINUTES
+        participants, skipped = await _apply_swapall_group(interaction.guild, keys, minutes=use_minutes)
+        ctx = InteractionContextAdapter(interaction, bot=bot)
+        message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
+        sent_transition = await _send_mass_swap_transition_panel(
+            ctx,
+            message_text=message_text,
+            filename=transition_name,
+            pre_render_task=transition_task,
         )
-    _device_record_success(interaction.user, actor_state, interaction.guild.id, "swapall")
+        if not sent_transition:
+            await interaction.followup.send(
+                f"{interaction.user.display_name} scrambles the room with a mass body-swap! Rotated {participants} participant(s), conflicts {skipped}.",
+                ephemeral=False,
+            )
+        _device_record_success(interaction.user, actor_state, interaction.guild.id, "swapall")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(interaction.guild.id, family="swap")
 
 
 @bot.tree.command(name="swapallnonadmin", description="Swap all active non-admin transformed users randomly.")
@@ -9632,25 +11220,36 @@ async def slash_swapallnonadmin_command(interaction: discord.Interaction, minute
     if battery_block:
         await interaction.followup.send(battery_block, ephemeral=True)
         return
-    keys = _eligible_mass_swap_keys(interaction.guild, include_admin_mod=False)
-    if len(keys) < 2:
-        await interaction.followup.send("Need at least two active non-admin transformed users to run swapall.", ephemeral=True)
+    if not await _try_begin_bulk_family_run(interaction.guild.id, family="swap"):
+        await interaction.followup.send("A bulk swap is already running in this server. Please wait.", ephemeral=True)
         return
-    use_minutes = minutes if minutes and minutes > 0 else SWAPALL_DEFAULT_MINUTES
-    participants, skipped = await _apply_swapall_group(interaction.guild, keys, minutes=use_minutes)
-    ctx = InteractionContextAdapter(interaction, bot=bot)
-    message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
-    sent_transition = await _send_mass_swap_transition_panel(
-        ctx,
-        message_text=message_text,
-        filename=f"mass_swap_{interaction.guild.id}.gif",
-    )
-    if not sent_transition:
-        await interaction.followup.send(
-            f"{interaction.user.display_name} triggers a non-admin mass swap! Rotated {participants} participant(s), conflicts {skipped}.",
-            ephemeral=False,
+    transition_name = f"mass_swap_{interaction.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("swap", filename=transition_name)
+    try:
+        keys = _eligible_mass_swap_keys(interaction.guild, include_admin_mod=False)
+        if len(keys) < 2:
+            _cancel_prefetch_task(transition_task)
+            await interaction.followup.send("Need at least two active non-admin transformed users to run swapall.", ephemeral=True)
+            return
+        use_minutes = minutes if minutes and minutes > 0 else SWAPALL_DEFAULT_MINUTES
+        participants, skipped = await _apply_swapall_group(interaction.guild, keys, minutes=use_minutes)
+        ctx = InteractionContextAdapter(interaction, bot=bot)
+        message_text = "A wave of body-swapping chaos tears through the room. Everybody ends up in the wrong body."
+        sent_transition = await _send_mass_swap_transition_panel(
+            ctx,
+            message_text=message_text,
+            filename=transition_name,
+            pre_render_task=transition_task,
         )
-    _device_record_success(interaction.user, actor_state, interaction.guild.id, "swapallnonadmin")
+        if not sent_transition:
+            await interaction.followup.send(
+                f"{interaction.user.display_name} triggers a non-admin mass swap! Rotated {participants} participant(s), conflicts {skipped}.",
+                ephemeral=False,
+            )
+        _device_record_success(interaction.user, actor_state, interaction.guild.id, "swapallnonadmin")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(interaction.guild.id, family="swap")
 
 
 @bot.tree.command(name="swapallpreview", description="Preview the mass swap animation without applying any swap.")
@@ -9669,7 +11268,7 @@ async def slash_swapallpreview_command(interaction: discord.Interaction) -> None
     sent_transition = await _send_mass_swap_transition_panel(
         ctx,
         message_text="Preview: a wave of body-swapping chaos tears through the room.",
-        filename=f"mass_swap_preview_{interaction.guild.id}.gif",
+        filename=f"mass_swap_preview_{interaction.guild.id}.webp",
     )
     if not sent_transition:
         await interaction.followup.send("Couldn't render the mass swap preview.", ephemeral=False)
@@ -9691,14 +11290,14 @@ async def slash_rerollallpreview_command(interaction: discord.Interaction) -> No
     sent_transition = await _send_mass_reroll_transition_panel(
         ctx,
         message_text="Preview: the area erupts in unstable reroll energy.",
-        filename=f"mass_reroll_preview_{interaction.guild.id}.gif",
+        filename=f"mass_reroll_preview_{interaction.guild.id}.webp",
     )
     if not sent_transition:
         await interaction.followup.send("Couldn't render the mass reroll preview.", ephemeral=False)
 
 
 @bot.tree.command(name="clone", description="Clone one active user's visuals onto another.")
-@app_commands.describe(source="Source token", target="Optional target token", minutes="Optional duration in minutes")
+@app_commands.describe(source="Source token", target="Optional target token")
 @app_commands.autocomplete(source=_character_name_autocomplete, target=_character_name_autocomplete)
 @app_commands.guild_only()
 @guard_slash_command_channel
@@ -9706,7 +11305,6 @@ async def slash_clone_command(
     interaction: discord.Interaction,
     source: str,
     target: Optional[str] = None,
-    minutes: Optional[int] = None,
 ) -> None:
     if not await _safe_defer_interaction(interaction, thinking=True):
         return
@@ -9724,33 +11322,67 @@ async def slash_clone_command(
         return
     source_state = _find_state_by_token(interaction.guild, source)
     if source_state is None:
-        await interaction.followup.send(f"I couldn't find an active transformation matching `{source}`.", ephemeral=True)
+        await interaction.followup.send(
+            f"I couldn't lock onto `{source}`. Try @mention, username, folder, or character token.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
     target_state = _find_state_by_token(interaction.guild, target) if target else actor_state
     if target_state is None:
-        await interaction.followup.send(f"I couldn't find an active transformation matching `{target or interaction.user.display_name}`.", ephemeral=True)
+        await interaction.followup.send(
+            f"I couldn't lock onto `{target or interaction.user.display_name}` as the clone target.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
     target_key = state_key(target_state.guild_id, target_state.user_id)
     source_key = state_key(source_state.guild_id, source_state.user_id)
     if _has_overlay(target_key):
-        await interaction.followup.send("Target already has an active overlay. Revert first.", ephemeral=True)
+        await interaction.followup.send("That target is already under a swap/clone illusion. Revert it first.", ephemeral=True)
         return
     if _has_overlay(source_key):
-        await interaction.followup.send("Cannot clone from an overlay source. Revert source first.", ephemeral=True)
+        await interaction.followup.send("That source is already under an overlay illusion. Revert the source first.", ephemeral=True)
         return
     before_target_state = replace(target_state)
-    expires_at = utc_now() + timedelta(minutes=minutes) if minutes and minutes > 0 else None
+    expires_at = utc_now() + timedelta(minutes=60)
     group_id = _new_overlay_group_id("clone")
+    clone_snapshot = _snapshot_base_visual_fields(source_state)
+    if _clone_visual_noop(target_state, clone_snapshot):
+        await interaction.followup.send("No visual change detected. That clone target already matches the source form.", ephemeral=True)
+        return
     _register_overlay_record(
         target_key,
         overlay_type="clone",
         group_id=group_id,
         source_user_id=source_state.user_id,
         base_visual=_snapshot_base_visual_fields(target_state),
+        cloned_visual_snapshot=clone_snapshot,
         expires_at=expires_at,
     )
-    _apply_visual_from_state(target_state, source_state)
-    target_state.identity_display_name = before_target_state.identity_display_name or before_target_state.character_name
+    if _CLONE_SNAPSHOT_ENFORCED:
+        _apply_clone_visual_snapshot(target_state, clone_snapshot)
+    else:
+        _apply_visual_from_state(target_state, source_state)
+    target_state.identity_display_name = _clone_label_for_state(interaction.guild, before_target_state, source_state)
+    int_ch = interaction.channel
+    guild_ch = int_ch if isinstance(int_ch, discord.abc.GuildChannel) else None
+    channel_scope = _selection_scope_for_channel(guild_ch)
+    source_selection_scope = _selection_scope_for_state(channel_scope, source_state)
+    after_clone_scope = _selection_scope_for_state(channel_scope, target_state)
+    seed_ok = _seed_clone_target_outfit_selection(
+        guild_ch,
+        source_state=source_state,
+        target_state=target_state,
+        persist=True,
+    )
+    after_transition_scope = after_clone_scope if seed_ok else source_selection_scope
+    if not seed_ok:
+        logger.warning(
+            "Clone outfit seed failed for target user_id=%s character=%s; clone transition uses source selection scope",
+            target_state.user_id,
+            target_state.character_name,
+        )
     persist_states()
     _persist_overlay_state()
     _schedule_overlay_group_expiry(interaction.guild.id, group_id, expires_at)
@@ -9762,7 +11394,7 @@ async def slash_clone_command(
         _, target_member = await fetch_member(target_state.guild_id, target_state.user_id)
     source_label = source_member.display_name if source_member is not None else str(source_state.user_id)
     target_label = target_member.display_name if target_member is not None else str(target_state.user_id)
-    message_text = f"{target_label} becomes a clone of {source_label}."
+    message_text = f"{target_label} is rewritten into {source_label}'s form."
     sent_transition = False
     if source_member is not None and target_member is not None:
         ctx = InteractionContextAdapter(interaction, bot=bot)
@@ -9775,10 +11407,76 @@ async def slash_clone_command(
             target_member=target_member,
             message_text=message_text,
             use_device_particles=_is_device_only_actor(interaction.user, actor_state, interaction.guild.id),
+            after_target_compose_scope=after_transition_scope,
         )
     if not sent_transition:
         await interaction.followup.send(message_text, ephemeral=False)
     _device_record_success(interaction.user, actor_state, interaction.guild.id, "clone")
+
+
+@bot.tree.command(name="cloneall", description="Clone all transformed users to one source form.")
+@app_commands.describe(source="Source token (user, character, or folder).")
+@app_commands.autocomplete(source=_character_name_autocomplete)
+@app_commands.guild_only()
+@guard_slash_command_channel
+async def slash_cloneall_command(interaction: discord.Interaction, source: str) -> None:
+    if not await _safe_defer_interaction(interaction, thinking=True):
+        return
+    if not _CLONEALL_ENABLED:
+        await interaction.followup.send("`cloneall` is disabled in this build.", ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.guild:
+        await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
+        return
+    await ensure_state_restored()
+    actor_state = find_active_transformation(interaction.user.id, interaction.guild.id)
+    if not has_fun_privilege(interaction.user, actor_state, interaction.guild.id):
+        await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
+        return
+    battery_block = _device_precheck_message(interaction.user, actor_state, interaction.guild.id, "cloneall")
+    if battery_block:
+        await interaction.followup.send(battery_block, ephemeral=True)
+        return
+    source_token = (source or "").strip()
+    source_state = _find_state_by_token(interaction.guild, source_token)
+    if source_state is None:
+        await interaction.followup.send(
+            f"I couldn't lock onto `{source_token}` as the clone source.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    if not await _try_begin_bulk_family_run(interaction.guild.id, family="swap"):
+        await interaction.followup.send("A bulk transformation command is already running in this server. Please wait.", ephemeral=True)
+        return
+    transition_name = f"mass_cloneall_{interaction.guild.id}.webp"
+    transition_task = _prefetch_mass_transition("reroll", filename=transition_name)
+    int_ch = interaction.channel
+    cloneall_channel = int_ch if isinstance(int_ch, discord.abc.GuildChannel) else None
+    try:
+        applied, skipped = await _apply_cloneall_group(
+            interaction.guild,
+            source_state=source_state,
+            channel=cloneall_channel,
+        )
+        if applied <= 0:
+            _cancel_prefetch_task(transition_task)
+            await interaction.followup.send("No transformed users were eligible for cloneall.", ephemeral=True)
+            return
+        ctx = InteractionContextAdapter(interaction, bot=bot)
+        message_text = f"A resonance pulse spreads {source_state.character_name}'s form across the active roster ({applied} affected, {skipped} skipped)."
+        sent_transition = await _send_mass_reroll_transition_panel(
+            ctx,
+            message_text=message_text,
+            filename=transition_name,
+            pre_render_task=transition_task,
+        )
+        if not sent_transition:
+            await interaction.followup.send(message_text, ephemeral=False)
+        _device_record_success(interaction.user, actor_state, interaction.guild.id, "cloneall")
+    finally:
+        _cancel_prefetch_task(transition_task)
+        await _end_bulk_family_run(interaction.guild.id, family="swap")
 
 
 @bot.tree.command(name="revert", description="Revert swap/clone overlays.")
@@ -9806,23 +11504,54 @@ async def slash_revert_overlay_command(interaction: discord.Interaction, target:
         total = 0
         for group_id in sorted(group_ids):
             total += await _revert_overlay_group(interaction.guild.id, group_id, reason=f"Manual revert by {interaction.user.display_name}")
-        await interaction.followup.send(f"Reverted overlays for {total} participant(s).", ephemeral=False)
+        swap_resets = 0
+        guild_user_ids = [
+            state.user_id
+            for (guild_id, _), state in list(active_transformations.items())
+            if guild_id == interaction.guild.id
+        ]
+        for user_id in guild_user_ids:
+            if await _unswap_and_announce(
+                interaction.guild.id,
+                user_id,
+                reason=f"Manual revert by {interaction.user.display_name}",
+            ):
+                swap_resets += 1
+        await interaction.followup.send(
+            f"The illusion collapses. Overlay reverts: {total}. Swap-chain resets: {swap_resets}.",
+            ephemeral=False,
+        )
         _device_record_success(interaction.user, actor_state, interaction.guild.id, "revert")
         return
     st = _find_state_by_token(interaction.guild, target)
     if st is None:
-        await interaction.followup.send(f"I couldn't find an active transformation matching `{target}`.", ephemeral=True)
+        await interaction.followup.send(
+            f"I couldn't lock onto `{target}` to undo an overlay.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
-    changed = await _revert_overlay_for_user(interaction.guild.id, st.user_id, reason=f"Manual revert by {interaction.user.display_name}")
-    await interaction.followup.send("Overlay reverted." if changed else "No overlay found for that target.", ephemeral=False)
+    changed = await _revert_overlay_or_swap_for_user(
+        interaction.guild.id,
+        st.user_id,
+        reason=f"Manual revert by {interaction.user.display_name}",
+    )
+    await interaction.followup.send(
+        "Target has been reverted back to their original form."
+        if changed
+        else "That target has no active swap chain or clone effect to break.",
+        ephemeral=False,
+    )
     if changed:
         _device_record_success(interaction.user, actor_state, interaction.guild.id, "revert")
 
 
 @bot.tree.command(name="dspawn", description="Force the Device to reassign now.")
+@app_commands.describe(target="Optional target token to assign Device to.")
+@app_commands.autocomplete(target=_character_name_autocomplete)
 @app_commands.guild_only()
 @guard_slash_command_channel
-async def slash_dspawn_command(interaction: discord.Interaction) -> None:
+async def slash_dspawn_command(interaction: discord.Interaction, target: Optional[str] = None) -> None:
     if not await _safe_defer_interaction(interaction, thinking=True):
         return
     if not isinstance(interaction.user, discord.Member) or not interaction.guild:
@@ -9835,17 +11564,42 @@ async def slash_dspawn_command(interaction: discord.Interaction) -> None:
         await interaction.followup.send("Only admins or moderators can use this command.", ephemeral=True)
         return
     old_holder = device_holder_by_guild.get(interaction.guild.id)
-    await _rotate_device_once(interaction.guild, force_announce=True)
-    new_holder = device_holder_by_guild.get(interaction.guild.id)
-    if new_holder is None:
-        await interaction.followup.send("No eligible transformed non-admin users are active right now.", ephemeral=True)
-        return
-    await interaction.followup.send(f"Device reassigned: <@{old_holder}> -> <@{new_holder}>", ephemeral=False)
+    token = (target or "").strip()
+    if token:
+        state = _find_state_by_token(interaction.guild, token)
+        if state is None:
+            await interaction.followup.send(f"I couldn't lock onto `{token}` for Device handoff.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            return
+        new_holder = int(state.user_id)
+        if not _is_device_eligible_user(interaction.guild, new_holder):
+            await interaction.followup.send("That target is not currently eligible to hold the Device.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            return
+        if old_holder == new_holder:
+            holder_name = _device_member_label(interaction.guild, new_holder)
+            await interaction.followup.send(f"The Device is already with {holder_name}.", ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+        await _commit_device_transfer(interaction.guild, old_holder, new_holder)
+    else:
+        await _rotate_device_once(interaction.guild, force_announce=True)
+        new_holder = device_holder_by_guild.get(interaction.guild.id)
+        if new_holder is None:
+            await interaction.followup.send("No eligible transformed non-admin users are active right now.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            return
+        if old_holder == new_holder:
+            holder_name = _device_member_label(interaction.guild, new_holder)
+            await interaction.followup.send(f"The Device remains with {holder_name}.", ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+    old_name = _device_member_label(interaction.guild, old_holder)
+    new_name = _device_member_label(interaction.guild, device_holder_by_guild.get(interaction.guild.id))
+    await interaction.followup.send(
+        f"Device reassigned: {old_name} -> {new_name}",
+        ephemeral=False,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(name="dstatus", description="Show current Device holder and battery.")
 @app_commands.guild_only()
-@guard_slash_command_channel
 async def slash_dstatus_command(interaction: discord.Interaction) -> None:
     if not await _safe_defer_interaction(interaction, thinking=False):
         return
@@ -9855,7 +11609,9 @@ async def slash_dstatus_command(interaction: discord.Interaction) -> None:
     if GAME_BOARD_MANAGER and isinstance(interaction.channel, discord.Thread) and GAME_BOARD_MANAGER.is_game_thread(interaction.channel):
         await interaction.followup.send("The Device isn't available in gameboard mode.", ephemeral=True)
         return
-    await interaction.followup.send(_device_status_text(interaction.guild)[:2000], ephemeral=False)
+    if not isinstance(interaction.user, discord.Member) or not _can_use_dstatus(interaction.user, interaction.guild.id):
+        return
+    await interaction.followup.send(_device_status_text(interaction.guild)[:2000], ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="drecharge", description="Recharge the Device battery to 100%.")
@@ -9874,7 +11630,7 @@ async def slash_drecharge_command(interaction: discord.Interaction) -> None:
         await interaction.followup.send("Only admins or moderators can use this command.", ephemeral=True)
         return
     _recharge_device_battery(interaction.guild.id)
-    await interaction.followup.send("Device battery recharged to 100%.", ephemeral=False)
+    await interaction.followup.send("Device battery recharged to 100%.", ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="helpdevice", description="Explain Device powers, battery, and recharge.")
@@ -9895,7 +11651,7 @@ async def slash_helpdevice_command(interaction: discord.Interaction) -> None:
         "Holder gains fun-command privilege (reroll/swap/clone family), but no moderation/system powers.\n\n"
         f"{_device_status_text(interaction.guild)}"
     )
-    await interaction.followup.send(text[:2000], ephemeral=False)
+    await interaction.followup.send(text[:2000], ephemeral=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.command(name="pswap")
@@ -9979,7 +11735,7 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return
     
-    # Check permission: admin, ball, or narrator only
+    # Check permission: admin or special-form user
     author_state = find_active_transformation(ctx.author.id, ctx.guild.id)
     if not has_fun_privilege(ctx.author, author_state, ctx.guild.id):
         await ctx.reply(_privileged_requirement_message("use this command"), mention_author=False)
@@ -10162,7 +11918,9 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         state1=new_state1,
         state2=new_state2,
     )
-    transition_file = _render_swap_transition_file(
+    transition_started = time.perf_counter()
+    transition_file = await run_panel_render_gif(
+        _render_swap_transition_file,
         before_left_state=state1,
         before_right_state=state2,
         left_state=new_state1,
@@ -10174,17 +11932,31 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
         filename=f"swap_{member1.id}_{member2.id}.png",
     )
     if transition_file is not None:
-        await ctx.reply(
-            content=message_text,
-            file=transition_file,
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        render_ms = (time.perf_counter() - transition_started) * 1000.0
+        _, upload_ms = await _timed_send_ms(
+            "swap_transition_send",
+            ctx.reply(
+                content=message_text,
+                file=transition_file,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
+        )
+        _log_transition_send_metrics(
+            label="swap_transition_send",
+            render_ms=render_ms,
+            upload_ms=upload_ms,
+            total_ms=(time.perf_counter() - transition_started) * 1000.0,
+            payload_bytes=_discord_file_size_bytes(transition_file),
         )
     else:
-        await ctx.reply(
-            message_text,
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        await _timed_send(
+            "swap_text_send",
+            ctx.reply(
+                message_text,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
         )
     _device_record_success(ctx.author, author_state, ctx.guild.id, "swap")
 
@@ -10234,7 +12006,7 @@ async def slash_swap_command(
         await interaction.followup.send("This command can only be used inside a server.", ephemeral=True)
         return
     
-    # Check permission: admin, ball, or narrator only
+    # Check permission: admin or special-form user
     author_state = find_active_transformation(interaction.user.id, interaction.guild.id)
     if not has_fun_privilege(interaction.user, author_state, interaction.guild.id):
         await interaction.followup.send(_privileged_requirement_message("use this command"), ephemeral=True)
@@ -10398,7 +12170,9 @@ async def slash_swap_command(
         state1=new_state1,
         state2=new_state2,
     )
-    transition_file = _render_swap_transition_file(
+    transition_started = time.perf_counter()
+    transition_file = await run_panel_render_gif(
+        _render_swap_transition_file,
         before_left_state=state1,
         before_right_state=state2,
         left_state=new_state1,
@@ -10410,17 +12184,31 @@ async def slash_swap_command(
         filename=f"swap_{member1.id}_{member2.id}.png",
     )
     if transition_file is not None:
-        await interaction.followup.send(
-            content=message_text,
-            file=transition_file,
-            ephemeral=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        render_ms = (time.perf_counter() - transition_started) * 1000.0
+        _, upload_ms = await _timed_send_ms(
+            "slash_swap_transition_send",
+            interaction.followup.send(
+                content=message_text,
+                file=transition_file,
+                ephemeral=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
+        )
+        _log_transition_send_metrics(
+            label="slash_swap_transition_send",
+            render_ms=render_ms,
+            upload_ms=upload_ms,
+            total_ms=(time.perf_counter() - transition_started) * 1000.0,
+            payload_bytes=_discord_file_size_bytes(transition_file),
         )
     else:
-        await interaction.followup.send(
-            message_text,
-            ephemeral=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        await _timed_send(
+            "slash_swap_text_send",
+            interaction.followup.send(
+                message_text,
+                ephemeral=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            ),
         )
     _device_record_success(interaction.user, author_state, interaction.guild.id, "swap")
 
@@ -10473,8 +12261,11 @@ async def slash_genderswap_command(
     else:
         target_member = author
     author_state = find_active_transformation(author.id, guild.id)
-    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
-        await interaction.followup.send("Only admins or moderators can genderswap someone else.", ephemeral=True)
+    if not has_fun_privilege(author, author_state, guild.id):
+        await interaction.followup.send(
+            "You need admin, moderator, Device holder, or eligible special form access to use this command.",
+            ephemeral=True,
+        )
         return
     battery_block = _device_precheck_message(author, author_state, guild.id, "genderswap")
     if battery_block:
@@ -10533,8 +12324,11 @@ async def slash_ageswap_command(
     else:
         target_member = author
     author_state = find_active_transformation(author.id, guild.id)
-    if target_member.id != author.id and not has_fun_privilege(author, author_state, guild.id):
-        await interaction.followup.send("Only admins or moderators can ageswap someone else.", ephemeral=True)
+    if not has_fun_privilege(author, author_state, guild.id):
+        await interaction.followup.send(
+            "You need admin, moderator, Device holder, or eligible special form access to use this command.",
+            ephemeral=True,
+        )
         return
     battery_block = _device_precheck_message(author, author_state, guild.id, "ageswap")
     if battery_block:
@@ -10714,9 +12508,25 @@ async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
     except discord.HTTPException:
         pass
 
-    async def send_channel_feedback(content: str, **kwargs) -> None:
+    async def send_channel_feedback(
+        content: str,
+        *,
+        metrics_label: Optional[str] = None,
+        render_ms: Optional[float] = None,
+        started_at: Optional[float] = None,
+        **kwargs,
+    ) -> None:
         kwargs.setdefault("mention_author", False)
-        await ctx.send(content, **kwargs)
+        kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
+        _, upload_ms = await _timed_send_ms("background_feedback_send", ctx.send(content, **kwargs))
+        if metrics_label and render_ms is not None and started_at is not None:
+            _log_transition_send_metrics(
+                label=metrics_label,
+                render_ms=render_ms,
+                upload_ms=upload_ms,
+                total_ms=(time.perf_counter() - started_at) * 1000.0,
+                payload_bytes=_discord_file_size_bytes(kwargs.get("file")),
+            )
 
     await ensure_state_restored()
     selection_scope = _selection_scope_for_channel(getattr(ctx, "channel", None))
@@ -10865,17 +12675,21 @@ async def prefix_bg_35(ctx: commands.Context, *, selection: str = ""):
         schedule_history_refresh()
         target_label = _background_target_label(ctx.guild, target_state)
         message_text = f"<@{ctx.author.id}> moved {target_label} to `{display}`."
-        transition_file = _render_background_transition_file(
+        transition_started = time.perf_counter()
+        transition_file = await _render_background_transition_file_cached(
             state=target_state,
             old_background_path=old_background_path,
             new_background_path=selected_path,
-            filename=f"bg_{target_state.user_id}.gif",
+            filename=f"bg_{target_state.user_id}.webp",
             selection_scope=selection_scope,
         )
         if transition_file is not None:
             await send_channel_feedback(
                 message_text,
                 file=transition_file,
+                metrics_label="background_transition_send",
+                render_ms=(time.perf_counter() - transition_started) * 1000.0,
+                started_at=transition_started,
             )
         else:
             await send_channel_feedback(
@@ -11028,13 +12842,18 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
     else:
         normalized_pose = None
 
-    before_avatar_image = compose_state_avatar_image(state, selection_scope=selection_scope)
+    state_selection_scope = _selection_scope_for_state(selection_scope, state)
+    before_avatar_image = compose_state_avatar_image(state, selection_scope=state_selection_scope)
+    prior_pose, prior_outfit = get_selected_pose_outfit(
+        state.character_name,
+        scope=state_selection_scope,
+    )
 
     if not set_selected_pose_outfit(
         state.character_name,
         parsed_pose if normalized_pose else None,
         parsed_outfit,
-        scope=selection_scope,
+        scope=state_selection_scope,
     ):
         pose_lines = []
         for pose, options in pose_outfits.items():
@@ -11051,29 +12870,50 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
 
     selected_pose, selected_outfit = get_selected_pose_outfit(
         state.character_name,
-        scope=selection_scope,
+        scope=state_selection_scope,
     )
-    pose_label = selected_pose or "auto"
+    if (
+        (prior_pose or "").strip().lower() == (selected_pose or "").strip().lower()
+        and (prior_outfit or "").strip().lower() == (selected_outfit or "").strip().lower()
+    ):
+        if ctx.guild:
+            await ctx.reply("No visual change detected. That outfit is already active.", mention_author=False)
+        else:
+            await ctx.send("No visual change detected. That outfit is already active.")
+        return
     outfit_label = selected_outfit or parsed_outfit
     if target_state is not None and ctx.guild and actor_member is not None:
         confirmation = (
-            f"<@{ctx.author.id}> changed {_background_target_label(ctx.guild, target_state)}'s outfit "
+            f"{ctx.author.display_name} changed {_background_target_label(ctx.guild, target_state)}'s outfit "
             f"to `{outfit_label}`."
         )
     else:
         confirmation = (
-            f"<@{ctx.author.id}> changed their outfit to `{outfit_label}`."
+            f"{ctx.author.display_name} changed their outfit to `{outfit_label}`."
         )
     schedule_history_refresh()
     if ctx.guild:
-        transition_file = _render_appearance_transition_file(
+        transition_started = time.perf_counter()
+        transition_file = await run_panel_render_gif(
+            _render_appearance_transition_file,
             state=state,
             before_avatar_image=before_avatar_image,
-            filename=f"outfit_{state.user_id}.gif",
-            selection_scope=selection_scope,
+            filename=f"outfit_{state.user_id}.webp",
+            selection_scope=state_selection_scope,
         )
         if transition_file is not None:
-            await ctx.reply(confirmation, mention_author=False, file=transition_file)
+            render_ms = (time.perf_counter() - transition_started) * 1000.0
+            _, upload_ms = await _timed_send_ms(
+                "outfit35_transition_send",
+                ctx.reply(confirmation, mention_author=False, file=transition_file),
+            )
+            _log_transition_send_metrics(
+                label="outfit35_transition_send",
+                render_ms=render_ms,
+                upload_ms=upload_ms,
+                total_ms=(time.perf_counter() - transition_started) * 1000.0,
+                payload_bytes=_discord_file_size_bytes(transition_file),
+            )
         else:
             await ctx.reply(confirmation, mention_author=False)
     else:
@@ -11086,6 +12926,9 @@ async def prefix_outfit_35(ctx: commands.Context, *, outfit_name: str = ""):
 async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
     """3.5 version of say command."""
     await ensure_state_restored()
+    if ctx.guild is None:
+        await ctx.reply("This command can only be used inside a server.", mention_author=False)
+        return
 
     guild_channel = ctx.channel if isinstance(ctx.channel, discord.abc.GuildChannel) else None
     selection_scope = _selection_scope_for_channel(guild_channel)
@@ -11094,6 +12937,7 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
     if not isinstance(actor, discord.Member):
         await ctx.reply("This command can only be used inside a server.", mention_author=False)
         return
+    author_state = find_active_transformation(actor.id, ctx.guild.id)
     # Check if in gameboard mode - if so, only GM can use !say
     can_use_command = False
     if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread):
@@ -11103,13 +12947,25 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
             can_use_command = GAME_BOARD_MANAGER._is_gm(actor, game_state) or (is_admin(actor) or is_bot_mod(actor))
         else:
             # Not in gameboard mode - use normal VN mode checks
-            can_use_command = (is_admin(actor) or is_bot_mod(actor)) or _actor_has_narrator_power_35(actor)
+            can_use_command = (
+                (is_admin(actor) or is_bot_mod(actor))
+                or _actor_has_narrator_power_35(actor)
+                or has_device_privilege(actor, ctx.guild.id)
+            )
     else:
         # Not in game thread - use normal VN mode checks
-        can_use_command = (is_admin(actor) or is_bot_mod(actor)) or _actor_has_narrator_power_35(actor)
+        can_use_command = (
+            (is_admin(actor) or is_bot_mod(actor))
+            or _actor_has_narrator_power_35(actor)
+            or has_device_privilege(actor, ctx.guild.id)
+        )
     
     if not can_use_command:
         await ctx.reply(_privileged_requirement_message("use `!say`"), mention_author=False)
+        return
+    battery_block = _device_precheck_message(actor, author_state, ctx.guild.id, "say")
+    if battery_block:
+        await ctx.reply(battery_block, mention_author=False)
         return
 
     args = args.strip()
@@ -11206,83 +13062,64 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
     formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else []
     custom_emoji_images = await prepare_custom_emoji_images(ctx.message, formatted_segments)
 
+    state_selection_scope = _selection_scope_for_state(selection_scope, target_state)
+
     files: list[discord.File] = []
     payload: dict = {}
     if MESSAGE_STYLE == "vn":
         character_display_name = _resolve_character_display_name(ctx.guild, target_state.user_id, target_state)
-        
-        # CRITICAL: Monkey-patch get_selected_background_path for gameboard mode
-        # This ensures !say uses gameboard backgrounds instead of VN backgrounds
-        original_func = None
+
+        say_panel_bg_kw: Dict[str, object] = {}
         if GAME_BOARD_MANAGER and isinstance(ctx.channel, discord.Thread):
             game_state = await GAME_BOARD_MANAGER._get_game_state_for_context(ctx)
             if game_state and target_state and target_state.user_id in game_state.players:
                 player = game_state.players[target_state.user_id]
-                background_path = (
+                resolved_bg = (
                     GAME_BOARD_MANAGER._get_game_background_path(player.background_id)
                     if player.background_id is not None
                     else None
                 )
-                # Monkey-patch get_selected_background_path to use gameboard background
-                import tfbot.panels as panels_module
-                from tfbot.panels import get_selected_background_path as global_get_bg
-                
-                original_func = panels_module.get_selected_background_path
-                
-                def game_background_getter(user_id: int) -> Optional[Path]:
-                    """Override background lookup to use game-specific background for !say command.
-                    
-                    CRITICAL: This function uses target_state.user_id and player.background_id,
-                    ensuring !say uses the same gameboard background as normal messages.
-                    """
-                    if user_id == target_state.user_id:
-                        # Always use gameboard background for this character
-                        if background_path:
-                            return background_path
-                        # Fallback: if background_path is None, try to get it from player.background_id directly
-                        if player.background_id is not None:
-                            logger.debug("Background path was None in !say monkey-patch, recalculating from player.background_id=%s", 
-                                       player.background_id)
-                            fallback_path = GAME_BOARD_MANAGER._get_game_background_path(player.background_id)
-                            if fallback_path:
-                                return fallback_path
-                            logger.warning("Failed to get background path from player.background_id=%s in !say monkey-patch", 
-                                         player.background_id)
-                        # If still None, don't fall back to VN mode - return None to use default
-                        logger.debug("No gameboard background available for user_id=%s in !say, returning None (will use default)", user_id)
-                        return None
-                    # Fall back to default behavior for other users (shouldn't happen in games)
-                    return global_get_bg(user_id)
-                
-                panels_module.get_selected_background_path = game_background_getter
-                logger.debug("Monkey-patched get_selected_background_path for !say command (user_id=%s, background_id=%s)", 
-                           target_state.user_id, player.background_id)
-        
-        try:
-            vn_file = render_vn_panel(
-                state=target_state,
-                message_content=cleaned_content,
-                character_display_name=character_display_name,
-                original_name=original_name,
-                attachment_id=str(ctx.message.id),
-                formatted_segments=formatted_segments,
-                custom_emoji_images=custom_emoji_images,
-                reply_context=reply_context,
-                selection_scope=selection_scope,
-                gacha_outfit_override=gacha_outfit_override,
-            )
-            if vn_file:
-                files.append(vn_file)
-        finally:
-            # CRITICAL: Restore original function (critical for isolation)
-            if original_func is not None:
-                import tfbot.panels as panels_module
-                panels_module.get_selected_background_path = original_func
-                logger.debug("Restored original get_selected_background_path after !say render")
+                if resolved_bg is None and player.background_id is not None:
+                    logger.warning(
+                        "Background path was None for !say (user_id=%s), recalculating from player.background_id=%s",
+                        target_state.user_id,
+                        player.background_id,
+                    )
+                    resolved_bg = GAME_BOARD_MANAGER._get_game_background_path(player.background_id)
+                    if resolved_bg is None:
+                        logger.warning(
+                            "Failed to get background path from player.background_id=%s in !say",
+                            player.background_id,
+                        )
+                say_panel_bg_kw["panel_background_path"] = resolved_bg
+                logger.debug(
+                    "Gameboard !say panel background (user_id=%s, background_id=%s)",
+                    target_state.user_id,
+                    player.background_id,
+                )
+
+        vn_file = await run_panel_render_vn(
+            render_vn_panel,
+            state=target_state,
+            message_content=cleaned_content,
+            character_display_name=character_display_name,
+            original_name=original_name,
+            attachment_id=str(ctx.message.id),
+            formatted_segments=formatted_segments,
+            custom_emoji_images=custom_emoji_images,
+            reply_context=reply_context,
+            selection_scope=state_selection_scope,
+            gacha_outfit_override=gacha_outfit_override,
+            **say_panel_bg_kw,
+        )
+        if vn_file:
+            files.append(vn_file)
 
     description = cleaned_content if cleaned_content else "*no message content*"
     if not files:
-        embed, avatar_file = await build_legacy_embed(target_state, description)
+        embed, avatar_file = await build_legacy_embed(
+            target_state, description, selection_scope=state_selection_scope
+        )
         if avatar_file:
             files.append(avatar_file)
         payload["embed"] = embed
@@ -11307,6 +13144,7 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
 
     if sent_message and cleaned_content:
         _register_relay_message(sent_message.id, target_state.character_name, cleaned_content)
+    _device_record_success(actor, author_state, ctx.guild.id, "say")
 
     await _delete_vn_message_with_retry(ctx.message, context="say panel")
 
@@ -11334,6 +13172,7 @@ def main():
         raise
     finally:
         shutdown_session_error_log()
+        shutdown_animation_perf_log()
 
 
 if __name__ == "__main__":
