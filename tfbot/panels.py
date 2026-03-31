@@ -217,7 +217,7 @@ VN_MASK_GUIDE_THRESHOLD = max(1, min(255, int_from_env("TFBOT_VN_MASK_GUIDE_THRE
 VN_MASK_GUIDE_DEBUG = os.getenv("TFBOT_VN_MASK_GUIDE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 VN_MASK_VISIBLE_ALPHA_THRESHOLD = max(0, min(254, int_from_env("TFBOT_VN_MASK_VISIBLE_ALPHA_THRESHOLD", 12)))
 # Tune this single value during live testing if edges look too soft/hard.
-SPRITE_EDGE_AA_STRENGTH = 0.32
+SPRITE_EDGE_AA_STRENGTH = 0.16
 if _VN_MASK_GUIDE_PATH_SETTING:
     _vn_mask_guide_path = Path(_VN_MASK_GUIDE_PATH_SETTING)
     if not _vn_mask_guide_path.is_absolute():

@@ -973,15 +973,23 @@ BLOCK_INANIMATE_EXCEPT_SPECIAL = os.getenv("TFBOT_BLOCK_INANIMATE_EXCEPT_SPECIAL
 
 ACTIVE_WINDOW_SECONDS = 6 * 60 * 60
 SWAPALL_DEFAULT_MINUTES = 60
-DEVICE_MIN_SECONDS = 5 * 60
-DEVICE_MAX_SECONDS = 4 * 60 * 60
+DEVICE_MIN_SECONDS = max(60, int_from_env("TFBOT_DEVICE_MIN_SECONDS", 300))
+DEVICE_MAX_SECONDS = max(DEVICE_MIN_SECONDS, int_from_env("TFBOT_DEVICE_MAX_SECONDS", 5400))
 DEVICE_RECHARGE_SECONDS = 30 * 60
 DEVICE_BATTERY_MAX = 100.0
-DEVICE_TRANSFER_BASE_CHANCE = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_BASE_CHANCE", 0.06)))
-DEVICE_TRANSFER_PER_USE_BONUS = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_PER_USE_BONUS", 0.035)))
-DEVICE_TRANSFER_IDLE_BONUS_PER_MIN = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_IDLE_BONUS_PER_MIN", 0.005)))
-DEVICE_TRANSFER_MAX_CHANCE = max(0.05, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_MAX_CHANCE", 0.8)))
-DEVICE_TRANSFER_COOLDOWN_SECONDS = max(0, int_from_env("TFBOT_DEVICE_TRANSFER_COOLDOWN_SECONDS", 120))
+DEVICE_TRANSFER_BASE_CHANCE = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_BASE_CHANCE", 0.22)))
+DEVICE_TRANSFER_PER_USE_BONUS = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_PER_USE_BONUS", 0.08)))
+DEVICE_TRANSFER_IDLE_BONUS_PER_MIN = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_IDLE_BONUS_PER_MIN", 0.012)))
+DEVICE_TRANSFER_MAX_CHANCE = max(0.05, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_MAX_CHANCE", 0.95)))
+DEVICE_TRANSFER_COOLDOWN_SECONDS = max(0, int_from_env("TFBOT_DEVICE_TRANSFER_COOLDOWN_SECONDS", 60))
+DEVICE_TRANSFER_MULTI_ACTIVE_BOOST = max(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_MULTI_ACTIVE_BOOST", 2.0))
+DEVICE_TRANSFER_MULTI_ACTIVE_FLOOR = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_TRANSFER_MULTI_ACTIVE_FLOOR", 0.35)))
+DEVICE_FORCE_TRANSFER_AFTER_COMMANDS = max(0, int_from_env("TFBOT_DEVICE_FORCE_TRANSFER_AFTER_COMMANDS", 12))
+DEVICE_MAX_HOLD_SECONDS = max(0, int_from_env("TFBOT_DEVICE_MAX_HOLD_SECONDS", 7200))
+DEVICE_REPEAT_WINDOW_HOURS = max(0.0, float_from_env("TFBOT_DEVICE_REPEAT_WINDOW_HOURS", 14.0))
+DEVICE_REPEAT_DECAY = max(0.0, min(1.0, float_from_env("TFBOT_DEVICE_REPEAT_DECAY", 0.5)))
+_DEVICE_HISTORY_VERBOSE = os.getenv("TFBOT_DEVICE_HISTORY_VERBOSE", "0").strip().lower() in {"1", "true", "yes", "on"}
+DEVICE_ASSIGNMENT_HISTORY_CAP = max(8, int_from_env("TFBOT_DEVICE_ASSIGNMENT_HISTORY_CAP", 64))
 
 # Overlay state (swap/clone visual overrides)
 overlay_records: Dict[TransformKey, Dict[str, object]] = {}
@@ -1002,6 +1010,7 @@ device_commands_since_transfer: Dict[int, int] = {}
 device_last_command_at: Dict[int, datetime] = {}
 device_assigned_at: Dict[int, datetime] = {}
 device_last_transfer_at: Dict[int, datetime] = {}
+device_assignment_history: Dict[int, List[Dict[str, object]]] = {}
 
 
 def _sync_panel_device_holders() -> None:
@@ -1063,12 +1072,23 @@ def _serialize_overlay_state() -> Dict[str, object]:
         }
         for guild_id in set(device_holder_by_guild.keys()) | set(device_commands_since_transfer.keys())
     ]
+    history_payload: List[Dict[str, object]] = []
+    for guild_id, rows in device_assignment_history.items():
+        for row in rows:
+            history_payload.append(
+                {
+                    "guild_id": guild_id,
+                    "user_id": int(row["user_id"]),
+                    "at": str(row["at"]),
+                }
+            )
     return {
         "overlay_records": records_payload,
         "last_active_tf": active_payload,
         "device_holders": device_payload,
         "device_battery": battery_payload,
         "device_telemetry": telemetry_payload,
+        "device_assignment_history": history_payload,
     }
 
 
@@ -1096,6 +1116,7 @@ def _load_overlay_state() -> None:
     prev_device_last_command_at = dict(device_last_command_at)
     prev_device_assigned_at = dict(device_assigned_at)
     prev_device_last_transfer_at = dict(device_last_transfer_at)
+    prev_device_assignment_history = {k: list(v) for k, v in device_assignment_history.items()}
     overlay_records.clear()
     overlay_group_members.clear()
     last_active_tf.clear()
@@ -1106,6 +1127,7 @@ def _load_overlay_state() -> None:
     device_last_command_at.clear()
     device_assigned_at.clear()
     device_last_transfer_at.clear()
+    device_assignment_history.clear()
     if not OVERLAY_STATE_FILE.exists():
         _sync_panel_device_holders()
         return
@@ -1123,6 +1145,8 @@ def _load_overlay_state() -> None:
         device_last_command_at.update(prev_device_last_command_at)
         device_assigned_at.update(prev_device_assigned_at)
         device_last_transfer_at.update(prev_device_last_transfer_at)
+        device_assignment_history.clear()
+        device_assignment_history.update({k: list(v) for k, v in prev_device_assignment_history.items()})
         _rebuild_overlay_groups()
         _sync_panel_device_holders()
         return
@@ -1178,6 +1202,22 @@ def _load_overlay_state() -> None:
                     device_last_transfer_at[gid] = parsed_transfer
         except Exception:
             continue
+    for row in payload.get("device_assignment_history", []):
+        try:
+            gid = int(row["guild_id"])
+            uid = int(row["user_id"])
+            at_raw = row.get("at")
+            if at_raw is None:
+                continue
+            device_assignment_history.setdefault(gid, []).append({"user_id": uid, "at": str(at_raw)})
+        except Exception:
+            continue
+    for gid, rows in list(device_assignment_history.items()):
+        trimmed = rows[-DEVICE_ASSIGNMENT_HISTORY_CAP:]
+        if trimmed:
+            device_assignment_history[gid] = trimmed
+        else:
+            device_assignment_history.pop(gid, None)
     now = utc_now()
     for gid in device_holder_by_guild:
         device_assigned_at.setdefault(gid, now)
@@ -1243,6 +1283,28 @@ def _has_clone_overlay(guild_id: int, user_id: int) -> bool:
     return str(record.get("overlay_type") or "").strip().lower() == "clone"
 
 
+def _resolve_clone_root_source_user_id(guild_id: int, source_user_id: int) -> int:
+    seen: set[int] = set()
+    uid = int(source_user_id)
+    while True:
+        if uid in seen:
+            return uid
+        seen.add(uid)
+        rec = overlay_records.get((guild_id, uid))
+        if not isinstance(rec, Mapping):
+            break
+        if str(rec.get("overlay_type") or "").strip().lower() != "clone":
+            break
+        raw = rec.get("source_user_id")
+        if raw is None:
+            break
+        try:
+            uid = int(raw)
+        except (TypeError, ValueError):
+            break
+    return uid
+
+
 def _is_overlay_visual_source_locked(guild_id: int, source_user_id: int) -> bool:
     for (g_id, _), rec in overlay_records.items():
         if g_id != guild_id:
@@ -1306,7 +1368,9 @@ def _device_precheck_message(
 def _log_device_command_use(member: discord.Member, command_name: str, guild_id: int) -> None:
     if not has_device_privilege(member, guild_id):
         return
-    logger.error("device_use: guild=%s user=%s command=%s", guild_id, member.id, command_name)
+    logger.info("device_use: guild=%s user=%s command=%s", guild_id, member.id, command_name)
+    if not _DEVICE_HISTORY_VERBOSE:
+        return
     try:
         bot.loop.create_task(
             send_history_message(
@@ -1334,6 +1398,51 @@ def _device_transfer_probability(guild_id: int) -> float:
         + (idle_minutes * DEVICE_TRANSFER_IDLE_BONUS_PER_MIN)
     )
     return max(0.0, min(chance, DEVICE_TRANSFER_MAX_CHANCE))
+
+
+def _device_transfer_probability_scaled(guild_id: int, eligible_count: int) -> float:
+    p = _device_transfer_probability(guild_id)
+    if eligible_count >= 2:
+        p = min(1.0, p * DEVICE_TRANSFER_MULTI_ACTIVE_BOOST)
+        p = max(p, DEVICE_TRANSFER_MULTI_ACTIVE_FLOOR)
+    return max(0.0, min(1.0, p))
+
+
+def _list_device_eligible_user_ids(guild: discord.Guild, *, now: Optional[datetime] = None) -> List[int]:
+    now = now or utc_now()
+    eligible: List[int] = []
+    for (g_id, user_id), seen_at in last_active_tf.items():
+        if g_id != guild.id:
+            continue
+        if _is_device_eligible_user(guild, user_id, seen_at=seen_at, now=now):
+            eligible.append(user_id)
+    return eligible
+
+
+def _device_repeat_assignment_weight_multiplier(guild_id: int, user_id: int, *, now: datetime) -> float:
+    if DEVICE_REPEAT_WINDOW_HOURS <= 0 or DEVICE_REPEAT_DECAY >= 0.999:
+        return 1.0
+    window = timedelta(hours=DEVICE_REPEAT_WINDOW_HOURS)
+    hist = device_assignment_history.get(guild_id, [])
+    count = 0
+    for row in hist:
+        try:
+            uid = int(row.get("user_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if uid != user_id:
+            continue
+        at = _parse_iso_utc(row.get("at"))
+        if at is None or now - at > window:
+            continue
+        count += 1
+    return max(DEVICE_REPEAT_DECAY**count, 1e-9)
+
+
+def _append_device_assignment_history(guild_id: int, user_id: int, at: datetime) -> None:
+    rows = device_assignment_history.setdefault(guild_id, [])
+    rows.append({"user_id": int(user_id), "at": at.isoformat()})
+    device_assignment_history[guild_id] = rows[-DEVICE_ASSIGNMENT_HISTORY_CAP:]
 
 
 def _device_transfer_on_cooldown(guild_id: int) -> bool:
@@ -1367,21 +1476,51 @@ def _device_note_success(member: discord.Member, guild_id: int, command_name: st
 def _maybe_schedule_device_transfer(guild_id: int, *, trigger: str) -> None:
     if not _DEVICE_DYNAMIC_TRANSFER_ENABLED:
         return
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+    eligible_ids = _list_device_eligible_user_ids(guild)
+    eligible_count = len(eligible_ids)
+    if eligible_count == 0:
+        return
+    old_holder = device_holder_by_guild.get(guild_id)
+    eligible_set = set(eligible_ids)
+    if old_holder is not None and old_holder not in eligible_set:
+        try:
+            bot.loop.create_task(_rotate_device_once(guild))
+        except Exception:
+            pass
+        return
+    if eligible_count == 1 and old_holder is not None and eligible_ids[0] == old_holder:
+        return
+    skip_roll = False
+    if eligible_count >= 2:
+        cmds = max(0, int(device_commands_since_transfer.get(guild_id, 0)))
+        if DEVICE_FORCE_TRANSFER_AFTER_COMMANDS > 0 and cmds >= DEVICE_FORCE_TRANSFER_AFTER_COMMANDS:
+            skip_roll = True
+        if not skip_roll and DEVICE_MAX_HOLD_SECONDS > 0:
+            assigned = _coerce_utc(device_assigned_at.get(guild_id))
+            if assigned is not None and (utc_now() - assigned).total_seconds() >= DEVICE_MAX_HOLD_SECONDS:
+                skip_roll = True
+    if skip_roll:
+        try:
+            bot.loop.create_task(_rotate_device_once(guild))
+        except Exception:
+            pass
+        return
     if _device_transfer_on_cooldown(guild_id):
         return
-    chance = _device_transfer_probability(guild_id)
+    chance = _device_transfer_probability_scaled(guild_id, eligible_count)
     roll = random.random()
     logger.info(
-        "device-transfer-check guild=%s trigger=%s chance=%.3f roll=%.3f",
+        "device-transfer-check guild=%s trigger=%s chance=%.3f roll=%.3f eligible=%s",
         guild_id,
         trigger,
         chance,
         roll,
+        eligible_count,
     )
     if roll > chance:
-        return
-    guild = bot.get_guild(guild_id)
-    if guild is None:
         return
     try:
         bot.loop.create_task(_rotate_device_once(guild))
@@ -1453,7 +1592,13 @@ def _pick_device_eligible_user(guild: discord.Guild, *, exclude_user_id: Optiona
             candidates.append(user_id)
     if not candidates:
         return None
-    return random.choice(candidates)
+    if len(candidates) == 1:
+        return candidates[0]
+    weights = [_device_repeat_assignment_weight_multiplier(guild.id, uid, now=now) for uid in candidates]
+    total_w = sum(weights)
+    if total_w <= 0:
+        return random.choice(candidates)
+    return random.choices(candidates, weights=weights, k=1)[0]
 
 
 def _is_device_eligible_user(
@@ -1499,11 +1644,13 @@ async def _commit_device_transfer(guild: discord.Guild, old_holder: Optional[int
     device_assigned_at[guild.id] = now
     device_last_transfer_at[guild.id] = now
     device_commands_since_transfer[guild.id] = 0
+    _append_device_assignment_history(guild.id, new_holder, now)
     _sync_panel_device_holders()
     _sync_device_battery(guild.id)
     _persist_overlay_state()
-    logger.error("device_transfer: guild=%s old=%s new=%s", guild.id, old_holder, new_holder)
-    await send_history_message("Device Transfer", f"Guild: {guild.id}\nOld: {old_holder}\nNew: {new_holder}")
+    logger.info("device_transfer: guild=%s old=%s new=%s", guild.id, old_holder, new_holder)
+    if _DEVICE_HISTORY_VERBOSE:
+        await send_history_message("Device Transfer", f"Guild: {guild.id}\nOld: {old_holder}\nNew: {new_holder}")
     await _announce_device_transfer(guild, old_holder, new_holder)
 
 
@@ -1520,22 +1667,71 @@ async def _announce_device_transfer(guild: discord.Guild, old_holder: Optional[i
         logger.error("Device transfer announcement failed in guild %s: %s", guild.id, exc)
 
 
+async def _maybe_device_strip_holder_for_special_form(
+    guild: discord.Guild,
+    member_user_id: int,
+    new_state: TransformationState,
+) -> None:
+    if device_holder_by_guild.get(guild.id) != member_user_id:
+        return
+    if not (_has_special_reroll_access(new_state) or _state_has_privileged_access(new_state)):
+        return
+    old = member_user_id
+    new_holder = _pick_device_eligible_user(guild, exclude_user_id=old)
+    if new_holder is None:
+        new_holder = _pick_device_eligible_user(guild)
+    if new_holder is None or new_holder == old:
+        return
+    await _commit_device_transfer(guild, old, new_holder)
+
+
 async def _rotate_device_once(guild: discord.Guild, force_announce: bool = False) -> None:
     old_holder = device_holder_by_guild.get(guild.id)
-    if old_holder is not None and not force_announce and _DEVICE_DYNAMIC_TRANSFER_ENABLED:
-        if _device_transfer_on_cooldown(guild.id):
-            return
-        chance = _device_transfer_probability(guild.id)
-        roll = random.random()
-        logger.info(
-            "device-transfer-loop-check guild=%s chance=%.3f roll=%.3f commands_since_transfer=%s",
-            guild.id,
-            chance,
-            roll,
-            device_commands_since_transfer.get(guild.id, 0),
-        )
-        if roll > chance:
-            return
+    eligible_ids = _list_device_eligible_user_ids(guild)
+    eligible_count = len(eligible_ids)
+    eligible_set = set(eligible_ids)
+
+    if eligible_count == 0:
+        return
+
+    if old_holder is not None and old_holder not in eligible_set:
+        new_holder = _pick_device_eligible_user(guild, exclude_user_id=old_holder)
+        if new_holder is None:
+            new_holder = _pick_device_eligible_user(guild)
+        if new_holder is not None and new_holder != old_holder:
+            await _commit_device_transfer(guild, old_holder, new_holder)
+        return
+
+    if not force_announce and eligible_count == 1 and old_holder is not None and eligible_ids[0] == old_holder:
+        return
+
+    skip_chance = bool(force_announce)
+    if not skip_chance and _DEVICE_DYNAMIC_TRANSFER_ENABLED and eligible_count >= 2:
+        cmds = max(0, int(device_commands_since_transfer.get(guild.id, 0)))
+        if DEVICE_FORCE_TRANSFER_AFTER_COMMANDS > 0 and cmds >= DEVICE_FORCE_TRANSFER_AFTER_COMMANDS:
+            skip_chance = True
+        if not skip_chance and DEVICE_MAX_HOLD_SECONDS > 0:
+            assigned = _coerce_utc(device_assigned_at.get(guild.id))
+            if assigned is not None and (utc_now() - assigned).total_seconds() >= DEVICE_MAX_HOLD_SECONDS:
+                skip_chance = True
+
+    if not skip_chance and not force_announce and _DEVICE_DYNAMIC_TRANSFER_ENABLED:
+        if old_holder is not None:
+            if _device_transfer_on_cooldown(guild.id):
+                return
+            chance = _device_transfer_probability_scaled(guild.id, eligible_count)
+            roll = random.random()
+            logger.info(
+                "device-transfer-loop-check guild=%s chance=%.3f roll=%.3f commands_since_transfer=%s eligible=%s",
+                guild.id,
+                chance,
+                roll,
+                device_commands_since_transfer.get(guild.id, 0),
+                eligible_count,
+            )
+            if roll > chance:
+                return
+
     new_holder = _pick_device_eligible_user(
         guild,
         exclude_user_id=old_holder if (old_holder is not None and not force_announce) else None,
@@ -1583,7 +1779,10 @@ def _device_status_text(guild: discord.Guild) -> str:
     holder_id = device_holder_by_guild.get(guild.id)
     battery = _sync_device_battery(guild.id)
     command_count = max(0, int(device_commands_since_transfer.get(guild.id, 0)))
-    chance_now = _device_transfer_probability(guild.id) if _DEVICE_DYNAMIC_TRANSFER_ENABLED else 0.0
+    eligible_n = len(_list_device_eligible_user_ids(guild))
+    chance_now = (
+        _device_transfer_probability_scaled(guild.id, eligible_n) if _DEVICE_DYNAMIC_TRANSFER_ENABLED else 0.0
+    )
     last_cmd = device_last_command_at.get(guild.id)
     if last_cmd is None:
         last_cmd = device_assigned_at.get(guild.id)
@@ -1596,6 +1795,11 @@ def _device_status_text(guild: discord.Guild) -> str:
     else:
         member = guild.get_member(holder_id)
         holder_text = member.display_name if member is not None else str(holder_id)
+    tenure_line = "Held by current holder: N/A"
+    if holder_id:
+        held_since = _coerce_utc(device_assigned_at.get(guild.id))
+        if held_since is not None:
+            tenure_line = f"Held by current holder: {_humanize_timedelta(utc_now() - held_since)}"
     if battery >= DEVICE_BATTERY_MAX - 1e-9:
         eta_text = "fully charged now"
     else:
@@ -1605,6 +1809,7 @@ def _device_status_text(guild: discord.Guild) -> str:
         eta_text = f"full in ~{minutes} minute(s)"
     return (
         f"Device holder: {holder_text}\n"
+        f"{tenure_line}\n"
         f"Battery: {battery:.0f}% ({eta_text})\n"
         f"Transfer pressure: {chance_now*100:.0f}% (uses since transfer: {command_count}, idle: {idle_text})\n"
         "Costs: low 10% (`say`,`swap`) | medium 20% (`revert`) | high 45% (`reroll`,`clone`,`genderswap`,`ageswap`) | all-target 90%"
@@ -3119,6 +3324,18 @@ def _detach_overlay_member_from_group(key: TransformKey, group_id: str) -> None:
         _cancel_overlay_group_task(group_id)
 
 
+def _strip_vn_swap_participant_overlays(guild_id: int, user_id1: int, user_id2: int) -> None:
+    for uid in (user_id1, user_id2):
+        key = state_key(guild_id, uid)
+        record = overlay_records.pop(key, None)
+        if not isinstance(record, Mapping):
+            continue
+        group_id = str(record.get("group_id") or "").strip()
+        if group_id:
+            _detach_overlay_member_from_group(key, group_id)
+    _persist_overlay_state()
+
+
 async def _revert_overlay_for_user(
     guild_id: int,
     user_id: int,
@@ -3308,6 +3525,14 @@ def _register_relay_message(message_id: int, author: str, text: str) -> None:
     logger.debug("Reply log registered id=%s author=%s text=%s", message_id, author, text[:120])
 
 
+def _meaningful_reply_body_text(content: Optional[str]) -> str:
+    """Return visible reply body text; strip Discord placeholder chars (e.g. ZWSP on attachment-only bot posts)."""
+    if not content:
+        return ""
+    s = content.strip().replace("\u200b", "").replace("\ufeff", "")
+    return s.strip()
+
+
 async def _resolve_reply_context(message: discord.Message) -> Optional[ReplyContext]:
     reference = message.reference
     if not reference or not reference.message_id:
@@ -3335,9 +3560,9 @@ async def _resolve_reply_context(message: discord.Message) -> Optional[ReplyCont
         target_msg.author, "name", "Unknown"
     )
 
-    content = (target_msg.content or "").strip()
-    if content:
-        context = ReplyContext(author=author, text=content)
+    meaningful = _meaningful_reply_body_text(target_msg.content)
+    if meaningful:
+        context = ReplyContext(author=author, text=meaningful)
         TRANSFORM_MESSAGE_LOG[reference.message_id] = context
         _persist_reply_log()
         logger.debug("Reply context resolved from message %s", reference.message_id)
@@ -3349,13 +3574,26 @@ async def _resolve_reply_context(message: discord.Message) -> Optional[ReplyCont
     if target_msg.embeds:
         embed = target_msg.embeds[0]
         if embed.description:
-            context = ReplyContext(author=author, text=embed.description.strip())
-            TRANSFORM_MESSAGE_LOG[reference.message_id] = context
-            _persist_reply_log()
-            logger.debug("Reply context resolved from embed %s", reference.message_id)
-            return context
+            desc_meaningful = _meaningful_reply_body_text(embed.description)
+            if desc_meaningful:
+                context = ReplyContext(author=author, text=desc_meaningful)
+                TRANSFORM_MESSAGE_LOG[reference.message_id] = context
+                _persist_reply_log()
+                logger.debug("Reply context resolved from embed %s", reference.message_id)
+                return context
 
     return None
+
+
+def _should_skip_tf_relay_for_discord_native(message: discord.Message) -> bool:
+    """True for polls and non-chat message types: do not replace or delete the original.
+
+    User chat uses ``MessageType.default``; Discord's reply UI uses ``MessageType.reply``—both relay.
+    """
+    if getattr(message, "poll", None) is not None:
+        return True
+    allowed_chat_types = {discord.MessageType.default, discord.MessageType.reply}
+    return message.type not in allowed_chat_types
 
 
 async def relay_transformed_message(
@@ -3372,6 +3610,8 @@ async def relay_transformed_message(
 ) -> bool:
     guild = message.guild
     if guild is None:
+        return False
+    if _should_skip_tf_relay_for_discord_native(message):
         return False
 
     selection_scope = _selection_scope_for_channel(message.channel)
@@ -3430,6 +3670,15 @@ async def relay_transformed_message(
         if has_mentions:
             cleaned_content = apply_mention_placeholders(mention_ready_text, mention_lookup)
 
+    has_attachments = bool(message.attachments)
+    has_stickers = bool(getattr(message, "stickers", None))
+    skip_vn_panel_for_media_only = (
+        MESSAGE_STYLE == "vn"
+        and not state.is_inanimate
+        and not cleaned_content
+        and (has_attachments or has_links or has_stickers)
+    )
+
     description = cleaned_content if cleaned_content else "*no message content*"
     formatted_segments = parse_discord_formatting(cleaned_content) if cleaned_content else []
     custom_emoji_images: Dict[str, "Image.Image"] = {}
@@ -3437,7 +3686,7 @@ async def relay_transformed_message(
     files: list[discord.File] = []
     payload: dict = {}
 
-    if MESSAGE_STYLE == "vn" and not state.is_inanimate:
+    if MESSAGE_STYLE == "vn" and not state.is_inanimate and not skip_vn_panel_for_media_only:
         custom_emoji_images = await prepare_custom_emoji_images(message, formatted_segments)
         if reply_context:
             logger.debug(
@@ -3470,7 +3719,7 @@ async def relay_transformed_message(
         else:
             logger.debug("VN panel rendering unavailable; using classic embed.")
 
-    if not files:
+    if not files and not skip_vn_panel_for_media_only:
         embed, avatar_file = await build_legacy_embed(
             state, description, selection_scope=state_selection_scope
         )
@@ -3478,9 +3727,7 @@ async def relay_transformed_message(
             files.append(avatar_file)
         payload["embed"] = embed
 
-
-    has_attachments = bool(message.attachments)
-    preserve_original = has_attachments or has_links
+    preserve_original = has_attachments or has_links or has_stickers
     deleted = False
     if not preserve_original:
         deleted = True
@@ -3500,6 +3747,16 @@ async def relay_transformed_message(
         except discord.HTTPException as exc:
             deleted = False
             logger.warning("Failed to delete message %s: %s", message.id, exc)
+
+    if skip_vn_panel_for_media_only:
+        if has_attachments and not has_links:
+            placeholder = "\u200b"
+            if message.content != placeholder:
+                try:
+                    await message.edit(content=placeholder, attachments=message.attachments, suppress=True)
+                except discord.HTTPException as exc:
+                    logger.debug("Unable to clear attachment message %s: %s", message.id, exc)
+        return True
 
     if not deleted and "embed" in payload:
         payload["embed"].set_footer(text="Grant Manage Messages so TF relay can replace posts.")
@@ -3521,8 +3778,12 @@ async def relay_transformed_message(
         logger.warning("Failed to relay TF message %s: %s", message.id, exc)
         return False
 
-    if sent_message and cleaned_content:
-        _register_relay_message(sent_message.id, state.character_name, cleaned_content)
+    if sent_message:
+        _register_relay_message(
+            sent_message.id,
+            state.character_name,
+            cleaned_content if cleaned_content else "(panel)",
+        )
 
     if has_attachments and not has_links:
         placeholder = "\u200b"
@@ -6139,6 +6400,8 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
     placeholder_key: Optional[TransformKey] = None
     placeholder_state: Optional[TransformationState] = None
     target_selected = False
+    # Set when target resolves via non-mention `_find_state_by_token` (first or combined token).
+    reroll_name_anchor_token: Optional[str] = None
 
     def cleanup_placeholder() -> None:
         nonlocal placeholder_key, placeholder_state
@@ -6194,6 +6457,8 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     state = placeholder
             else:
                 state = _find_state_by_token(guild, first)
+                if state is not None:
+                    reroll_name_anchor_token = first.strip()
             if state is None:
                 potential_member = discord.utils.find(
                     lambda m: m.name.lower() == first.lower()
@@ -6231,6 +6496,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                                 non_filter_tokens.clear()
                         else:
                             state = combined_state
+                            reroll_name_anchor_token = combined_target.strip()
                             non_filter_tokens.clear()
                     if state is None:
                         _reroll_diag_log(
@@ -6372,17 +6638,6 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
             )
             return None
 
-        if (
-            target_selected
-            and target_member is not None
-            and target_member.id != author.id
-            and not author_can_reroll_elite
-        ):
-            await _reroll_reply(
-                "Users cannot target reroll. Ask an admin, moderator, Device holder, or eligible special form user."
-            )
-            return None
-
         if not bulk_mode and device_only_actor:
             cost = _device_cost_for_command("reroll")
             battery = _sync_device_battery(guild.id)
@@ -6425,13 +6680,6 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                     mention_author=False,
                 )
                 return None
-
-        if target_member.id == author.id and not author_can_reroll_elite and not filter_value:
-            await ctx.reply(
-                "You can't use your own reroll. Ask another player, admin, or moderator.",
-                mention_author=False,
-            )
-            return None
 
         if forced_token_blocked:
             await ctx.reply(
@@ -6516,6 +6764,25 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
                 mention_author=False,
             )
             return None
+
+        if (
+            reroll_name_anchor_token
+            and not state.is_inanimate
+            and (state.character_name or "").strip()
+        ):
+            anchor = _identity_pool_name_best_match_for_token(
+                state.character_name, reroll_name_anchor_token
+            )
+            if anchor:
+                ch = CHARACTER_BY_NAME.get(anchor.strip().lower())
+                cur = (state.character_name or "").strip()
+                if ch and anchor.strip().lower() != cur.lower():
+                    state.character_name = ch.name
+                    state.character_folder = ch.folder
+                    state.character_avatar_path = ch.avatar_path
+                    state.character_message = ch.message
+                    state.avatar_applied = False
+                    persist_states()
 
         if not suppress_messages:
             reroll_speech_gate_key = key
@@ -6832,6 +7099,7 @@ async def reroll_command(ctx: commands.Context, *, args: str = ""):
         if not bulk_mode:
             if getattr(ctx, "_reroll_device_other_paid_battery", None) is not False:
                 _device_record_success(author, author_state, guild.id, "reroll")
+        await _maybe_device_strip_holder_for_special_form(guild, target_member.id, state)
         setattr(ctx, "_bulk_reroll_applied", True)
 
         history_details = (
@@ -7768,6 +8036,13 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
             await send_channel_feedback(message_text)
         return
 
+    author_state_self: Optional[TransformationState] = None
+    old_self_bg: Optional[Path] = None
+    if ctx.guild is not None:
+        author_state_self = find_active_transformation(ctx.author.id, ctx.guild.id)
+        if author_state_self is not None and not author_state_self.is_inanimate:
+            old_self_bg = get_selected_background_path(ctx.author.id)
+
     if not set_selected_background(ctx.author.id, selected_path):
         try:
             await ctx.author.send("Unable to update your background at this time.")
@@ -7782,6 +8057,31 @@ async def background_command(ctx: commands.Context, *, selection: str = ""):
         if ctx.guild:
             await ctx.send("I couldn't DM you. Please enable direct messages.", delete_after=10)
     schedule_history_refresh()
+    if (
+        ctx.guild is not None
+        and author_state_self is not None
+        and not author_state_self.is_inanimate
+        and old_self_bg is not None
+    ):
+        message_text = f"<@{ctx.author.id}> moved {_background_target_label(ctx.guild, author_state_self)} to `{display}`."
+        transition_started = time.perf_counter()
+        transition_file = await _render_background_transition_file_cached(
+            state=author_state_self,
+            old_background_path=old_self_bg,
+            new_background_path=selected_path,
+            filename=f"bg_{ctx.author.id}.webp",
+            selection_scope=selection_scope,
+        )
+        if transition_file is not None:
+            await send_channel_feedback(
+                message_text,
+                file=transition_file,
+                metrics_label="background_transition_send",
+                render_ms=(time.perf_counter() - transition_started) * 1000.0,
+                started_at=transition_started,
+            )
+        else:
+            await send_channel_feedback(message_text)
 
 
 @bot.tree.command(name="bg", description="Select or manage VN backgrounds.")
@@ -8495,8 +8795,12 @@ async def _handle_slash_say(
         await interaction.followup.send("Couldn't deliver that panel.", ephemeral=True)
         return
 
-    if sent_message and cleaned_content:
-        _register_relay_message(sent_message.id, target_state.character_name, cleaned_content)
+    if sent_message:
+        _register_relay_message(
+            sent_message.id,
+            target_state.character_name,
+            cleaned_content if cleaned_content else "(panel)",
+        )
     if enforce_permissions:
         _device_record_success(actor, actor_state, guild.id, "say")
 
@@ -9047,31 +9351,83 @@ def _token_variants(token: str) -> set[str]:
     if "_" in normalized_token:
         _add(normalized_token.replace("_", " "))
         _add(normalized_token.replace("_", ""))
-        _add(normalized_token.split("_", 1)[0])
     if "-" in normalized_token:
         _add(normalized_token.replace("-", " "))
         _add(normalized_token.replace("-", ""))
-        _add(normalized_token.split("-", 1)[0])
-    alnum_only = re.sub(r"[^a-z0-9 ]+", "", normalized_token).strip()
-    if alnum_only and alnum_only != normalized_token:
-        _add(alnum_only)
-        _add(alnum_only.replace(" ", ""))
-        _add(alnum_only.split(" ", 1)[0])
     return variants
+
+
+def _pool_name_first_token_lower(name: str) -> str:
+    """First space-delimited word of a pool display name (4.8-style short targeting)."""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    return s.split(" ", 1)[0].strip().lower()
 
 
 def _name_matches_token(name: str, token: str) -> bool:
     name_normalized = (name or "").strip().lower()
     if not name_normalized:
         return False
-    first_token = name_normalized.split(" ", 1)[0]
     variants = _token_variants(token)
     if not variants:
         return False
+    identity_names = [n for n in identity_names_for_character_name(name) if (n or "").strip()]
+    identity_lower = {n.strip().lower() for n in identity_names}
+    first_words: set[str] = set()
+    fw0 = _pool_name_first_token_lower(name)
+    if fw0:
+        first_words.add(fw0)
+    for n in identity_names:
+        fw = _pool_name_first_token_lower(n)
+        if fw:
+            first_words.add(fw)
     for variant in variants:
-        if variant == name_normalized or variant == first_token:
+        if variant == name_normalized or variant in identity_lower:
+            return True
+        if variant in first_words:
             return True
     return False
+
+
+def _identity_pool_name_best_match_for_token(identity_root_name: str, token: str) -> Optional[str]:
+    """Best pool ``name`` in the identity group for ``identity_root_name`` that matches ``token``.
+
+    When multiple names match (e.g. full name vs first-word), prefer a full-string match to the token
+    over first-word-only; if still tied, prefer ``identity_root_name`` when it is among hits, else a
+    deterministic shortest-then-alphabetical choice.
+    """
+    root = (identity_root_name or "").strip()
+    tok = (token or "").strip()
+    if not root or not tok:
+        return None
+    group = identity_names_for_character_name(root)
+    if not group:
+        return None
+    hits = [n for n in group if _name_matches_token(n, tok)]
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    token_lower = tok.lower()
+    variants = _token_variants(tok)
+
+    def full_string_match(n: str) -> bool:
+        nl = n.strip().lower()
+        return nl == token_lower or nl in variants
+
+    full_hits = [n for n in hits if full_string_match(n)]
+    if len(full_hits) == 1:
+        return full_hits[0]
+    if len(full_hits) > 1:
+        r = root.strip()
+        if r in full_hits:
+            return r
+        return sorted(full_hits, key=lambda x: (len(x.strip()), x.lower()))[0]
+    r = root.strip()
+    if r in hits:
+        return r
+    return sorted(hits, key=lambda x: (len(x.strip()), x.lower()))[0]
 
 
 def _character_matches_token(character: TFCharacter, token: str) -> bool:
@@ -9087,42 +9443,53 @@ def _character_matches_token(character: TFCharacter, token: str) -> bool:
         for folder_candidate in folder_candidates:
             if folder_candidate in variants:
                 return True
-    name_normalized = character.name.lower()
-    first_token = name_normalized.split(" ", 1)[0]
+    name_normalized = character.name.strip().lower()
+    identity_names = [n for n in identity_names_for_character_name(character.name) if (n or "").strip()]
+    identity_lower = {n.strip().lower() for n in identity_names}
+    first_words: set[str] = set()
+    fw0 = _pool_name_first_token_lower(character.name)
+    if fw0:
+        first_words.add(fw0)
+    for n in identity_names:
+        fw = _pool_name_first_token_lower(n)
+        if fw:
+            first_words.add(fw)
     for variant in variants:
-        if variant == name_normalized or variant == first_token:
+        if variant == name_normalized or variant in identity_lower:
+            return True
+        if variant in first_words:
             return True
     return False
 
 
 def _variant_family_candidates_for_token(guild: discord.Guild, token: str) -> List[TransformationState]:
-    """Find active states that look like variant forms of a base token."""
-    base_variants = {v for v in _token_variants(token) if len(v) >= 4}
-    if not base_variants:
+    """Find active states whose pack-linked identity or folder token intersects the user's token variants."""
+    variants = _token_variants(token)
+    if not variants:
         return []
     matches: List[TransformationState] = []
     seen_users: set[int] = set()
     for state in active_transformations.values():
         if state.guild_id != guild.id:
             continue
-        state_tokens = {(state.character_name or "").strip().lower()}
+        cname = (state.character_name or "").strip()
+        if not cname:
+            continue
+        state_names: set[str] = set()
+        for n in identity_names_for_character_name(cname):
+            t = (n or "").strip()
+            if not t:
+                continue
+            state_names.add(t.lower())
+            fw = _pool_name_first_token_lower(t)
+            if fw:
+                state_names.add(fw)
         folder_token = _state_folder_token(state)
         if folder_token:
-            state_tokens.add(folder_token.lower())
-        candidate_hit = False
-        for candidate in state_tokens:
-            if not candidate:
-                continue
-            for base in base_variants:
-                if candidate == base or not candidate.startswith(base):
-                    continue
-                suffix = candidate[len(base):]
-                if suffix and re.fullmatch(r"[a-z0-9_\\-]+", suffix):
-                    candidate_hit = True
-                    break
-            if candidate_hit:
-                break
-        if candidate_hit and state.user_id not in seen_users:
+            state_names.add(folder_token.lower())
+            folder_norm = folder_token.replace("\\", "/").strip("/").lower()
+            state_names.add(folder_norm.rsplit("/", 1)[-1])
+        if variants & state_names and state.user_id not in seen_users:
             seen_users.add(state.user_id)
             matches.append(state)
     matches.sort(key=lambda s: ((s.character_name or "").lower(), int(s.user_id)))
@@ -9137,6 +9504,7 @@ def _find_clone_source_state_by_token(
     """Match token to frozen clone-source snapshot labels; return that source user's state if unambiguous."""
     if not token_variants:
         return None
+    slug_intent = "_" in normalized or "-" in normalized
     matched_source_ids: set[int] = set()
     for (g_id, _target_uid), record in overlay_records.items():
         if g_id != guild.id:
@@ -9154,7 +9522,7 @@ def _find_clone_source_state_by_token(
         if (
             _name_matches_token(label, normalized)
             or visible_normalized in token_variants
-            or visible_first in token_variants
+            or (not slug_intent and visible_first in token_variants)
         ):
             matched_source_ids.add(sid)
     if len(matched_source_ids) != 1:
@@ -9174,10 +9542,23 @@ def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[Transform
         if state:
             return state
     token_variants = _token_variants(normalized)
+    slug_intent = "_" in normalized or "-" in normalized
 
     clone_source_state = _find_clone_source_state_by_token(guild, normalized, token_variants)
     if clone_source_state is not None:
         return clone_source_state
+
+    pack_file = _get_loaded_pack_file_for_reroll(normalized)
+    if pack_file:
+        pack_matches: List[TransformationState] = []
+        for state in active_transformations.values():
+            if state.guild_id != guild.id:
+                continue
+            entry = CHARACTER_BY_NAME.get((state.character_name or "").strip().lower())
+            if entry is not None and getattr(entry, "_pack_name", None) == pack_file:
+                pack_matches.append(state)
+        if len(pack_matches) == 1:
+            return pack_matches[0]
 
     # Visible VN identity first. This is what users intuitively mean when they
     # target a swapped name like "riley".
@@ -9197,7 +9578,9 @@ def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[Transform
         if visible_name:
             visible_normalized = visible_name.strip().lower()
             visible_first = visible_normalized.split(" ", 1)[0]
-            if visible_normalized in token_variants or visible_first in token_variants:
+            if visible_normalized in token_variants or (
+                not slug_intent and visible_first in token_variants
+            ):
                 return state
 
     # Then resolve by the real person behind the state.
@@ -9214,11 +9597,11 @@ def _find_state_by_token(guild: discord.Guild, token: str) -> Optional[Transform
             username_first = username.split(" ", 1)[0]
             if (
                 profile in token_variants
-                or profile_first in token_variants
+                or (not slug_intent and profile_first in token_variants)
                 or display in token_variants
-                or display_first in token_variants
+                or (not slug_intent and display_first in token_variants)
                 or username in token_variants
-                or username_first in token_variants
+                or (not slug_intent and username_first in token_variants)
             ):
                 return state
 
@@ -9294,14 +9677,13 @@ def _resolve_forced_reroll_token(
         return forced_character, None
 
     token_variants = _token_variants(normalized)
-    # Inanimate tokens: 4.5-style first word or full name match
+    # Inanimate: full normalized name only (underscore/space variants via _token_variants).
     for entry in INANIMATE_FORMS:
         raw = str(entry.get("name", "")).strip()
         if not raw:
             continue
         name_lower = raw.lower()
-        first_lower = name_lower.split(" ", 1)[0]
-        if name_lower in token_variants or first_lower in token_variants:
+        if name_lower in token_variants:
             return None, entry
     return None, None
 
@@ -10899,7 +11281,7 @@ async def prefix_clone_command(ctx: commands.Context, *, args: str = "") -> None
         target_key,
         overlay_type="clone",
         group_id=group_id,
-        source_user_id=source_state.user_id,
+        source_user_id=_resolve_clone_root_source_user_id(ctx.guild.id, source_state.user_id),
         base_visual=_snapshot_base_visual_fields(target_state),
         cloned_visual_snapshot=clone_snapshot,
         expires_at=expires_at,
@@ -10986,7 +11368,7 @@ async def _apply_cloneall_group(
             key,
             overlay_type="clone",
             group_id=group_id,
-            source_user_id=source_state.user_id,
+            source_user_id=_resolve_clone_root_source_user_id(guild.id, source_state.user_id),
             base_visual=_snapshot_base_visual_fields(target_state),
             cloned_visual_snapshot=snapshot,
             expires_at=expires_at,
@@ -11355,7 +11737,7 @@ async def slash_clone_command(
         target_key,
         overlay_type="clone",
         group_id=group_id,
-        source_user_id=source_state.user_id,
+        source_user_id=_resolve_clone_root_source_user_id(interaction.guild.id, source_state.user_id),
         base_visual=_snapshot_base_visual_fields(target_state),
         cloned_visual_snapshot=clone_snapshot,
         expires_at=expires_at,
@@ -11500,10 +11882,16 @@ async def slash_revert_overlay_command(interaction: discord.Interaction, target:
         await interaction.followup.send(battery_block, ephemeral=True)
         return
     if not target:
+        rev_ch = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
         group_ids = {str(rec.get("group_id")) for (g, _), rec in overlay_records.items() if g == interaction.guild.id and rec.get("group_id")}
         total = 0
         for group_id in sorted(group_ids):
-            total += await _revert_overlay_group(interaction.guild.id, group_id, reason=f"Manual revert by {interaction.user.display_name}")
+            total += await _revert_overlay_group(
+                interaction.guild.id,
+                group_id,
+                reason=f"Manual revert by {interaction.user.display_name}",
+                channel=rev_ch,
+            )
         swap_resets = 0
         guild_user_ids = [
             state.user_id
@@ -11515,6 +11903,7 @@ async def slash_revert_overlay_command(interaction: discord.Interaction, target:
                 interaction.guild.id,
                 user_id,
                 reason=f"Manual revert by {interaction.user.display_name}",
+                channel=rev_ch,
             ):
                 swap_resets += 1
         await interaction.followup.send(
@@ -11531,10 +11920,12 @@ async def slash_revert_overlay_command(interaction: discord.Interaction, target:
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
+    rev_ch_one = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
     changed = await _revert_overlay_or_swap_for_user(
         interaction.guild.id,
         st.user_id,
         reason=f"Manual revert by {interaction.user.display_name}",
+        channel=rev_ch_one,
     )
     await interaction.followup.send(
         "Target has been reverted back to their original form."
@@ -11910,7 +12301,10 @@ async def prefix_swap_command(ctx: commands.Context, *, args: str = "") -> None:
     
     # Persist states
     persist_states()
-    
+    _strip_vn_swap_participant_overlays(ctx.guild.id, user1_id, user2_id)
+    await _maybe_device_strip_holder_for_special_form(ctx.guild, user1_id, new_state1)
+    await _maybe_device_strip_holder_for_special_form(ctx.guild, user2_id, new_state2)
+
     message_text = _swap_transition_message(
         actor_user_id=ctx.author.id,
         member1=member1,
@@ -12162,7 +12556,10 @@ async def slash_swap_command(
     
     # Persist states
     persist_states()
-    
+    _strip_vn_swap_participant_overlays(interaction.guild.id, user1_id, user2_id)
+    await _maybe_device_strip_holder_for_special_form(interaction.guild, user1_id, new_state1)
+    await _maybe_device_strip_holder_for_special_form(interaction.guild, user2_id, new_state2)
+
     message_text = _swap_transition_message(
         actor_user_id=interaction.user.id,
         member1=member1,
@@ -13142,8 +13539,12 @@ async def prefix_say_35(ctx: commands.Context, *, args: str = ""):
         await ctx.reply("Couldn't deliver that panel.", mention_author=False)
         return
 
-    if sent_message and cleaned_content:
-        _register_relay_message(sent_message.id, target_state.character_name, cleaned_content)
+    if sent_message:
+        _register_relay_message(
+            sent_message.id,
+            target_state.character_name,
+            cleaned_content if cleaned_content else "(panel)",
+        )
     _device_record_success(actor, author_state, ctx.guild.id, "say")
 
     await _delete_vn_message_with_retry(ctx.message, context="say panel")

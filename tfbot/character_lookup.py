@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 logger = logging.getLogger("tfbot.character_lookup")
 
@@ -41,6 +41,17 @@ def resolve_characters_content_root(base_dir: Optional[Path] = None) -> Optional
     return content.resolve()
 
 
+def _normalize_path_slashes(value: str) -> str:
+    return value.replace("\\", "/").strip().strip("/")
+
+
+def _folder_basename(canonical: str) -> str:
+    norm = _normalize_path_slashes(canonical)
+    if not norm:
+        return ""
+    return norm.split("/")[-1]
+
+
 class CharacterNameNormalizer:
     """Normalize submitted character folder names to their canonical casing.
 
@@ -48,20 +59,37 @@ class CharacterNameNormalizer:
     ``TFBOT_CHARACTERS_REPO_SUBDIR`` is empty).
     """
 
-    def __init__(self, content_root: Path, *, extra_candidates: Optional[Sequence[str]] = None):
+    def __init__(
+        self,
+        content_root: Path,
+        *,
+        extra_candidates: Optional[Sequence[str]] = None,
+        name_aliases: Optional[Mapping[str, str]] = None,
+    ):
         self.content_root = content_root
         self._extra_candidates = tuple(
-            str(candidate).strip() for candidate in (extra_candidates or []) if str(candidate).strip()
+            _normalize_path_slashes(str(candidate))
+            for candidate in (extra_candidates or [])
+            if str(candidate).strip()
         )
+        self._name_aliases: Dict[str, str] = {
+            k.strip().lower(): _normalize_path_slashes(v)
+            for k, v in (name_aliases or {}).items()
+            if str(k).strip() and str(v).strip()
+        }
         self._lookup: Dict[str, str] = {}
         self._conflicts: Dict[str, List[str]] = {}
+        self._canonical_names: tuple[str, ...] = ()
         self.refresh()
 
     def refresh(self) -> None:
         """Rebuild the lookup table from the characters repo."""
+        raw_candidates = list(self._collect_raw_candidates())
+        self._canonical_names = tuple(sorted(set(raw_candidates), key=str.lower))
+
         lookup: Dict[str, str] = {}
         conflicts: Dict[str, List[str]] = {}
-        for canonical in self._candidate_names():
+        for canonical in self._canonical_names:
             lowered = canonical.lower()
             if lowered in conflicts:
                 if canonical not in conflicts[lowered]:
@@ -94,32 +122,96 @@ class CharacterNameNormalizer:
         if not submitted:
             raise CharacterNormalizationError("Provide a valid character folder name.")
 
-        lowered = submitted.strip().lower()
-        conflict = self._conflicts.get(lowered)
+        stripped = submitted.strip()
+        lowered_key = _normalize_path_slashes(stripped).lower()
+        conflict = self._conflicts.get(lowered_key)
         if conflict:
             conflict_names = ", ".join(conflict)
             raise CharacterNormalizationError(
-                f"Multiple canonical characters share the name '{submitted.lower()}': {conflict_names}. "
+                f"Multiple canonical characters share the name '{stripped.lower()}': {conflict_names}. "
                 "Contact staff to resolve the duplicate before continuing."
             )
 
-        canonical = self._lookup.get(lowered)
+        canonical = self._lookup.get(lowered_key)
         if canonical:
             return canonical
 
+        alias_folder = self._name_aliases.get(lowered_key)
+        if alias_folder:
+            af_l = alias_folder.lower()
+            hit = self._lookup.get(af_l)
+            if hit:
+                return hit
+            fuzzy_alias = self._fuzzy_resolve(af_l)
+            if len(fuzzy_alias) == 1:
+                return fuzzy_alias[0]
+
+        fuzzy = self._fuzzy_resolve(lowered_key)
+        if len(fuzzy) == 1:
+            return fuzzy[0]
+        if len(fuzzy) > 1:
+            preview = ", ".join(sorted(fuzzy, key=str.lower))
+            raise CharacterNormalizationError(
+                f"Ambiguous character '{submitted}': could mean {preview}. Use a fuller or more specific name."
+            )
+
         raise CharacterNormalizationError(f"Unknown character '{submitted}'. Check the spelling and try again.")
 
-    def _candidate_names(self) -> Iterable[str]:
+    def _fuzzy_resolve(self, lowered: str) -> List[str]:
+        """Match basename or first word of basename; return unique canonical paths."""
+        if not lowered:
+            return []
+        hits: list[str] = []
+        seen: Set[str] = set()
+        for canonical in self._canonical_names:
+            norm = _normalize_path_slashes(canonical)
+            if not norm:
+                continue
+            full_l = norm.lower()
+            if full_l == lowered:
+                if canonical not in seen:
+                    seen.add(canonical)
+                    hits.append(canonical)
+                continue
+            base = _folder_basename(canonical)
+            base_l = base.lower()
+            if base_l == lowered:
+                if canonical not in seen:
+                    seen.add(canonical)
+                    hits.append(canonical)
+                continue
+            parts = base_l.split()
+            if parts and parts[0] == lowered:
+                if canonical not in seen:
+                    seen.add(canonical)
+                    hits.append(canonical)
+        return hits
+
+    def _collect_raw_candidates(self) -> Iterable[str]:
         names: Set[str] = set()
         if self.content_root.exists():
-            for entry in self.content_root.iterdir():
-                if entry.is_dir():
+            try:
+                for entry in self.content_root.iterdir():
+                    if not entry.is_dir():
+                        continue
                     candidate = entry.name.strip()
-                    if candidate:
-                        names.add(candidate)
+                    if not candidate:
+                        continue
+                    names.add(candidate)
+                    try:
+                        for sub in entry.iterdir():
+                            if sub.is_dir():
+                                sub_name = sub.name.strip()
+                                if sub_name:
+                                    names.add(f"{candidate}/{sub_name}")
+                    except OSError as exc:
+                        logger.debug("Skipping subdirs under %s: %s", entry, exc)
+            except OSError as exc:
+                logger.warning("Failed to list character directories under %s: %s", self.content_root, exc)
 
         for candidate in self._extra_candidates:
-            names.add(candidate)
+            if candidate:
+                names.add(candidate)
 
         return sorted(names, key=str.lower)
 

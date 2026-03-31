@@ -10,6 +10,8 @@ import os
 import secrets
 import shutil
 import subprocess
+import time
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, FrozenSet, Optional, Sequence
@@ -23,6 +25,10 @@ from tfbot.character_lookup import (
     resolve_characters_content_root,
     resolve_characters_git_root,
 )
+
+# Match CharacterNameNormalizer folder normalization for alias cache equality.
+def _submission_norm_folder(value: str) -> str:
+    return value.replace("\\", "/").strip().strip("/")
 from tfbot.models import TransformationState
 from tfbot.panel_executor import run_panel_render_vn
 from tfbot.panels import VN_CACHE_DIR, compose_game_avatar, parse_discord_formatting, render_vn_panel
@@ -42,6 +48,85 @@ logger = logging.getLogger("tfbot.submissions")
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 BASE_DIR = PACKAGE_DIR.parent
+
+
+def _character_content_directory(content_root: Path, character: str) -> Path:
+    """Join content_root with a canonical character path that may contain `/` (pack bucket + name)."""
+    rel = character.replace("\\", "/").strip().strip("/")
+    path = content_root
+    for part in rel.split("/"):
+        p = part.strip()
+        if p:
+            path = path / p
+    return path
+
+
+def _tf_character_folder_candidates() -> tuple[str, ...]:
+    try:
+        from tf_characters import TF_CHARACTERS
+    except ImportError:
+        return ()
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in TF_CHARACTERS:
+        if not isinstance(entry, dict):
+            continue
+        raw = _submission_norm_folder((entry.get("folder") or "").strip().replace("\\", "/"))
+        if raw and raw not in seen:
+            seen.add(raw)
+            out.append(raw)
+    return tuple(out)
+
+
+def _tf_character_name_folder_aliases() -> dict[str, str]:
+    """Map pool `name` (and unique first words) to canonical `folder` for !submit normalization."""
+    try:
+        from tf_characters import TF_CHARACTERS
+    except ImportError:
+        return {}
+    full_name_aliases: dict[str, str] = {}
+    first_word_hits: dict[str, list[str]] = {}
+    for entry in TF_CHARACTERS:
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("name") or "").strip()
+        folder = _submission_norm_folder((entry.get("folder") or "").strip().replace("\\", "/"))
+        if not name or not folder:
+            continue
+        key_full = name.lower()
+        if key_full not in full_name_aliases:
+            full_name_aliases[key_full] = folder
+        parts = name.split()
+        if parts:
+            first_word_hits.setdefault(parts[0].lower(), []).append(folder)
+    out = dict(full_name_aliases)
+    for fw, folders in first_word_hits.items():
+        uniq = sorted(set(folders))
+        if len(uniq) != 1:
+            continue
+        if fw in out and out[fw] != uniq[0]:
+            continue
+        if fw not in out:
+            out[fw] = uniq[0]
+    return out
+
+
+def _validate_character_folder_token(character: str) -> Optional[str]:
+    if not character or "\\" in character:
+        return "Provide a valid character folder name."
+    if ".." in character or character.startswith("/"):
+        return "Provide a valid character folder name."
+    parts = [p for p in character.split("/") if p]
+    if not parts:
+        return "Provide a valid character folder name."
+    for part in parts:
+        segment = part.strip()
+        if not segment:
+            return "Provide a valid character folder name."
+        for ch in segment:
+            if not (ch.isalnum() or ch in (" ", "_", "-")):
+                return "Character path may only use letters, numbers, spaces, underscores, hyphens, and `/` between folders."
+    return None
 
 SUBMISSIONS_DIR = BASE_DIR / "submissions"
 PENDING_DIR = SUBMISSIONS_DIR / "pending"
@@ -263,7 +348,8 @@ class SubmissionManager:
         if normalization_error:
             await ctx.reply(normalization_error, mention_author=False)
             return
-        pose_dir = content_root / character / pose
+        char_root = _character_content_directory(content_root, character)
+        pose_dir = char_root / pose
         target_dir = pose_dir / "outfits"
         try:
             pose_dir.mkdir(parents=True, exist_ok=True)
@@ -360,7 +446,8 @@ class SubmissionManager:
         if normalization_error:
             await ctx.reply(normalization_error, mention_author=False)
             return
-        target_dir = content_root / character / pose / "outfits"
+        char_root = _character_content_directory(content_root, character)
+        target_dir = char_root / pose / "outfits"
         outfit_path = target_dir / f"{outfit}.png"
         if not outfit_path.exists():
             await ctx.reply("That outfit image does not exist yet.", mention_author=False)
@@ -412,8 +499,9 @@ class SubmissionManager:
         return attachments[0] if attachments else None
 
     def _validate_inputs(self, character: str, pose: str, outfit: str) -> Optional[str]:
-        if not character or "/" in character or "\\" in character:
-            return "Provide a valid character folder name."
+        char_err = _validate_character_folder_token(character)
+        if char_err:
+            return char_err
         if not pose or "/" in pose or "\\" in pose:
             return "Provide a valid pose folder name."
         if not outfit or " " in outfit:
@@ -431,7 +519,8 @@ class SubmissionManager:
         git_root: Path,
         content_root: Path,
     ) -> Path:
-        dest = (content_root / character / pose / "outfits" / f"{outfit}.png").resolve()
+        char_root = _character_content_directory(content_root, character)
+        dest = (char_root / pose / "outfits" / f"{outfit}.png").resolve()
         return dest.relative_to(git_root.resolve())
 
     def _normalize_character_name(
@@ -443,9 +532,20 @@ class SubmissionManager:
         root = content_root or self._resolve_content_root()
         if root is None:
             return None, "characters_repo is not configured."
+        extras = _tf_character_folder_candidates()
+        name_aliases = _tf_character_name_folder_aliases()
         normalizer = self._character_normalizer
-        if normalizer is None or normalizer.content_root != root:
-            normalizer = CharacterNameNormalizer(root)
+        cached_extras = getattr(normalizer, "_extra_candidates", None)
+        cached_aliases = getattr(normalizer, "_name_aliases", None)
+        if (
+            normalizer is None
+            or normalizer.content_root != root
+            or cached_extras != extras
+            or cached_aliases != name_aliases
+        ):
+            normalizer = CharacterNameNormalizer(
+                root, extra_candidates=extras, name_aliases=name_aliases
+            )
             self._character_normalizer = normalizer
         else:
             normalizer.refresh()
@@ -664,7 +764,7 @@ class SubmissionManager:
         content_root = self._resolve_content_root()
         if content_root is None:
             return False
-        character_dir = content_root / record.character_name
+        character_dir = _character_content_directory(content_root, record.character_name)
         config_path = character_dir / "character.yml"
         if not config_path.exists():
             return False
@@ -695,7 +795,9 @@ class SubmissionManager:
     def _clear_vn_cache_entry(self, character: str, pose: str) -> None:
         if VN_CACHE_DIR is None:
             return
-        candidates = {character, character.lower()}
+        slash = character.replace("\\", "/")
+        flat = slash.replace("/", "_")
+        candidates = {character, character.lower(), slash, slash.lower(), flat, flat.lower()}
         pose_candidates = {pose, pose.lower()}
         for char_token in candidates:
             char_dir = VN_CACHE_DIR / char_token
@@ -904,32 +1006,63 @@ class SubmissionManager:
         if not git_executable:
             return False, "git executable not found."
 
-        commands = [
-            [git_executable, "-C", str(repo_root), "add", str(relative_path)],
-            [git_executable, "-C", str(repo_root), "commit", "-m", commit_message],
+        add_cmd = [git_executable, "-C", str(repo_root), "add", str(relative_path)]
+        add_result = subprocess.run(add_cmd, capture_output=True, text=True)
+        if add_result.returncode != 0:
+            detail = add_result.stderr.strip() or add_result.stdout.strip() or "git add failed"
+            return False, detail
+
+        staged_check = [
+            git_executable,
+            "-C",
+            str(repo_root),
+            "diff",
+            "--cached",
+            "--name-only",
+            "--",
+            str(relative_path),
         ]
-        for cmd in commands:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                detail = result.stderr.strip() or result.stdout.strip() or "unknown git error"
+        staged_result = subprocess.run(staged_check, capture_output=True, text=True)
+        staged_names = (staged_result.stdout or "").strip()
+        if not staged_names:
+            retry_add = [git_executable, "-C", str(repo_root), "add", "-A", "--", str(relative_path)]
+            retry_result = subprocess.run(retry_add, capture_output=True, text=True)
+            if retry_result.returncode != 0:
+                detail = retry_result.stderr.strip() or retry_result.stdout.strip() or "git add -A failed"
+                return False, detail
+            staged_result = subprocess.run(staged_check, capture_output=True, text=True)
+            staged_names = (staged_result.stdout or "").strip()
+            if not staged_names:
+                status_cmd = [git_executable, "-C", str(repo_root), "status", "--porcelain"]
+                status_result = subprocess.run(status_cmd, capture_output=True, text=True)
+                detail = status_result.stdout.strip() or status_result.stderr.strip() or "git status failed"
                 return False, detail
 
+        commit_cmd = [git_executable, "-C", str(repo_root), "commit", "-m", commit_message]
+        commit_result = subprocess.run(commit_cmd, capture_output=True, text=True)
+        if commit_result.returncode != 0:
+            detail = commit_result.stderr.strip() or commit_result.stdout.strip() or "git commit failed"
+            return False, detail
+
         push_cmd = [git_executable, "-C", str(repo_root), "push"]
-        push_result = subprocess.run(push_cmd, capture_output=True, text=True)
-        if push_result.returncode == 0:
-            return True, "pushed successfully"
-
         pull_cmd = [git_executable, "-C", str(repo_root), "pull", "--rebase", "--autostash"]
-        pull_result = subprocess.run(pull_cmd, capture_output=True, text=True)
-        if pull_result.returncode != 0:
-            detail = pull_result.stderr.strip() or pull_result.stdout.strip() or "git pull failed"
-            return False, detail
 
-        retry_result = subprocess.run(push_cmd, capture_output=True, text=True)
-        if retry_result.returncode != 0:
-            detail = retry_result.stderr.strip() or retry_result.stdout.strip() or "git push failed"
-            return False, detail
-        return True, "pushed after pulling"
+        last_detail = ""
+        for _ in range(3):
+            push_result = subprocess.run(push_cmd, capture_output=True, text=True)
+            if push_result.returncode == 0:
+                return True, "pushed successfully"
+            last_detail = (push_result.stderr or "").strip() or (push_result.stdout or "").strip() or "git push failed"
+
+            if "cannot lock ref 'refs/heads/main'" in last_detail or "cannot lock ref \"refs/heads/main\"" in last_detail:
+                time.sleep(0.6 + (random.random() * 1.4))
+
+            pull_result = subprocess.run(pull_cmd, capture_output=True, text=True)
+            if pull_result.returncode != 0:
+                detail = pull_result.stderr.strip() or pull_result.stdout.strip() or "git pull failed"
+                return False, detail
+
+        return False, last_detail or "git push failed"
 
 
 def setup_submission_features(bot: commands.Bot) -> SubmissionManager:
